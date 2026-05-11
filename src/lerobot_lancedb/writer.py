@@ -44,6 +44,19 @@ logger = logging.getLogger(__name__)
 _DEFAULT_JPEG_QUALITY = 95
 
 
+def _decode_video_frames_compat(video_path, timestamps, tolerance_s, backend):
+    """``decode_video_frames`` adds kwargs across lerobot versions; pass them
+    conditionally so we work against 0.5.x as well as newer releases.
+    """
+    import inspect
+
+    sig = inspect.signature(decode_video_frames)
+    kwargs = {}
+    if "return_uint8" in sig.parameters:
+        kwargs["return_uint8"] = True
+    return decode_video_frames(video_path, timestamps, tolerance_s, backend, **kwargs)
+
+
 def _to_lance_name(name: str) -> str:
     return name.replace(".", "_")
 
@@ -135,12 +148,8 @@ def _episode_record_batch(
             from_ts = float(ep[f"videos/{vid_key}/from_timestamp"])
             shifted = [from_ts + t for t in ts_local_list]
             video_path = src.root / meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(
-                video_path,
-                shifted,
-                tolerance_s,
-                src._video_backend,
-                return_uint8=True,
+            frames = _decode_video_frames_compat(
+                video_path, shifted, tolerance_s, src._video_backend
             )
             decoded_videos[vid_key] = frames
 

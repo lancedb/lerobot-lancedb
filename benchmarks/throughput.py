@@ -99,9 +99,12 @@ def main() -> None:
     for nw in args.num_workers:
         for backend in args.backends:
             if backend == "parquet":
-                ds: torch.utils.data.Dataset = LeRobotDataset(
-                    args.repo_id, root=args.src_root, return_uint8=True
-                )
+                import inspect
+
+                kwargs: dict = {"root": args.src_root}
+                if "return_uint8" in inspect.signature(LeRobotDataset.__init__).parameters:
+                    kwargs["return_uint8"] = True
+                ds: torch.utils.data.Dataset = LeRobotDataset(args.repo_id, **kwargs)
             else:
                 ds = LeRobotLanceDataset(root=Path(args.lance_root), return_uint8=True)
 
