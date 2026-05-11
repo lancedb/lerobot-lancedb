@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot-lancedb"
+version = "0.1.0.dev0"
+description = "Lance-backed datasets for LeRobot — frame-level random access on local disk and cloud (S3 / GCS / HF Hub / HF Buckets)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+authors = [
+    { name = "Ayush Chaurasia", email = "ayush@lancedb.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["lerobot", "lancedb", "lance", "robotics", "datasets", "dataloader"]
+
+dependencies = [
+    # We subclass lerobot.datasets.LeRobotDataset so isinstance checks pass
+    # for downstream training code (factories, samplers, etc.). We don't
+    # depend on the [dataset] extra explicitly because older lerobot versions
+    # bundled those deps into the base install. Users on lerobot>=0.6 should
+    # install with `lerobot-lancedb` + `lerobot[dataset]` together.
+    "lerobot>=0.5.0",
+    "datasets>=4.0.0,<5.0.0",
+    "pyarrow>=21.0.0,<30.0.0",
+    "lancedb>=0.20.0,<1.0.0",
+    "pylance>=0.20.0,<1.0.0",
+    "numpy>=2.0.0,<2.3.0",
+    "Pillow>=10.0.0",
+    "torch>=2.7,<2.11.0",
+    "torchvision>=0.22.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.1.0,<9.0.0",
+    "pytest-timeout>=2.4.0,<3.0.0",
+]
+dev = [
+    "lerobot-lancedb[test]",
+    "ruff>=0.14.1",
+]
+
+[project.scripts]
+lerobot-convert-to-lance = "lerobot_lancedb.scripts.convert_to_lance:main"
+
+[project.urls]
+homepage = "https://github.com/lancedb/lerobot-lancedb"
+issues = "https://github.com/lancedb/lerobot-lancedb/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
