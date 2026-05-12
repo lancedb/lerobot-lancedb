@@ -63,17 +63,35 @@ ds = make_lerobot_dataset("me/pusht_lance")            # Lance (Hub suffix conve
 
 Standard LeRobot datasets store frames inside multi-episode mp4 chunks. Every batch decodes a frame range; cloud reads pay both byte-range fetch latency *and* per-window decode cost. Lance stores one row per frame with JPEG-encoded images, served by a columnar engine with native object-store backends — no video decode on the hot path, and remote random access is fast enough to train against directly.
 
-A throughput benchmark on `lerobot/pusht` (local SSD, M-series Mac, batch=64):
+### Throughput
 
-| backend  | nw=0 | nw=2 | nw=4 |
+Lance is faster on every realistic training condition we've measured. The
+gap widens with frame resolution, number of cameras, and worker count.
+
+Measured on `lerobot/aloha_static_cups_open` (4 cameras × 480×640 × 20 000
+frames; local SSD, M-series Mac, batch=32):
+
+| condition | parquet+mp4 (bps) | Lance (bps) | speedup |
 |---|---:|---:|---:|
-| parquet+mp4 |  47  |  83  | 155  |
-| **Lance**   | **133** | **184** | **273** |
-| speedup     | 2.86× | 2.22× | 1.76× |
+| shuffled, nw=0 | 2.4 | 5.8 | **2.39×** |
+| shuffled, nw=4 | 3.6 | 13.9 | **3.88×** |
+| shuffled + delta_timestamps, nw=0 | 1.0 | 1.8 | **1.78×** |
+| shuffled + delta_timestamps, nw=4 | 1.6 | 2.5 | **1.62×** |
 
-(Run `python benchmarks/throughput.py --help` to reproduce on your data.)
+Reproduce with `python examples/conversion.py --benchmark` (full numbers
+across more datasets are embedded in the file).
 
-Larger gains are expected on cloud storage where the parquet+mp4 path adds network latency per video-decode seek.
+**Caveat for tiny datasets:** on small toy datasets like the 50 MB
+`lerobot/pusht`, the entire dataset lives in the OS file cache after a
+couple of epochs, so both backends are reading from RAM. In that regime
+per-batch Python overhead dominates and the result depends on the exact
+configuration. With realistic `delta_timestamps` Lance still wins by
+**5-7×** on pusht; without delta_timestamps the gap narrows or inverts.
+Don't make decisions based on toy-dataset numbers — measure on real data.
+
+Cloud-storage benchmarks (S3 / HF Buckets / GCS) aren't in this README
+yet; we expect gains to be **substantially larger** there because the
+parquet+mp4 path pays per-decode network round-trips.
 
 ## Status of features
 

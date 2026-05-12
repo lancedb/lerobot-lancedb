@@ -40,11 +40,17 @@ from .dataset import LeRobotLanceDataset
 logger = logging.getLogger(__name__)
 
 
-def _open_parquet(repo_id: str, root: str | Path | None = None) -> LeRobotDataset:
+def _open_parquet(
+    repo_id: str,
+    root: str | Path | None = None,
+    delta_timestamps: dict[str, list[float]] | None = None,
+) -> LeRobotDataset:
     """Open the upstream parquet+mp4 dataset, with ``return_uint8`` if supported."""
     kwargs: dict[str, Any] = {"root": root}
     if "return_uint8" in inspect.signature(LeRobotDataset.__init__).parameters:
         kwargs["return_uint8"] = True
+    if delta_timestamps:
+        kwargs["delta_timestamps"] = delta_timestamps
     return LeRobotDataset(repo_id, **kwargs)
 
 
@@ -91,6 +97,7 @@ def benchmark_throughput(
     num_batches: int = 100,
     warmup: int = 10,
     backends: Iterable[str] = ("parquet", "lance"),
+    delta_timestamps: dict[str, list[float]] | None = None,
     print_results: bool = True,
 ) -> list[dict]:
     """Run a throughput comparison and (optionally) print it.
@@ -114,9 +121,15 @@ def benchmark_throughput(
     for nw in num_workers:
         for backend in backends:
             if backend == "parquet":
-                ds: torch.utils.data.Dataset = _open_parquet(repo_id, root=src_root)
+                ds: torch.utils.data.Dataset = _open_parquet(
+                    repo_id, root=src_root, delta_timestamps=delta_timestamps
+                )
             elif backend == "lance":
-                ds = LeRobotLanceDataset(root=Path(lance_root), return_uint8=True)
+                ds = LeRobotLanceDataset(
+                    root=Path(lance_root),
+                    return_uint8=True,
+                    delta_timestamps=delta_timestamps,
+                )
             else:
                 raise ValueError(f"unknown backend {backend!r}")
 
