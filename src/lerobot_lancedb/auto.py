@@ -132,6 +132,10 @@ def _split_lance_kwargs(
     kwargs: dict[str, Any],
 ) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    # ``video_backend`` etc. only make sense for the parquet+mp4 reader;
+    # silently drop them when routing to Lance so the same caller code
+    # works against either backend. ``decode_device`` is Lance-only and
+    # passes through unchanged.
     drop = {"video_backend", "download_videos", "force_cache_sync"}
     for k, v in kwargs.items():
         if k in drop:

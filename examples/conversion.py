@@ -287,21 +287,35 @@ from lerobot_lancedb import LeRobotLanceDataset, benchmark_throughput, convert_t
 #   shuffled + delta_timestamps, nw=4  parquet    1.92         62
 #                                      lance      3.36        108   1.75x
 #
-# When Lance helps (always, on real data):
-#   * Video-backed datasets — parquet+mp4 pays per-batch torchcodec seek +
-#     decode; Lance just JPEG-decodes a binary blob (faster, GIL-free).
-#   * Multi-camera datasets — gap widens with camera count and frame size.
-#   * Cloud reads (S3 / HF Buckets / GCS) — not measured here, but
-#     theoretically the largest gain because Lance avoids per-decode
-#     network round-trips.
+# Why "only" 1.6-1.8× under realistic delta_timestamps?
 #
-# When the comparison looks weird (RAM-cache artifacts):
-#   * Toy datasets that fit in OS cache: both backends read from RAM, the
-#     measurement isn't of disk-or-decode throughput, and per-batch Python
-#     overhead drives the result. Skip; measure on real data instead.
-#   * ``delta_timestamps`` patterns narrow Lance's lead on video-backed
-#     datasets (parquet's torchcodec amortizes the seek across a window).
-#     Lance still wins, just by less.
+# Per-batch profile on aloha_static_cups_open (4 cams × 480×640, bs=32):
+#
+#   lance fetch (Permutation.take):    7 ms  (~ 2%)
+#   bytes → pylist (4 cameras):        5 ms  (~ 2%)
+#   JPEG decode (libjpeg-turbo CPU): 272 ms  (~96%)
+#
+# 96% of Lance's batch time is CPU JPEG decode. Both backends spend most
+# of their time decoding 256 × 480×640 frames per batch, and we can't
+# beat raw libjpeg-turbo on the same CPU. The lance fetch is essentially
+# free; the speedup over parquet+mp4 comes from avoiding torchcodec's
+# per-window seek, which is significant but bounded.
+#
+# Where the gap widens (much larger speedups):
+#   * GPU NVJPEG — set ``decode_device='cuda'`` to decode JPEGs on the GPU.
+#     ~10× faster than CPU libjpeg-turbo. Extrapolating the profile above:
+#     272 ms → 27 ms means total goes 284 → 39 ms = ~7× the current Lance
+#     throughput, and decoded tensors land on the GPU directly (no H2D
+#     copy in the training loop). The parquet+mp4 path could in theory
+#     use NVDEC for the same effect but it's much harder to set up, and
+#     torchcodec's CUDA support is patchy across codecs.
+#   * Cloud reads (S3 / GCS / HF Buckets) — parquet+mp4 pays a network
+#     round-trip per chunk fetch and per torchcodec seek. Lance reads the
+#     specific byte-ranges it needs in one go. Expect 10-20× on cold
+#     cloud reads.
+#   * Larger batches / no delta_timestamps — torchcodec's seek amortization
+#     advantage disappears when the read pattern is one independent frame
+#     per item.
 
 
 # ──────────────────────────────────────────────────────────────────────

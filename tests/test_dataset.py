@@ -244,6 +244,25 @@ def test_make_lerobot_dataset_forces_lance(lance_dataset_dir):
     assert isinstance(ds, LeRobotLanceDataset)
 
 
+# ── GPU JPEG decode (skipped if no CUDA) ──────────────────────────────
+
+
+def test_decode_on_gpu_returns_cuda_tensors(lance_dataset_dir):
+    """If CUDA is available, ``decode_device='cuda'`` returns CUDA tensors.
+
+    The actual NVJPEG decode is also significantly faster (~10× over
+    libjpeg-turbo) on a typical GPU, but we don't benchmark here — this
+    is just an API smoke-test.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    ds = LeRobotLanceDataset(
+        root=lance_dataset_dir, return_uint8=True, decode_device="cuda"
+    )
+    item = ds[0]
+    assert item["observation.image"].device.type == "cuda"
+
+
 # ── multi-camera (dtype=image) ───────────────────────────────────────
 
 

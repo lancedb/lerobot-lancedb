@@ -98,6 +98,7 @@ def benchmark_throughput(
     warmup: int = 10,
     backends: Iterable[str] = ("parquet", "lance"),
     delta_timestamps: dict[str, list[float]] | None = None,
+    decode_device: str | None = None,
     print_results: bool = True,
 ) -> list[dict]:
     """Run a throughput comparison and (optionally) print it.
@@ -129,6 +130,7 @@ def benchmark_throughput(
                     root=Path(lance_root),
                     return_uint8=True,
                     delta_timestamps=delta_timestamps,
+                    decode_device=decode_device,
                 )
             else:
                 raise ValueError(f"unknown backend {backend!r}")

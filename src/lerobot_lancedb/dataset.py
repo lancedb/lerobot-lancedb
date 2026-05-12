@@ -136,7 +136,14 @@ class LeRobotLanceDataset(LeRobotDataset):
         tolerance_s: float = 1e-4,
         return_uint8: bool = False,
         connect_kwargs: dict[str, Any] | None = None,
+        decode_device: str | torch.device | None = None,
     ) -> None:
+        """``decode_device`` decodes JPEGs on the named torch device. Pass
+        ``"cuda"`` to use NVJPEG (typically ~10× faster than libjpeg-turbo on
+        CPU); pass ``None`` (the default) to decode on CPU. When set, decoded
+        image tensors are returned on that device, saving the H2D transfer
+        in the training loop.
+        """
         # Skip LeRobotDataset.__init__ — it does Hub downloads + builds a
         # DatasetReader for the parquet+mp4 path, neither of which apply
         # here. Go straight to torch.utils.data.Dataset for the bookkeeping
@@ -187,6 +194,13 @@ class LeRobotLanceDataset(LeRobotDataset):
         self.delta_timestamps = delta_timestamps
         self.set_image_transforms(image_transforms)
         self._return_uint8 = return_uint8
+        # Normalize ``decode_device``. ``None`` → CPU (the safe default).
+        # We don't auto-detect CUDA: workers might be on different devices,
+        # and the user usually wants explicit control over where decoded
+        # tensors land.
+        self._decode_device = (
+            torch.device(decode_device) if decode_device is not None else None
+        )
 
         # The parent has a few video-encoder-specific attributes used only on
         # the write path. We won't ever write, but pyright/static checks and
@@ -441,9 +455,16 @@ class LeRobotLanceDataset(LeRobotDataset):
     # ── decoding ──────────────────────────────────────────────────────
 
     def _decode_jpeg_blobs(self, blobs: list[bytes]) -> torch.Tensor:
-        """Decode JPEG ``bytes`` → ``(N, C, H, W)`` ``uint8`` tensor."""
+        """Decode JPEG ``bytes`` → ``(N, C, H, W)`` ``uint8`` tensor.
+
+        When ``self._decode_device`` is set (e.g. ``cuda``), torchvision uses
+        NVJPEG and returns tensors on that device — ~10× faster than CPU
+        libjpeg-turbo on a typical NVIDIA GPU and saves the H2D copy.
+        """
         if not blobs:
-            return torch.empty(0, dtype=torch.uint8)
+            return torch.empty(
+                0, dtype=torch.uint8, device=self._decode_device or "cpu"
+            )
 
         if _tv_decode_jpeg is not None:
             try:
@@ -451,7 +472,12 @@ class LeRobotLanceDataset(LeRobotDataset):
                     torch.frombuffer(b if isinstance(b, (bytes, bytearray)) else bytes(b), dtype=torch.uint8)
                     for b in blobs
                 ]
-                decoded = _tv_decode_jpeg(byte_tensors, mode=_TV_RGB)
+                if self._decode_device is not None:
+                    decoded = _tv_decode_jpeg(
+                        byte_tensors, mode=_TV_RGB, device=self._decode_device
+                    )
+                else:
+                    decoded = _tv_decode_jpeg(byte_tensors, mode=_TV_RGB)
                 return torch.stack(decoded)
             except (RuntimeError, TypeError):
                 pass  # malformed blob — fall through to PIL
@@ -461,7 +487,10 @@ class LeRobotLanceDataset(LeRobotDataset):
             with Image.open(io.BytesIO(b)) as img:
                 arr = np.array(img.convert("RGB"))
             out.append(torch.from_numpy(arr).permute(2, 0, 1))
-        return torch.stack(out)
+        stacked = torch.stack(out)
+        if self._decode_device is not None:
+            stacked = stacked.to(self._decode_device)
+        return stacked
 
     def _decode_image_column(self, blobs: list[bytes], dot_key: str) -> torch.Tensor:
         """Decode JPEGs and apply per-feature normalization.

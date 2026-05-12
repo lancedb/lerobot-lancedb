@@ -83,17 +83,42 @@ M-series Mac, batch=32):
 Two independent datasets, same shape, consistent picture. Reproduce with
 `python examples/conversion.py --benchmark` (full numbers in the file).
 
-**Caveat for tiny datasets:** on small toy datasets like the 50 MB
-`lerobot/pusht`, the entire dataset lives in the OS file cache after a
-couple of epochs, so both backends are reading from RAM. In that regime
-per-batch Python overhead dominates and the result depends on the exact
-configuration. With realistic `delta_timestamps` Lance still wins by
-**5-7×** on pusht; without delta_timestamps the gap narrows or inverts.
-Don't make decisions based on toy-dataset numbers — measure on real data.
+#### Where the gap widens: GPU NVJPEG
+
+Per-batch profile on aloha (4 cameras × 480×640, bs=32): **96% of the
+Lance batch time is CPU JPEG decoding**. Lance fetch + Python conversion
+is 4% combined — essentially free. Once you move JPEG decode to the GPU
+the picture changes dramatically:
+
+```python
+ds = LeRobotLanceDataset(root="./pusht_lance", decode_device="cuda")
+```
+
+`torchvision.io.decode_jpeg` uses NVJPEG when given `device="cuda"`
+— typically ~10× faster than CPU libjpeg-turbo on a single NVIDIA GPU,
+and decoded tensors land on the GPU directly (no H2D copy). Extrapolating
+the local-SSD numbers above, this brings Lance to **~7× the current
+CPU-Lance throughput**, i.e. ~10-20× the upstream parquet+mp4 path. The
+parquet+mp4 path could in theory match this with NVDEC, but torchcodec's
+CUDA support is much more limited (codec-specific) and not enabled by
+default in LeRobot.
+
+#### Where it widens even more: cloud reads
 
 Cloud-storage benchmarks (S3 / HF Buckets / GCS) aren't in this README
 yet; we expect gains to be **substantially larger** there because the
-parquet+mp4 path pays per-decode network round-trips.
+parquet+mp4 path pays a network round-trip per chunk fetch and per
+torchcodec seek. Lance reads only the byte ranges it needs in one go.
+
+#### Caveat for tiny datasets
+
+On small toy datasets like the 50 MB `lerobot/pusht`, the entire dataset
+lives in the OS file cache after a couple of epochs, so both backends
+are reading from RAM. In that regime per-batch Python overhead dominates
+and the result depends on the exact configuration. With realistic
+`delta_timestamps` Lance still wins by **5-7×** on pusht; without them
+the gap narrows. Don't make backend decisions based on toy-dataset
+numbers — measure on real data.
 
 ## Status of features
 
