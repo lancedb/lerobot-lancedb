@@ -1,10 +1,12 @@
 # GPU benchmark: reproducing the NVJPEG numbers
 
 This guide walks through running the parquet+mp4-vs-Lance throughput
-benchmark on a CUDA machine. The Lance reader auto-enables NVJPEG
-(GPU JPEG decode) via `decode_device="auto"`, so the speedup just
-happens — you should see ~7–10× over the CPU-Lance numbers in the
-README and ~10–15× over the upstream parquet+mp4 reader on local SSD.
+benchmark on a CUDA machine. **NVJPEG is enabled by default** in the
+core library — `LeRobotLanceDataset(...)` resolves `decode_device="auto"`
+to CUDA when `torch.cuda.is_available()`, with no flags or code changes.
+The benchmark + training scripts inherit that default. You should see
+~7–10× over the CPU-Lance numbers in the README and ~10–15× over the
+upstream parquet+mp4 reader on local SSD.
 
 The whole flow is ~30 minutes wall time on an A100/H100 box with fast
 disk (most of which is downloading the source datasets the first time).

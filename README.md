@@ -93,15 +93,23 @@ Two takeaways:
 
 Reproduce with `python examples/conversion.py --benchmark`.
 
-#### Where the gap widens: GPU NVJPEG
+#### Where the gap widens: GPU NVJPEG (auto-enabled)
 
 Per-batch profile on aloha (4 cameras × 480×640, bs=32): **96% of the
 Lance batch time is CPU JPEG decoding**. Lance fetch + Python conversion
 is 4% combined — essentially free. Once you move JPEG decode to the GPU
-the picture changes dramatically:
+the picture changes dramatically.
+
+**This is on by default.** `LeRobotLanceDataset.__init__` takes
+`decode_device="auto"` (the default), which resolves to `"cuda"` when
+`torch.cuda.is_available()` and `"cpu"` otherwise:
 
 ```python
-ds = LeRobotLanceDataset(root="./pusht_lance", decode_device="cuda")
+# No flags, no special config. On a GPU machine this auto-picks NVJPEG.
+ds = LeRobotLanceDataset(root="./pusht_lance")
+
+# To force CPU decode (e.g. for an apples-to-apples comparison):
+ds = LeRobotLanceDataset(root="./pusht_lance", decode_device="cpu")
 ```
 
 `torchvision.io.decode_jpeg` uses NVJPEG when given `device="cuda"`
@@ -112,6 +120,8 @@ CPU-Lance throughput**, i.e. ~10-20× the upstream parquet+mp4 path. The
 parquet+mp4 path could in theory match this with NVDEC, but torchcodec's
 CUDA support is much more limited (codec-specific) and not enabled by
 default in LeRobot.
+
+See [`GPU_BENCHMARK.md`](GPU_BENCHMARK.md) for the step-by-step recipe.
 
 #### Where it widens even more: cloud reads
 

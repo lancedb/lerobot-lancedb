@@ -98,7 +98,7 @@ def benchmark_throughput(
     warmup: int = 10,
     backends: Iterable[str] = ("parquet", "lance"),
     delta_timestamps: dict[str, list[float]] | None = None,
-    decode_device: str | None = None,
+    decode_device: str | None = "auto",
     print_results: bool = True,
 ) -> list[dict]:
     """Run a throughput comparison and (optionally) print it.
