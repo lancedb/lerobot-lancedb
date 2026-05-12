@@ -9,6 +9,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """DataLoader throughput benchmark: parquet+mp4 vs Lance.
 
+Standalone CLI wrapping :func:`lerobot_lancedb.benchmark_throughput`.
+
 Example::
 
     lerobot-convert-to-lance --repo-id=lerobot/pusht \\
@@ -23,57 +25,10 @@ Example::
 from __future__ import annotations
 
 import argparse
-import logging
-import time
-from pathlib import Path
 
-import torch
-
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.utils import init_logging
 
-from lerobot_lancedb import LeRobotLanceDataset
-
-
-def _run(
-    dataset: torch.utils.data.Dataset,
-    batch_size: int,
-    num_workers: int,
-    num_batches: int,
-    warmup: int,
-) -> tuple[float, float]:
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=True,
-        drop_last=True,
-        persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
-    )
-    seen = 0
-    t0 = None
-    total_t0 = time.perf_counter()
-    for i, _batch in enumerate(loader):
-        if i == warmup:
-            t0 = time.perf_counter()
-        seen += 1
-        if seen >= num_batches:
-            break
-    elapsed_steady = time.perf_counter() - (t0 if t0 is not None else total_t0)
-    steady_batches = max(0, seen - warmup)
-    bps = steady_batches / elapsed_steady if elapsed_steady > 0 else float("nan")
-    return time.perf_counter() - total_t0, bps
-
-
-def _print_table(rows: list[dict]) -> None:
-    headers = ["backend", "num_workers", "total_s", "steady_bps", "frames_per_s"]
-    widths = [max(len(h), max((len(str(r[h])) for r in rows), default=0)) for h in headers]
-    line = "  ".join(h.ljust(w) for h, w in zip(headers, widths, strict=True))
-    print(line)
-    print("-" * len(line))
-    for r in rows:
-        print("  ".join(str(r[h]).ljust(w) for h, w in zip(headers, widths, strict=True)))
+from lerobot_lancedb import benchmark_throughput
 
 
 def main() -> None:
@@ -95,39 +50,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    rows: list[dict] = []
-    for nw in args.num_workers:
-        for backend in args.backends:
-            if backend == "parquet":
-                import inspect
-
-                kwargs: dict = {"root": args.src_root}
-                if "return_uint8" in inspect.signature(LeRobotDataset.__init__).parameters:
-                    kwargs["return_uint8"] = True
-                ds: torch.utils.data.Dataset = LeRobotDataset(args.repo_id, **kwargs)
-            else:
-                ds = LeRobotLanceDataset(root=Path(args.lance_root), return_uint8=True)
-
-            logging.info("Benchmarking backend=%s num_workers=%d", backend, nw)
-            total, bps = _run(
-                ds,
-                batch_size=args.batch_size,
-                num_workers=nw,
-                num_batches=args.num_batches,
-                warmup=args.warmup,
-            )
-            rows.append(
-                {
-                    "backend": backend,
-                    "num_workers": nw,
-                    "total_s": f"{total:.2f}",
-                    "steady_bps": f"{bps:.2f}",
-                    "frames_per_s": f"{bps * args.batch_size:.0f}",
-                }
-            )
-
-    print()
-    _print_table(rows)
+    benchmark_throughput(
+        repo_id=args.repo_id,
+        lance_root=args.lance_root,
+        src_root=args.src_root,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        num_batches=args.num_batches,
+        warmup=args.warmup,
+        backends=args.backends,
+    )
 
 
 if __name__ == "__main__":

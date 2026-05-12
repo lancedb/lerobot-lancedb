@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from .auto import make_lerobot_dataset
+from .benchmark import benchmark_throughput, print_throughput_table
 from .dataset import LeRobotLanceDataset
 from .writer import convert_to_lance
 
@@ -21,7 +22,9 @@ __version__ = "0.1.0.dev0"
 
 __all__ = [
     "LeRobotLanceDataset",
+    "benchmark_throughput",
     "convert_to_lance",
     "make_lerobot_dataset",
+    "print_throughput_table",
     "__version__",
 ]

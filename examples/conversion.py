@@ -55,7 +55,7 @@ from pathlib import Path
 
 from lerobot.utils.utils import init_logging
 
-from lerobot_lancedb import LeRobotLanceDataset, convert_to_lance
+from lerobot_lancedb import LeRobotLanceDataset, benchmark_throughput, convert_to_lance
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -242,6 +242,52 @@ from lerobot_lancedb import LeRobotLanceDataset, convert_to_lance
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Throughput comparison: parquet+mp4 vs Lance (measured)
+# ──────────────────────────────────────────────────────────────────────
+#
+# Run with ``python examples/conversion.py --benchmark`` to reproduce. Each
+# row reports steady-state batches/sec after a 5-10 batch warmup, batch
+# size 32, on an M-series Mac with local SSD. We measure ``num_workers=0``
+# (single-process baseline) and ``num_workers=4`` (typical training config).
+#
+# dataset                        backend   nw      bps   frames/s   speedup
+# ─────────────────────────────────────────────────────────────────────────
+# pusht                          parquet    0    76.20      2438
+# pusht                          parquet    4   292.98      9375
+# pusht                          lance      0   218.53      6993    2.87x
+# pusht                          lance      4   512.18     16390    1.75x
+# pusht_image                    parquet    0   159.28      5097
+# pusht_image                    parquet    4   466.88     14940
+# pusht_image                    lance      0   192.86      6172    1.21x
+# pusht_image                    lance      4   269.05      8609    0.58x   ⚠
+# pusht-subtask                  parquet    0    81.45      2606
+# pusht-subtask                  parquet    4   278.16      8901
+# pusht-subtask                  lance      0   188.77      6041    2.32x
+# pusht-subtask                  lance      4   471.08     15075    1.69x
+# aloha_static_cups_open         parquet    0     2.42        78
+# aloha_static_cups_open         parquet    4     4.41       141
+# aloha_static_cups_open         lance      0     6.16       197    2.54x
+# aloha_static_cups_open         lance      4    16.70       534    3.79x
+#
+# When Lance helps:
+#   * Video-backed datasets — the parquet+mp4 path pays per-batch torchcodec
+#     seek + decode; Lance just JPEG-decodes binary blobs (faster, GIL-free).
+#   * Multi-camera datasets — the gap widens with the number of cameras,
+#     and the bigger the frames the more dramatic the win (aloha @ nw=4 is
+#     a textbook example: 3.79× faster).
+#   * Cloud reads (S3 / HF Buckets / GCS) — not measured here, but
+#     theoretically the largest gain because Lance avoids decoder fetch
+#     round-trips entirely.
+#
+# When it doesn't (be honest about this):
+#   * ``pusht_image`` at high ``num_workers``: parquet+pillow is already
+#     plenty fast for 96×96 image-in-parquet frames, and at nw=4 the
+#     bottleneck moves off-disk; Lance ends up *slower* here (0.58×).
+#     Use Lance for the video / multi-cam case; for tiny image-in-parquet
+#     datasets the upstream reader is fine.
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Programmatic conversion (equivalent to the shell commands above)
 # ──────────────────────────────────────────────────────────────────────
 #
@@ -249,25 +295,50 @@ from lerobot_lancedb import LeRobotLanceDataset, convert_to_lance
 # pipeline, push to the Hub right after, etc.
 
 
+# Each entry has per-dataset benchmark knobs because aloha's parquet+mp4
+# path is ~30x slower than the pusht variants — we need a smaller
+# ``num_batches`` to keep the benchmark from taking forever.
 DATASETS = [
-    {"repo_id": "lerobot/pusht", "output": "outputs/datasets/pusht_lance"},
-    {"repo_id": "lerobot/pusht_image", "output": "outputs/datasets/pusht_image_lance"},
-    {"repo_id": "lerobot/pusht-subtask", "output": "outputs/datasets/pusht-subtask_lance"},
+    {
+        "repo_id": "lerobot/pusht",
+        "output": "outputs/datasets/pusht_lance",
+        "bench": {"num_batches": 100, "warmup": 10},
+    },
+    {
+        "repo_id": "lerobot/pusht_image",
+        "output": "outputs/datasets/pusht_image_lance",
+        "bench": {"num_batches": 100, "warmup": 10},
+    },
+    {
+        "repo_id": "lerobot/pusht-subtask",
+        "output": "outputs/datasets/pusht-subtask_lance",
+        "bench": {"num_batches": 100, "warmup": 10},
+    },
     {
         "repo_id": "lerobot/aloha_static_cups_open",
         "output": "outputs/datasets/aloha_static_cups_open_lance",
+        "bench": {"num_batches": 30, "warmup": 5},
     },
 ]
 
 
-def convert_all(overwrite: bool = False, push_to_hub_owner: str | None = None) -> None:
-    """Run every conversion in ``DATASETS``, optionally uploading to the Hub.
+def convert_all(
+    overwrite: bool = False,
+    push_to_hub_owner: str | None = None,
+    benchmark: bool = False,
+    batch_size: int = 32,
+    num_workers: tuple[int, ...] = (0, 4),
+) -> None:
+    """Run every conversion in ``DATASETS``; optionally upload + benchmark.
 
     Args:
         overwrite: Replace existing Lance tables.
         push_to_hub_owner: When set (e.g. ``"me"``), upload each converted
-            dataset to ``hf://datasets/{owner}/{name}`` after conversion.
+            dataset to ``hf://datasets/{owner}/{name}_lance`` after conversion.
             Requires ``HF_TOKEN`` or ``huggingface-cli login``.
+        benchmark: After each conversion, run a quick throughput comparison
+            (parquet+mp4 vs Lance) and print the result table.
+        batch_size, num_workers: DataLoader knobs forwarded to the benchmark.
     """
     for entry in DATASETS:
         repo_id = entry["repo_id"]
@@ -287,8 +358,18 @@ def convert_all(overwrite: bool = False, push_to_hub_owner: str | None = None) -
             push_to_hub=push_to_hub,
             progress=False,
         )
-        dt = time.perf_counter() - t0
-        logging.info("  done in %.1fs", dt)
+        logging.info("  done in %.1fs", time.perf_counter() - t0)
+
+        if benchmark:
+            bench_kwargs = entry.get("bench", {})
+            print(f"\n=== Throughput: {repo_id} ===")
+            benchmark_throughput(
+                repo_id=repo_id,
+                lance_root=output,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                **bench_kwargs,
+            )
 
 
 def smoke_load(root: str | Path) -> None:
@@ -315,9 +396,34 @@ def main() -> None:
         action="store_true",
         help="After converting, open each output to verify readability.",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="After each conversion, print a throughput comparison "
+        "(parquet+mp4 vs Lance) for that dataset.",
+    )
+    parser.add_argument(
+        "--bench-batch-size",
+        type=int,
+        default=32,
+        help="DataLoader batch size used by the throughput benchmark.",
+    )
+    parser.add_argument(
+        "--bench-num-workers",
+        type=int,
+        nargs="+",
+        default=[0, 4],
+        help="DataLoader num_workers values to benchmark.",
+    )
     args = parser.parse_args()
 
-    convert_all(overwrite=args.overwrite, push_to_hub_owner=args.push_to_hub_owner)
+    convert_all(
+        overwrite=args.overwrite,
+        push_to_hub_owner=args.push_to_hub_owner,
+        benchmark=args.benchmark,
+        batch_size=args.bench_batch_size,
+        num_workers=tuple(args.bench_num_workers),
+    )
 
     if args.smoke_load:
         for entry in DATASETS:
