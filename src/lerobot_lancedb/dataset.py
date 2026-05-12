@@ -136,13 +136,21 @@ class LeRobotLanceDataset(LeRobotDataset):
         tolerance_s: float = 1e-4,
         return_uint8: bool = False,
         connect_kwargs: dict[str, Any] | None = None,
-        decode_device: str | torch.device | None = None,
+        decode_device: str | torch.device | None = "auto",
     ) -> None:
-        """``decode_device`` decodes JPEGs on the named torch device. Pass
-        ``"cuda"`` to use NVJPEG (typically ~10× faster than libjpeg-turbo on
-        CPU); pass ``None`` (the default) to decode on CPU. When set, decoded
-        image tensors are returned on that device, saving the H2D transfer
-        in the training loop.
+        """``decode_device`` decodes JPEGs on the named torch device.
+
+        * ``"auto"`` (default) — use ``cuda`` if available, otherwise ``cpu``.
+          Recommended for GPU training: NVJPEG is typically ~10× faster than
+          libjpeg-turbo and decoded tensors land on the GPU directly, saving
+          the H2D transfer in the training loop. The decoded-batch memory
+          (~230 MB per batch on a 4-cam 480×640 dataset) is memory the
+          forward pass needs on-GPU anyway, so this isn't extra pressure.
+        * ``"cpu"`` — force CPU decode. Useful if you're memory-constrained
+          on a small GPU (each spawn-mode worker spawns its own CUDA context,
+          ~500 MB-1 GB each), or if you want to control where tensors land.
+        * ``"cuda"`` / ``torch.device(...)`` — explicit device. Use when you
+          have multiple GPUs and want decode to land on a specific one.
         """
         # Skip LeRobotDataset.__init__ — it does Hub downloads + builds a
         # DatasetReader for the parquet+mp4 path, neither of which apply
@@ -194,13 +202,16 @@ class LeRobotLanceDataset(LeRobotDataset):
         self.delta_timestamps = delta_timestamps
         self.set_image_transforms(image_transforms)
         self._return_uint8 = return_uint8
-        # Normalize ``decode_device``. ``None`` → CPU (the safe default).
-        # We don't auto-detect CUDA: workers might be on different devices,
-        # and the user usually wants explicit control over where decoded
-        # tensors land.
-        self._decode_device = (
-            torch.device(decode_device) if decode_device is not None else None
-        )
+        # Resolve ``decode_device``:
+        #   "auto" (default) → cuda if available, else cpu
+        #   None             → cpu (back-compat with the original API)
+        #   "cuda"/"cpu"/torch.device(...) → use as-is
+        if decode_device == "auto":
+            decode_device = "cuda" if torch.cuda.is_available() else None
+        if decode_device in (None, "cpu"):
+            self._decode_device = None
+        else:
+            self._decode_device = torch.device(decode_device)
 
         # The parent has a few video-encoder-specific attributes used only on
         # the write path. We won't ever write, but pyright/static checks and

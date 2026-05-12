@@ -429,6 +429,7 @@ def convert_all(
 def benchmark_all(
     batch_size: int = 32,
     num_workers: tuple[int, ...] = (0, 4),
+    decode_device: str = "auto",
 ) -> None:
     """Run the throughput benchmark on each entry in ``BENCHMARK_DATASETS``.
 
@@ -442,7 +443,21 @@ def benchmark_all(
     Args:
         batch_size: DataLoader batch size.
         num_workers: Iterable of ``num_workers`` values to benchmark.
+        decode_device: Forwarded to the Lance reader's ``decode_device``.
+            ``"auto"`` (the default) picks CUDA if available — that's where
+            Lance's biggest win is.
     """
+    if decode_device == "auto":
+        import torch as _torch
+
+        resolved = "cuda" if _torch.cuda.is_available() else "cpu"
+        logging.info(
+            "Benchmark decode_device='auto' resolved to '%s' "
+            "(torch.cuda.is_available()=%s)",
+            resolved,
+            _torch.cuda.is_available(),
+        )
+
     for entry in BENCHMARK_DATASETS:
         repo_id = entry["repo_id"]
         output = entry["output"]
@@ -467,6 +482,7 @@ def benchmark_all(
             num_workers=num_workers,
             num_batches=num_batches,
             warmup=warmup,
+            decode_device=decode_device,
         )
 
         # Run B: with delta_timestamps (realistic training).
@@ -480,6 +496,7 @@ def benchmark_all(
                 num_batches=num_batches,
                 warmup=warmup,
                 delta_timestamps=deltas,
+                decode_device=decode_device,
             )
 
 
@@ -533,6 +550,14 @@ def main() -> None:
         default=[0, 4],
         help="DataLoader num_workers values to benchmark.",
     )
+    parser.add_argument(
+        "--decode-device",
+        type=str,
+        default="auto",
+        help="Device for JPEG decoding in the Lance reader. 'auto' (default) "
+        "uses CUDA if available — recommended on GPU machines for ~10× "
+        "decode speedup via NVJPEG. Pass 'cpu' to force CPU decode.",
+    )
     args = parser.parse_args()
 
     if not args.skip_convert:
@@ -549,6 +574,7 @@ def main() -> None:
         benchmark_all(
             batch_size=args.bench_batch_size,
             num_workers=tuple(args.bench_num_workers),
+            decode_device=args.decode_device,
         )
 
 
