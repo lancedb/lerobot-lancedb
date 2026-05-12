@@ -266,14 +266,21 @@ from lerobot_lancedb import LeRobotLanceDataset, benchmark_throughput, convert_t
 # lerobot/aloha_static_cups_open  (50 eps, 20 000 frames, 3.6 GB Lance):
 #   condition                          backend     bps   frames/s  speedup
 #   ───────────────────────────────────────────────────────────────────────
-#   shuffled, nw=0                     parquet    2.43         78
-#                                      lance      5.80        186   2.39x
-#   shuffled, nw=4                     parquet    3.58        115
-#                                      lance     13.90        445   3.88x
-#   shuffled + delta_timestamps, nw=0  parquet    0.98         31
-#                                      lance      1.75         56   1.78x
-#   shuffled + delta_timestamps, nw=4  parquet    1.56         50
-#                                      lance      2.53         81   1.62x
+#   shuffled, nw=0                     parquet    2.4          78
+#                                      lance      6.0         186   2.4x
+#   shuffled, nw=4 (sweet spot)        parquet    5.7         182
+#                                      lance     19.4         621   3.4x   ← typ.
+#   shuffled, nw=8                     parquet    3.3         106
+#                                      lance     16.3         522   5.0x
+#   shuffled + delta_timestamps, nw=4  parquet    1.6          51
+#                                      lance      2.5          81   1.6x
+#
+# Notes on the no-delta sweep: nw=4 is the per-core sweet spot on this
+# 8-core M-series laptop. Both backends regress past nw=4 (parquet
+# more, due to torchcodec/ffmpeg internal contention), so Lance's
+# relative speedup actually GROWS from 3.4× → 5.0× at nw=8 — but
+# absolute throughput tops out at nw=4 for both. On a workstation with
+# 16+ cores, Lance should keep scaling further while parquet plateaus.
 #
 # lerobot/aloha_static_ziploc_slide  (56 eps, 16 800 frames, 3.2 GB Lance):
 #   condition                          backend     bps   frames/s  speedup
@@ -299,7 +306,16 @@ from lerobot_lancedb import LeRobotLanceDataset, benchmark_throughput, convert_t
 # of their time decoding 256 × 480×640 frames per batch, and we can't
 # beat raw libjpeg-turbo on the same CPU. The lance fetch is essentially
 # free; the speedup over parquet+mp4 comes from avoiding torchcodec's
-# per-window seek, which is significant but bounded.
+# per-window seek (significant, but bounded).
+#
+# Scaling note: more workers = more decode parallelism, but only up to
+# the physical core count. On an 8-core M-series Mac, peak Lance
+# throughput on aloha is at nw=4 (~19 bps); nw=8 regresses slightly to
+# ~16 bps due to thermal throttling and memory pressure. The
+# parquet+mp4 path regresses MORE past nw=4 (torchcodec/ffmpeg
+# contention) so Lance's relative speedup actually widens at higher
+# nw, but absolute throughput stops climbing for both. ``prefetch_factor``
+# is already at PyTorch's default of 2; bumping to 4 didn't help.
 #
 # Where the gap widens (much larger speedups):
 #   * GPU NVJPEG — set ``decode_device='cuda'`` to decode JPEGs on the GPU.

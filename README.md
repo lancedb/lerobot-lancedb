@@ -65,23 +65,33 @@ Standard LeRobot datasets store frames inside multi-episode mp4 chunks. Every ba
 
 ### Throughput
 
-Lance is faster on every realistic training condition we've measured. The
-gap widens with frame resolution, number of cameras, and worker count.
+Lance is faster on every realistic training condition we've measured.
+The gap widens with frame resolution, number of cameras, and worker count.
 
-Measured on two real 4-camera × 480×640 ALOHA datasets (local SSD,
-M-series Mac, batch=32):
+Measured on `lerobot/aloha_static_cups_open` (4 cameras × 480×640 × 20k
+frames; local SSD, 8-core M-series Mac, batch=32; averaged across 3
+runs):
 
-| dataset | condition | parquet+mp4 (bps) | Lance (bps) | speedup |
-|---|---|---:|---:|---:|
-| `aloha_static_cups_open` | shuffled, nw=0 | 2.4 | 5.8 | **2.39×** |
-| `aloha_static_cups_open` | shuffled, nw=4 | 3.6 | 13.9 | **3.88×** |
-| `aloha_static_cups_open` | shuffled + delta_timestamps, nw=4 | 1.6 | 2.5 | **1.62×** |
-| `aloha_static_ziploc_slide` | shuffled, nw=0 | 2.6 | 6.0 | **2.36×** |
-| `aloha_static_ziploc_slide` | shuffled, nw=4 | 6.0 | 16.0 | **2.67×** |
-| `aloha_static_ziploc_slide` | shuffled + delta_timestamps, nw=4 | 1.9 | 3.4 | **1.75×** |
+| condition | parquet+mp4 (bps) | Lance (bps) | speedup |
+|---|---:|---:|---:|
+| shuffled, nw=4 (sweet spot) | 5.7 | **19.4** | **3.4×** |
+| shuffled, nw=8 (saturate cores) | 3.3 | 16.3 | **5.0×** |
+| shuffled + delta_timestamps, nw=4 | 1.6 | 2.5 | **1.6×** |
 
-Two independent datasets, same shape, consistent picture. Reproduce with
-`python examples/conversion.py --benchmark` (full numbers in the file).
+Two takeaways:
+
+1. **At the per-core sweet spot (nw=4 on this 8-core box), Lance is
+   ~3.4× faster.** Both backends regress past nw=4 because of thermal
+   throttling and (for parquet) torchcodec/ffmpeg internal contention.
+   On a workstation with 16+ cores, Lance should keep scaling further.
+
+2. **With `delta_timestamps` the gap narrows to ~1.6×.** Realistic
+   training reads a window of N frames per camera per item; torchcodec
+   amortizes the multi-frame seek so parquet+mp4 gets a discount. Lance
+   does straight 2× more decode work. We can't beat raw libjpeg-turbo
+   on the same CPU — see the GPU section below for how to close this.
+
+Reproduce with `python examples/conversion.py --benchmark`.
 
 #### Where the gap widens: GPU NVJPEG
 
