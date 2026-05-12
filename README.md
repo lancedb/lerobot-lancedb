@@ -68,18 +68,20 @@ Standard LeRobot datasets store frames inside multi-episode mp4 chunks. Every ba
 Lance is faster on every realistic training condition we've measured. The
 gap widens with frame resolution, number of cameras, and worker count.
 
-Measured on `lerobot/aloha_static_cups_open` (4 cameras × 480×640 × 20 000
-frames; local SSD, M-series Mac, batch=32):
+Measured on two real 4-camera × 480×640 ALOHA datasets (local SSD,
+M-series Mac, batch=32):
 
-| condition | parquet+mp4 (bps) | Lance (bps) | speedup |
-|---|---:|---:|---:|
-| shuffled, nw=0 | 2.4 | 5.8 | **2.39×** |
-| shuffled, nw=4 | 3.6 | 13.9 | **3.88×** |
-| shuffled + delta_timestamps, nw=0 | 1.0 | 1.8 | **1.78×** |
-| shuffled + delta_timestamps, nw=4 | 1.6 | 2.5 | **1.62×** |
+| dataset | condition | parquet+mp4 (bps) | Lance (bps) | speedup |
+|---|---|---:|---:|---:|
+| `aloha_static_cups_open` | shuffled, nw=0 | 2.4 | 5.8 | **2.39×** |
+| `aloha_static_cups_open` | shuffled, nw=4 | 3.6 | 13.9 | **3.88×** |
+| `aloha_static_cups_open` | shuffled + delta_timestamps, nw=4 | 1.6 | 2.5 | **1.62×** |
+| `aloha_static_ziploc_slide` | shuffled, nw=0 | 2.6 | 6.0 | **2.36×** |
+| `aloha_static_ziploc_slide` | shuffled, nw=4 | 6.0 | 16.0 | **2.67×** |
+| `aloha_static_ziploc_slide` | shuffled + delta_timestamps, nw=4 | 1.9 | 3.4 | **1.75×** |
 
-Reproduce with `python examples/conversion.py --benchmark` (full numbers
-across more datasets are embedded in the file).
+Two independent datasets, same shape, consistent picture. Reproduce with
+`python examples/conversion.py --benchmark` (full numbers in the file).
 
 **Caveat for tiny datasets:** on small toy datasets like the 50 MB
 `lerobot/pusht`, the entire dataset lives in the OS file cache after a

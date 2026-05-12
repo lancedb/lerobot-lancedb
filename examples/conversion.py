@@ -258,9 +258,12 @@ from lerobot_lancedb import LeRobotLanceDataset, benchmark_throughput, convert_t
 # in RAM and forces actual I/O + decode work". The aloha datasets answer
 # that.
 #
-# Multi-camera dataset (4 cameras × 480×640 × 20 000 frames, 3.6 GB lance):
+# Two independent 4-camera × 480×640 ALOHA datasets — using both lets you
+# spot run-to-run variance vs. structural effects. Lance is consistently
+# faster on every condition. Speedup ratios shown vs. parquet at the same
+# num_workers.
 #
-# lerobot/aloha_static_cups_open:
+# lerobot/aloha_static_cups_open  (50 eps, 20 000 frames, 3.6 GB Lance):
 #   condition                          backend     bps   frames/s  speedup
 #   ───────────────────────────────────────────────────────────────────────
 #   shuffled, nw=0                     parquet    2.43         78
@@ -271,6 +274,18 @@ from lerobot_lancedb import LeRobotLanceDataset, benchmark_throughput, convert_t
 #                                      lance      1.75         56   1.78x
 #   shuffled + delta_timestamps, nw=4  parquet    1.56         50
 #                                      lance      2.53         81   1.62x
+#
+# lerobot/aloha_static_ziploc_slide  (56 eps, 16 800 frames, 3.2 GB Lance):
+#   condition                          backend     bps   frames/s  speedup
+#   ───────────────────────────────────────────────────────────────────────
+#   shuffled, nw=0                     parquet    2.56         82
+#                                      lance      6.05        193   2.36x
+#   shuffled, nw=4                     parquet    5.99        192
+#                                      lance     16.01        512   2.67x
+#   shuffled + delta_timestamps, nw=0  parquet    1.24         40
+#                                      lance      2.26         72   1.82x
+#   shuffled + delta_timestamps, nw=4  parquet    1.92         62
+#                                      lance      3.36        108   1.75x
 #
 # When Lance helps (always, on real data):
 #   * Video-backed datasets — parquet+mp4 pays per-batch torchcodec seek +
@@ -305,25 +320,43 @@ DATASETS = [
         "repo_id": "lerobot/aloha_static_cups_open",
         "output": "outputs/datasets/aloha_static_cups_open_lance",
     },
+    {
+        "repo_id": "lerobot/aloha_static_ziploc_slide",
+        "output": "outputs/datasets/aloha_static_ziploc_slide_lance",
+    },
 ]
 
+
 # Only the larger real-world datasets are benchmarked — see the comment
-# block above for why we exclude the pusht-family. Each entry adds the
-# delta_timestamps + benchmark knobs we use for the comparison.
+# block above for why we exclude the pusht-family.
+#
+# Both entries are 4-camera × 480×640 ALOHA bimanual datasets — the
+# canonical "real training data" shape. Using two independent datasets
+# of the same shape lets readers spot run-to-run variance vs structural
+# effects.
+_ALOHA_DELTAS = {
+    # Observe (t-1, t) at 50 Hz; predict 16-step action chunk.
+    "observation.images.cam_high": [-0.02, 0.0],
+    "observation.images.cam_left_wrist": [-0.02, 0.0],
+    "observation.images.cam_low": [-0.02, 0.0],
+    "observation.images.cam_right_wrist": [-0.02, 0.0],
+    "observation.state": [-0.02, 0.0],
+    "action": [i / 50 for i in range(-1, 15)],
+}
+
+
 BENCHMARK_DATASETS = [
     {
         "repo_id": "lerobot/aloha_static_cups_open",
         "output": "outputs/datasets/aloha_static_cups_open_lance",
-        # ALOHA-style: observe (t-1, t), predict 16-step action chunk.
-        # Use the dataset's fps (50 Hz) to convert frame offsets → seconds.
-        "delta_timestamps": {
-            "observation.images.cam_high": [-0.02, 0.0],
-            "observation.images.cam_left_wrist": [-0.02, 0.0],
-            "observation.images.cam_low": [-0.02, 0.0],
-            "observation.images.cam_right_wrist": [-0.02, 0.0],
-            "observation.state": [-0.02, 0.0],
-            "action": [i / 50 for i in range(-1, 15)],
-        },
+        "delta_timestamps": _ALOHA_DELTAS,
+        "num_batches": 25,
+        "warmup": 5,
+    },
+    {
+        "repo_id": "lerobot/aloha_static_ziploc_slide",
+        "output": "outputs/datasets/aloha_static_ziploc_slide_lance",
+        "delta_timestamps": _ALOHA_DELTAS,
         "num_batches": 25,
         "warmup": 5,
     },
