@@ -242,3 +242,277 @@ def test_make_lerobot_dataset_routes_to_lance(lance_dataset_dir):
 def test_make_lerobot_dataset_forces_lance(lance_dataset_dir):
     ds = make_lerobot_dataset(backend="lance", root=lance_dataset_dir, return_uint8=True)
     assert isinstance(ds, LeRobotLanceDataset)
+
+
+# ── multi-camera (dtype=image) ───────────────────────────────────────
+
+
+_MULTICAM_FEATURES = {
+    "observation.state": {"dtype": "float32", "shape": (4,), "names": ["s0", "s1", "s2", "s3"]},
+    "action": {"dtype": "float32", "shape": (2,), "names": ["a0", "a1"]},
+    "observation.images.cam_left": {
+        "dtype": "image",
+        "shape": (3, 24, 32),
+        "names": ["channels", "height", "width"],
+    },
+    "observation.images.cam_right": {
+        "dtype": "image",
+        "shape": (3, 24, 32),
+        "names": ["channels", "height", "width"],
+    },
+}
+
+
+@pytest.fixture(scope="module")
+def multicam_parquet_dataset(tmp_path_factory):
+    """A 2-camera parquet+image dataset (no mp4 codec)."""
+    root = tmp_path_factory.mktemp("multicam_holder") / "ds"
+    ds = LeRobotDataset.create(
+        repo_id="lance_test/multicam",
+        fps=_DEFAULT_FPS,
+        features=_MULTICAM_FEATURES,
+        root=root,
+        use_videos=False,
+    )
+    rng = np.random.default_rng(7)
+    for _ in range(2):  # two episodes of 4 frames each
+        for _ in range(4):
+            ds.add_frame(
+                {
+                    "observation.state": torch.tensor(
+                        rng.standard_normal(4), dtype=torch.float32
+                    ),
+                    "action": torch.tensor(rng.standard_normal(2), dtype=torch.float32),
+                    "observation.images.cam_left": rng.integers(
+                        0, 256, size=(3, 24, 32), dtype=np.uint8
+                    ),
+                    "observation.images.cam_right": rng.integers(
+                        0, 256, size=(3, 24, 32), dtype=np.uint8
+                    ),
+                    "task": "multicam_task",
+                }
+            )
+        ds.save_episode()
+    ds.finalize()
+    return root
+
+
+@pytest.fixture(scope="module")
+def multicam_lance_dir(multicam_parquet_dataset, tmp_path_factory):
+    out = tmp_path_factory.mktemp("multicam_lance_out")
+    convert_to_lance(
+        repo_id="lance_test/multicam",
+        output=out,
+        src_root=multicam_parquet_dataset,
+        overwrite=True,
+        progress=False,
+    )
+    return out
+
+
+def test_multicam_two_image_keys_decoded(multicam_lance_dir):
+    """Both camera keys must come back as (C, H, W) tensors per frame."""
+    ds = LeRobotLanceDataset(root=multicam_lance_dir, return_uint8=True)
+    item = ds[0]
+    assert "observation.images.cam_left" in item
+    assert "observation.images.cam_right" in item
+    # dtype="image" features always come back as float32 [0, 1] regardless of
+    # return_uint8 — that's what upstream LeRobotDataset does too.
+    for cam in ("observation.images.cam_left", "observation.images.cam_right"):
+        assert item[cam].shape == (3, 24, 32)
+        assert item[cam].dtype == torch.float32
+
+
+def test_multicam_batched_decode_is_one_call_per_key(multicam_lance_dir):
+    """Batched getitems must produce one tensor per (sample, camera).
+
+    The internal blob_layout is keyed per-camera and decoded in one batched
+    torchvision call per camera; this test catches regressions where camera
+    keys get mixed up or one decode call leaks blobs from another camera.
+    """
+    ds = LeRobotLanceDataset(root=multicam_lance_dir, return_uint8=True)
+    batch = ds.__getitems__([0, 1, 2, 3])
+    for s in range(4):
+        assert batch[s]["observation.images.cam_left"].shape == (3, 24, 32)
+        assert batch[s]["observation.images.cam_right"].shape == (3, 24, 32)
+    # Different cameras must produce different pixels (JPEG of random arrays).
+    assert not torch.equal(
+        batch[0]["observation.images.cam_left"],
+        batch[0]["observation.images.cam_right"],
+    )
+
+
+# ── subtasks ─────────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def subtasks_lance_dir(parquet_dataset, tmp_path_factory):
+    """Reuse the standard parquet fixture; add a subtasks sidecar manually.
+
+    Subtasks aren't writable via LeRobotDataset.add_frame in 0.5.x — they
+    live as a parquet sidecar (``meta/subtasks.parquet``) that the converter
+    copies verbatim. We synthesise one with a single subtask row + a
+    subtask_index column inside the parquet via direct file edits.
+    """
+    import shutil
+
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    src_root, _, _ = parquet_dataset
+    holder = tmp_path_factory.mktemp("subtasks_holder")
+    src_copy = holder / "ds"
+    shutil.copytree(src_root, src_copy)
+
+    # 1) Add a subtasks.parquet sidecar (index name "subtask").
+    subtasks_df = pd.DataFrame({"subtask_index": [0, 1]}, index=["sub_a", "sub_b"])
+    subtasks_df.index.name = "subtask"
+    subtasks_df.to_parquet(src_copy / "meta" / "subtasks.parquet")
+
+    # 2) Inject a subtask_index column into every data parquet (round-robin
+    #    between subtasks 0 and 1 so the test can distinguish them).
+    data_files = sorted((src_copy / "data").rglob("*.parquet"))
+    assert data_files, "expected at least one data parquet"
+    for fp in data_files:
+        tbl = pq.read_table(fp)
+        n = tbl.num_rows
+        sub_idx = pa.array([i % 2 for i in range(n)], type=pa.int32())
+        tbl = tbl.append_column("subtask_index", sub_idx)
+        pq.write_table(tbl, fp)
+
+    # 3) Register the new column in info.json so meta.features knows about it.
+    import json
+
+    info_path = src_copy / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["features"]["subtask_index"] = {
+        "dtype": "int64",
+        "shape": [1],
+        "names": None,
+    }
+    info_path.write_text(json.dumps(info))
+
+    # 4) Convert.
+    out = tmp_path_factory.mktemp("subtasks_lance_out")
+    convert_to_lance(
+        repo_id="lance_test/tiny",
+        output=out,
+        src_root=src_copy,
+        overwrite=True,
+        progress=False,
+    )
+    return out
+
+
+def test_subtask_index_round_trips(subtasks_lance_dir):
+    """subtask_index column + subtask string lookup both flow through."""
+    ds = LeRobotLanceDataset(root=subtasks_lance_dir, return_uint8=True)
+    item0 = ds[0]
+    item1 = ds[1]
+
+    # Numeric column round-trips.
+    assert int(item0["subtask_index"]) == 0
+    assert int(item1["subtask_index"]) == 1
+
+    # String resolution via meta.subtasks.
+    assert item0.get("subtask") == "sub_a"
+    assert item1.get("subtask") == "sub_b"
+
+
+# ── video features (dtype="video") — gated on ffmpeg ─────────────────
+
+
+@pytest.fixture(scope="module")
+def video_parquet_dataset(tmp_path_factory):
+    """A 1-camera video-backed dataset; needs ffmpeg to encode mp4 chunks.
+
+    Skipped automatically when ffmpeg / torchcodec aren't available.
+    """
+    pytest.importorskip("torchcodec", reason="torchcodec is required for video features")
+    import shutil
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg binary not on PATH")
+
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (4,),
+            "names": ["s0", "s1", "s2", "s3"],
+        },
+        "action": {"dtype": "float32", "shape": (2,), "names": ["a0", "a1"]},
+        # dtype="video" → mp4 storage on the source side; the converter
+        # decodes and re-encodes per-frame as JPEG into the Lance table.
+        "observation.image": {
+            "dtype": "video",
+            "shape": (3, 32, 48),
+            "names": ["channels", "height", "width"],
+        },
+    }
+
+    root = tmp_path_factory.mktemp("video_src_holder") / "ds"
+    # Use h264; libsvtav1 (the LeRobot default) is slow + can be missing.
+    ds = LeRobotDataset.create(
+        repo_id="lance_test/video",
+        fps=_DEFAULT_FPS,
+        features=features,
+        root=root,
+        use_videos=True,
+        vcodec="h264",
+    )
+    rng = np.random.default_rng(11)
+    for _ in range(2):
+        for _ in range(4):
+            ds.add_frame(
+                {
+                    "observation.state": torch.tensor(
+                        rng.standard_normal(4), dtype=torch.float32
+                    ),
+                    "action": torch.tensor(rng.standard_normal(2), dtype=torch.float32),
+                    "observation.image": rng.integers(
+                        0, 256, size=(3, 32, 48), dtype=np.uint8
+                    ),
+                    "task": "video_task",
+                }
+            )
+        ds.save_episode()
+    ds.finalize()
+    return root
+
+
+@pytest.fixture(scope="module")
+def video_lance_dir(video_parquet_dataset, tmp_path_factory):
+    out = tmp_path_factory.mktemp("video_lance_out")
+    convert_to_lance(
+        repo_id="lance_test/video",
+        output=out,
+        src_root=video_parquet_dataset,
+        overwrite=True,
+        progress=False,
+    )
+    return out
+
+
+def test_video_round_trip_shape_and_normalization(video_parquet_dataset, video_lance_dir):
+    """A dtype=video feature must convert to JPEG-binary in Lance and come
+    back as a (C, H, W) tensor. Pixels won't match byte-for-byte (mp4 → frame
+    → JPEG → frame is a triple-lossy path), but shape, dtype and range must
+    be right and the image must not be all-zeros.
+    """
+    ds = LeRobotLanceDataset(root=video_lance_dir, return_uint8=True)
+    item = ds[0]
+    img = item["observation.image"]
+    assert img.shape == (3, 32, 48)
+    # dtype=video honors return_uint8 (unlike dtype=image).
+    assert img.dtype == torch.uint8
+    # Decoded image isn't degenerate.
+    assert int(img.max()) - int(img.min()) > 5
+
+
+def test_video_return_uint8_false_yields_float32(video_lance_dir):
+    """With return_uint8=False, video frames come back as float32 in [0, 1]."""
+    ds = LeRobotLanceDataset(root=video_lance_dir, return_uint8=False)
+    img = ds[0]["observation.image"]
+    assert img.dtype == torch.float32
+    assert img.min() >= 0.0 and img.max() <= 1.0
