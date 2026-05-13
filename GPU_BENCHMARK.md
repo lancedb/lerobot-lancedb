@@ -133,19 +133,29 @@ python examples/conversion.py --skip-convert --benchmark \
 
 ## What to expect
 
-On an Ampere / Hopper GPU with the dataset on local NVMe, with
-`delta_timestamps` on and `num_workers=4`:
+Measured on H100 80GB with `delta_timestamps` on and the dataset on
+local NVMe:
 
-| backend | bps (M-series Mac, CPU) | bps (CUDA, NVJPEG) | speedup vs CPU lance |
-|---|---:|---:|---:|
-| parquet+mp4 | 1.6 | ~1.6 (unchanged) | — |
-| **Lance** | 2.5 | **~17–18 (projected)** | **~7×** |
-| **Lance speedup vs parquet** | 1.6× | **~10–11× (projected)** | |
+| dataset | nw | parquet+mp4 (bps) | Lance (bps) | speedup |
+|---|---:|---:|---:|---:|
+| `aloha_static_cups_open` | 0 | 1.14 | 3.41 | **3.00×** |
+| `aloha_static_cups_open` | 4 | 2.14 | 10.87 | **5.07×** |
+| `aloha_static_ziploc_slide` | 0 | 1.14 | 3.35 | **2.93×** |
+| `aloha_static_ziploc_slide` | 4 | 1.63 | 11.11 | **6.82×** |
 
-Without `delta_timestamps`, expect ~15–20× over parquet+mp4 on
-the same GPU. (The smaller speedup with delta_timestamps is because
-torchcodec amortizes the multi-frame seek per camera; this is the
-worst case for Lance, and even it improves to 10×+ on GPU.)
+Two takeaways:
+
+1. **At `num_workers=4`, Lance is 5-7× faster than parquet+mp4** under
+   the realistic training pattern (windowed reads via
+   `delta_timestamps`). Two independent datasets give consistent
+   numbers — this is a structural effect, not a fluke.
+2. **Parquet stays close to its CPU throughput** because the upstream
+   reader doesn't use NVDEC by default (and NVDEC is harder to set
+   up + bad at random-access reads anyway). Lance gets ~3× the bump
+   from CPU→GPU on the same hardware purely from NVJPEG.
+
+Without `delta_timestamps`, expect even larger speedups on the same
+GPU (the no-delta CPU baseline is already 3-4× and the GPU gap widens).
 
 ## Reporting back
 

@@ -66,32 +66,47 @@ Standard LeRobot datasets store frames inside multi-episode mp4 chunks. Every ba
 ### Throughput
 
 Lance is faster on every realistic training condition we've measured.
-The gap widens with frame resolution, number of cameras, and worker count.
+The gap widens with frame resolution, number of cameras, and (especially)
+GPU acceleration.
 
-Measured on `lerobot/aloha_static_cups_open` (4 cameras × 480×640 × 20k
-frames; local SSD, 8-core M-series Mac, batch=32; averaged across 3
-runs):
+#### Measured on H100 (NVJPEG auto-enabled, delta_timestamps on)
 
-| condition | parquet+mp4 (bps) | Lance (bps) | speedup |
-|---|---:|---:|---:|
-| shuffled, nw=4 (sweet spot) | 5.7 | **19.4** | **3.4×** |
-| shuffled, nw=8 (saturate cores) | 3.3 | 16.3 | **5.0×** |
-| shuffled + delta_timestamps, nw=4 | 1.6 | 2.5 | **1.6×** |
+Realistic training pattern — ALOHA-style `delta_timestamps`, 4 cameras
+× 480×640, batch=32, local SSD:
 
-Two takeaways:
+| dataset | nw | parquet+mp4 (bps) | Lance (bps) | speedup |
+|---|---:|---:|---:|---:|
+| `aloha_static_cups_open` | 0 | 1.14 | 3.41 | **3.00×** |
+| `aloha_static_cups_open` | 4 | 2.14 | **10.87** | **5.07×** |
+| `aloha_static_ziploc_slide` | 0 | 1.14 | 3.35 | **2.93×** |
+| `aloha_static_ziploc_slide` | 4 | 1.63 | **11.11** | **6.82×** |
 
-1. **At the per-core sweet spot (nw=4 on this 8-core box), Lance is
-   ~3.4× faster.** Both backends regress past nw=4 because of thermal
-   throttling and (for parquet) torchcodec/ffmpeg internal contention.
-   On a workstation with 16+ cores, Lance should keep scaling further.
+`decode_device="auto"` (the default) picks NVJPEG when CUDA is
+available, so this happens with zero user code changes — just install
+on a CUDA box. See [`GPU_BENCHMARK.md`](GPU_BENCHMARK.md) for the
+full reproduction recipe.
 
-2. **With `delta_timestamps` the gap narrows to ~1.6×.** Realistic
-   training reads a window of N frames per camera per item; torchcodec
-   amortizes the multi-frame seek so parquet+mp4 gets a discount. Lance
-   does straight 2× more decode work. We can't beat raw libjpeg-turbo
-   on the same CPU — see the GPU section below for how to close this.
+#### Why parquet+mp4 can't (easily) close the gap on GPU
 
-Reproduce with `python examples/conversion.py --benchmark`.
+* lerobot stores frames as **mp4 video** → would need **NVDEC** (video decoder).
+* `lerobot-lancedb` stores frames as **per-row JPEGs** → uses **NVJPEG** (image decoder).
+
+NVJPEG is built into torchvision, decodes independent JPEGs at full
+speed regardless of order, and scales with CUDA cores. NVDEC needs
+torchcodec built against the NVIDIA Video Codec SDK, is codec-specific
+(H.264 mostly OK, AV1 patchy), is bottlenecked by the 1-2 NVDEC
+engines on most cards, and pays a seek-to-keyframe + decode-forward
+cost on every shuffled batch.
+
+#### CPU baseline (for reference)
+
+On a CPU-only box (8-core M-series Mac), with delta_timestamps the
+speedup is more modest (~1.6×): both backends bottleneck on the same
+CPU JPEG/video decoder, and Lance's win comes from avoiding torchcodec's
+per-frame seek overhead. Without delta_timestamps it's 3.4× at the
+per-core sweet spot.
+
+Reproduce any of these with `python examples/conversion.py --benchmark`.
 
 #### Where the gap widens: GPU NVJPEG (auto-enabled)
 
@@ -114,12 +129,12 @@ ds = LeRobotLanceDataset(root="./pusht_lance", decode_device="cpu")
 
 `torchvision.io.decode_jpeg` uses NVJPEG when given `device="cuda"`
 — typically ~10× faster than CPU libjpeg-turbo on a single NVIDIA GPU,
-and decoded tensors land on the GPU directly (no H2D copy). Extrapolating
-the local-SSD numbers above, this brings Lance to **~7× the current
-CPU-Lance throughput**, i.e. ~10-20× the upstream parquet+mp4 path. The
-parquet+mp4 path could in theory match this with NVDEC, but torchcodec's
-CUDA support is much more limited (codec-specific) and not enabled by
-default in LeRobot.
+and decoded tensors land on the GPU directly (no H2D copy). On H100
+this translates to a **5-7× speedup over the upstream parquet+mp4
+reader under realistic delta_timestamps** training reads (measured —
+see the table above). The parquet+mp4 path could in theory match this
+with NVDEC, but torchcodec's CUDA support is much more limited
+(codec-specific) and not enabled by default in LeRobot.
 
 See [`GPU_BENCHMARK.md`](GPU_BENCHMARK.md) for the step-by-step recipe.
 
