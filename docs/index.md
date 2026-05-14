@@ -60,7 +60,7 @@ Plug it into any code that expects a `LeRobotDataset`:
 
 Realistic training read pattern (`delta_timestamps`, 8 frames per sample, `batch_size=32`, `num_workers=4`, CPU decode, H100) on `lerobot/aloha_static_cups_open` (480×640, 4-cam bimanual):
 
-| format | size MB | fps | speedup vs upstream | bit-exact? |
+| format | size MB | fps | speedup | bit-exact? |
 |---|---:|---:|---:|:---:|
 | upstream parquet+mp4 | 485.6 | 18.7 | 1.00× | ✓ |
 | `convert_to_lance` (JPEG-95) | 3 626 | 46.0 | 2.46× | ✗ |

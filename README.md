@@ -45,7 +45,7 @@ For the JPEG layout, use `lerobot-convert-to-lance` and `LeRobotLanceDataset` in
 
 Realistic training read pattern (`delta_timestamps`, 8 frames / sample, batch 32, num_workers 4, CPU decode, H100):
 
-| dataset | format | size MB | delta_ts fps | **speedup vs upstream** | bit-exact? |
+| dataset | format | size MB | delta_ts fps | **speedup** | bit-exact? |
 |---|---|---:|---:|---:|:---:|
 | **pusht** (96×96, 1-cam) | upstream parquet+mp4 | 7.3 | 750 | 1.00× | ✓ |
 | | `convert_to_lance` (JPEG-95) | 60.0 | 3510 | **4.68×** | ✗ (6.2% pixels differ) |

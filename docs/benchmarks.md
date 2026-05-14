@@ -17,7 +17,7 @@ Reproduce with [`examples/benchmark_formats.py`](https://github.com/lancedb/lero
 
 ### `lerobot/pusht` (synthetic 96×96, 1-cam)
 
-| format | size MB | delta_ts fps | speedup vs upstream | bit-exact? |
+| format | size MB | delta_ts fps | speedup | bit-exact? |
 |---|---:|---:|---:|:---:|
 | upstream parquet+mp4 | **7.3** | 750 | 1.00× | ✓ |
 | `convert_to_lance` (JPEG-95) | 60.0 | 3510 | **4.68×** | ✗ |
@@ -26,7 +26,7 @@ Reproduce with [`examples/benchmark_formats.py`](https://github.com/lancedb/lero
 
 ### `lerobot/aloha_static_cups_open` (real 480×640, 4-cam bimanual)
 
-| format | size MB | delta_ts fps | speedup vs upstream | bit-exact? |
+| format | size MB | delta_ts fps | speedup | bit-exact? |
 |---|---:|---:|---:|:---:|
 | upstream parquet+mp4 | **485.6** | 18.7 | 1.00× | ✓ |
 | `convert_to_lance` (JPEG-95) | 3 626 | 46.0 | **2.46×** | ✗ |
@@ -35,7 +35,7 @@ Reproduce with [`examples/benchmark_formats.py`](https://github.com/lancedb/lero
 
 ### `lerobot/koch_pick_place_5_lego` (real 480×640, 2-cam single-arm)
 
-| format | size MB | delta_ts fps | speedup vs upstream | bit-exact? |
+| format | size MB | delta_ts fps | speedup | bit-exact? |
 |---|---:|---:|---:|:---:|
 | upstream parquet+mp4 | **2 014** | 26.6 | 1.00× | ✓ |
 | `convert_to_lance` (JPEG-95) | 8 541 | 70.8 | **2.66×** | ✗ |
