@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import shutil
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +44,20 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_JPEG_QUALITY = 95
+
+
+def _default_encode_workers() -> int:
+    """Heuristic worker count for the image-encode thread pool.
+
+    PIL's libjpeg-turbo / libpng paths release the GIL on encode, so threads
+    do scale. Cap at the smaller of (CPU count, 8) — the writer iterates
+    one episode at a time and additional threads beyond that gain little.
+    """
+    cpu = os.cpu_count() or 1
+    return max(1, min(cpu, 8))
+
+
+_ENCODE_WORKERS = _default_encode_workers()
 
 
 def _decode_video_frames_compat(video_path, timestamps, tolerance_s, backend):
@@ -223,15 +239,17 @@ def _episode_record_batch(
             continue
         if key in video_keys:
             frames = decoded_videos[key]
-            blobs = [
-                _encode_image(frames[i], jpeg_quality, lossless, chroma_subsampling)
-                for i in range(ep_len)
-            ]
+
+            def _enc_v(i: int, frames=frames):
+                return _encode_image(frames[i], jpeg_quality, lossless, chroma_subsampling)
+
+            with ThreadPoolExecutor(max_workers=_ENCODE_WORKERS) as pool:
+                blobs = list(pool.map(_enc_v, range(ep_len)))
             arrays[lance_key] = pa.array(blobs, type=pa.binary())
         elif key in image_keys:
-            blobs = []
             col = rows[key]
-            for i in range(ep_len):
+
+            def _enc_i(i: int, col=col):
                 v = col[i] if isinstance(col, list) else col[i]
                 if isinstance(v, Image.Image):
                     buf = io.BytesIO()
@@ -244,9 +262,11 @@ def _episode_record_batch(
                             quality=jpeg_quality,
                             subsampling=chroma_subsampling,
                         )
-                    blobs.append(buf.getvalue())
-                else:
-                    blobs.append(_encode_image(v, jpeg_quality, lossless, chroma_subsampling))
+                    return buf.getvalue()
+                return _encode_image(v, jpeg_quality, lossless, chroma_subsampling)
+
+            with ThreadPoolExecutor(max_workers=_ENCODE_WORKERS) as pool:
+                blobs = list(pool.map(_enc_i, range(ep_len)))
             arrays[lance_key] = pa.array(blobs, type=pa.binary())
         else:
             dim = tabular_dims[lance_key]

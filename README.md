@@ -40,8 +40,10 @@ Most lerobot datasets are `dtype=video` — the upstream stores frames inside pe
 ### Convert: video-stored datasets (recommended path)
 
 ```bash
-python -c "from lerobot_lancedb import convert_to_lance_video; \
-    convert_to_lance_video('lerobot/pusht', './pusht_lance_video')"
+lerobot-convert-to-lance-video \
+    --repo-id=lerobot/pusht \
+    --output=./pusht_lance_video \
+    --overwrite
 ```
 
 This produces:
@@ -239,15 +241,18 @@ Highlights:
 --push-to-hub REPO          Optional HF Hub repo to upload to
 ```
 
-For `convert_to_lance_video`, use the Python API (no separate CLI yet):
+```bash
+lerobot-convert-to-lance-video --help
+```
 
-```python
-from lerobot_lancedb import convert_to_lance_video
-convert_to_lance_video(
-    repo_id="lerobot/aloha_static_cups_open",
-    output="./aloha_cups_open_lance_video",
-    overwrite=True,
-)
+```
+--repo-id REPO_ID           Source HF dataset (required)
+--output OUTPUT             Local output dir (required)
+--src-root SRC_ROOT         Override the source root (else fetched from HF cache)
+--revision REVISION         HF revision / branch / tag
+--table-name TABLE_NAME     Override the frames-table name (default: last segment of repo_id)
+--tolerance-s TOLERANCE_S   Frame-timestamp tolerance for video decode
+--overwrite                 Drop and rewrite if the target already exists
 ```
 
 ## Examples
@@ -276,10 +281,9 @@ Issues and PRs welcome. The package is intentionally small:
 
 ## Known issues / TODO
 
-- **PNG writer is slow on large multi-camera datasets.** Conversion is single-threaded; deflate-compressing every pixel of every frame across 4 cameras at 480×640 takes ~75 min for `lerobot/aloha_static_cups_open` (vs ~11 min for the JPEG-95 path and <1 min for `convert_to_lance_video`). For `dtype=video` sources, prefer `convert_to_lance_video` — it's both faster to write and bit-exact. Parallelizing the PNG writer across episodes would be a worthwhile optimization but isn't done yet.
-- **`convert_to_lance_video` has no standalone CLI yet.** Use the Python API.
-- **Per-epoch reshuffle** via `PermutationBuilder.shuffle` isn't wired up yet — the current shuffling relies on the DataLoader sampler.
-- **NVDEC for the video-blob path** isn't enabled. torchcodec on CPU is fast enough that this hasn't been a bottleneck in practice, but on huge multi-camera datasets a GPU decode path would close more of the gap to JPEG/NVJPEG.
+- **PNG writer is still slow vs the video-blob path on large datasets.** Per-frame PIL PNG encode now uses a 4–8-thread pool (~5–8× faster than the previous single-threaded path), so ALOHA cups_open dropped from ~75 min to ~13 min — but `convert_to_lance_video` finishes the same dataset in under a minute because it never decodes the source video. For `dtype=video` sources, prefer the video-blob path. PNG remains the right pick for `dtype=image` sources where there's no source mp4.
+- **Cloud-coherent sequential shuffle** via `PermutationBuilder.shuffle(clump_size=...)` isn't wired up. The current readers do random-access `__getitems__` (driven by the DataLoader's sampler), which is the right call for local SSD but pays per-row latency on cloud storage. A streaming sequential path with clump-shuffled physical order would be a separate API; not blocking for v0.
+- **NVDEC for the video-blob path** depends on a torchcodec build with CUDA support (the default pip wheel uses the ffmpeg variant, which raises `Unsupported device: cuda` when asked to decode on GPU). Rebuilding torchcodec against the NVIDIA Video Codec SDK is doable but the supported codec set is narrow — e.g. AV1 NVDEC needs RTX 40-series / Hopper or newer. For multi-camera natural-image datasets where decode dominates, this is the biggest remaining lever; for everything else, CPU torchcodec is already fast enough.
 
 ## License
 

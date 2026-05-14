@@ -52,6 +52,7 @@ dev = [
 
 [project.scripts]
 lerobot-convert-to-lance = "lerobot_lancedb.scripts.convert_to_lance:main"
+lerobot-convert-to-lance-video = "lerobot_lancedb.scripts.convert_to_lance_video:main"
 
 [project.urls]
 homepage = "https://github.com/lancedb/lerobot-lancedb"
