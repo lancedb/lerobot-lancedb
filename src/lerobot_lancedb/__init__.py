@@ -14,7 +14,8 @@ from __future__ import annotations
 from .auto import make_lerobot_dataset
 from .benchmark import benchmark_throughput, print_throughput_table
 from .dataset import LeRobotLanceDataset
-from .writer import convert_to_lance
+from .lance_video_dataset import LeRobotLanceVideoDataset
+from .writer import convert_to_lance, convert_to_lance_video
 
 
 __version__ = "0.1.0.dev0"
@@ -22,8 +23,10 @@ __version__ = "0.1.0.dev0"
 
 __all__ = [
     "LeRobotLanceDataset",
+    "LeRobotLanceVideoDataset",
     "benchmark_throughput",
     "convert_to_lance",
+    "convert_to_lance_video",
     "make_lerobot_dataset",
     "print_throughput_table",
     "__version__",

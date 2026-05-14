@@ -47,7 +47,9 @@ from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.utils.constants import ACTION, OBS_IMAGES
 
-from lerobot_lancedb import LeRobotLanceDataset
+from lerobot.datasets import LeRobotDataset
+
+from lerobot_lancedb import LeRobotLanceDataset, LeRobotLanceVideoDataset
 
 log = logging.getLogger("train_and_eval_lance")
 
@@ -90,6 +92,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-eval", action="store_true", help="Train only, no offline eval.")
     p.add_argument("--seed", type=int, default=100000,
                    help="Default matches lerobot/diffusion_pusht (seed=100000).")
+    p.add_argument("--upstream-loader", action="store_true",
+                   help="Use the upstream parquet+mp4 LeRobotDataset instead of LeRobotLanceDataset. "
+                        "Useful for head-to-head comparisons. Ignores --lance-root and --decode-device.")
+    p.add_argument("--video-loader", action="store_true",
+                   help="Use LeRobotLanceVideoDataset (Lance blob v2 + torchcodec on-the-fly decode) "
+                        "instead of the default JPEG/PNG-encoded LeRobotLanceDataset. Requires the "
+                        "dataset to have been converted with convert_to_lance_video.")
     return p.parse_args()
 
 
@@ -120,12 +129,16 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("device=%s lance_root=%s", device, args.lance_root)
 
-    if not args.lance_root.exists():
+    if not args.upstream_loader and not args.lance_root.exists():
         raise FileNotFoundError(
-            f"{args.lance_root} not found. Run `python examples/conversion.py` first."
+            f"{args.lance_root} not found. Run `python examples/conversion.py` first "
+            "or pass --upstream-loader to use the upstream parquet+mp4 path."
         )
 
-    meta = LeRobotDatasetMetadata(repo_id=args.repo_id, root=args.lance_root)
+    if args.upstream_loader:
+        meta = LeRobotDatasetMetadata(repo_id=args.repo_id)
+    else:
+        meta = LeRobotDatasetMetadata(repo_id=args.repo_id, root=args.lance_root)
     if args.eval_fraction > 0:
         train_eps, eval_eps = split_episodes(meta.total_episodes, args.eval_fraction)
     else:
@@ -167,14 +180,22 @@ def main() -> None:
         ACTION: [t / meta.fps for t in cfg.action_delta_indices],
     }
 
-    if not args.skip_train:
-        train_dataset = LeRobotLanceDataset(
+    def make_dataset() -> torch.utils.data.Dataset:
+        if args.upstream_loader:
+            return LeRobotDataset(
+                repo_id=args.repo_id,
+                delta_timestamps=delta_timestamps,
+            )
+        return LeRobotLanceDataset(
             root=args.lance_root,
             repo_id=args.repo_id,
             delta_timestamps=delta_timestamps,
             return_uint8=True,
             decode_device=args.decode_device,
         )
+
+    if not args.skip_train:
+        train_dataset = make_dataset()
         sampler = EpisodeAwareSampler(
             meta.episodes["dataset_from_index"],
             meta.episodes["dataset_to_index"],
@@ -183,8 +204,9 @@ def main() -> None:
             shuffle=True,
         )
         # pin_memory only works for CPU tensors. With decode_device='cpu' (the safer default)
-        # we can pin; with 'cuda'/'auto' we can't, since the dataloader yields CUDA tensors.
-        pin = device.type == "cuda" and args.decode_device == "cpu"
+        # or the upstream parquet+mp4 loader, tensors are on CPU and can be pinned.
+        # With decode_device='cuda'/'auto', the Lance dataloader yields CUDA tensors and we can't.
+        pin = device.type == "cuda" and (args.upstream_loader or args.decode_device == "cpu")
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             num_workers=args.num_workers,
@@ -261,14 +283,8 @@ def main() -> None:
     log.info("eval: frames=%d batches~=%d", len(eval_indices), int(np.ceil(len(eval_indices) / args.eval_batch_size)))
 
     # New dataset instance; we drive sample selection ourselves via a SubsetSampler.
-    eval_dataset = LeRobotLanceDataset(
-        root=args.lance_root,
-        repo_id=args.repo_id,
-        delta_timestamps=delta_timestamps,
-        return_uint8=True,
-        decode_device=args.decode_device,
-    )
-    eval_pin = device.type == "cuda" and args.decode_device == "cpu"
+    eval_dataset = make_dataset()
+    eval_pin = device.type == "cuda" and (args.upstream_loader or args.decode_device == "cpu")
     eval_loader = torch.utils.data.DataLoader(
         eval_dataset,
         num_workers=args.num_workers,
