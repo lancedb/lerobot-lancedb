@@ -11,11 +11,21 @@ Both readers expose the same API. Pick by source `dtype` (see [Conversion](conve
 
 ## Install
 
+Until the first PyPI release, install from GitHub:
+
 ```bash
-pip install lerobot-lancedb
+pip install git+https://github.com/lancedb/lerobot-lancedb.git
 ```
 
-Pulls in:
+For local development:
+
+```bash
+git clone https://github.com/lancedb/lerobot-lancedb.git
+cd lerobot-lancedb
+pip install -e '.[dev]'
+```
+
+Either path pulls in:
 
 - `lerobot[dataset]`
 - `lancedb` / `pylance`
