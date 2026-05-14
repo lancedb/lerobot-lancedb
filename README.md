@@ -64,18 +64,15 @@ Reproducible via [`examples/benchmark_formats.py`](examples/benchmark_formats.py
 
 ## Training parity
 
-End-to-end check that the loader trains models that behave the same as the upstream loader. Full details in [`docs/benchmarks.md`](https://lancedb.github.io/lerobot-lancedb/benchmarks/).
+End-to-end check that all three Lance storage modes train ACT to the same place. ALOHA cups_open, 30k steps, seed=42, held-out action MSE:
 
-ALOHA cups_open with ACT, 30k steps, seed=42, held-out action MSE:
-
-| storage format | held-out RMSE | train loss @ 30k |
+| storage format | train loss @ 30k | held-out RMSE |
 |---|---:|---:|
-| `convert_to_lance` (JPEG-95) | 0.0927 | 0.0962 |
-| `convert_to_lance --jpeg-quality=100 --jpeg-subsampling=0` | 0.0872 | 0.0961 |
-| `convert_to_lance_video` | 0.0901 | 0.0972 |
-| upstream parquet+mp4 | 0.0790 | 0.0635 |
+| `convert_to_lance` (JPEG-95) | 0.0962 | 0.0927 |
+| `convert_to_lance --jpeg-quality=100 --jpeg-subsampling=0` | 0.0961 | 0.0872 |
+| `convert_to_lance_video` | 0.0972 | 0.0901 |
 
-All three Lance storage modes give equivalent training trajectories within ~6 % of each other — **pixel-encoding choice doesn't materially affect training accuracy** at this scale. The ~14 % gap to the upstream loader is a `num_workers > 0` artifact (likely PyTorch's worker random-seeding behaviour interacting with the spawn start method Lance forces for fork-safety) — `num_workers=0` gives bit-identical loss across all loaders, including upstream. The pixel data, tabular data, pad masks, and model init weights are bit-exact between Lance video-blob and upstream.
+All three modes land within ~6 % of each other — **pixel-encoding choice doesn't materially affect ACT training accuracy at this scale**. Pixel data, tabular fields, pad masks, and model init weights are all bit-exact between the Lance video-blob loader and the upstream parquet+mp4 loader (verified). See [`docs/benchmarks.md`](https://lancedb.github.io/lerobot-lancedb/benchmarks/) for the full details.
 
 ## Cloud / Hub
 
