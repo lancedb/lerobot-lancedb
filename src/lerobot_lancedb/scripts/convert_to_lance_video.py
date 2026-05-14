@@ -13,10 +13,10 @@ Produces two Lance tables side-by-side:
   verbatim as a Lance blob-v2-encoded ``video_bytes`` column. Bit-exact
   pixels, ~same disk size as the upstream layout.
 
-Use this for ``dtype=video`` source datasets where you want to avoid the
-JPEG roundtrip that ``lerobot-convert-to-lance`` introduces. For
-``dtype=image`` datasets (e.g. ``lerobot/pusht_image``), use
-``lerobot-convert-to-lance --lossless`` instead.
+Use this for ``dtype=video`` source datasets where you want bit-exact
+pixels at upstream's disk footprint. For ``dtype=image`` datasets, use
+``lerobot-convert-to-lance`` (JPEG, lossy — pick a higher
+``--jpeg-quality`` / ``--jpeg-subsampling=0`` if pixel fidelity matters).
 
 Usage::
 

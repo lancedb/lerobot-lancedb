@@ -80,29 +80,26 @@ def _to_lance_name(name: str) -> str:
 def _encode_image(
     frame: torch.Tensor | np.ndarray,
     jpeg_quality: int,
-    lossless: bool,
     chroma_subsampling: int = 2,
 ) -> bytes:
-    """Encode an image (CHW or HWC, uint8 or float [0,1]) as JPEG or PNG bytes.
+    """Encode an image (CHW or HWC, uint8 or float [0,1]) as JPEG bytes.
 
-    Tradeoff space (measured on lerobot/pusht and lerobot/aloha_static_cups_open;
-    see README's "End-to-end training parity" section for full numbers):
+    Tradeoff space (measured on lerobot/pusht, lerobot/aloha_static_cups_open,
+    lerobot/koch_pick_place_5_lego; see the README for full numbers):
 
-    * ``lossless=True`` → PNG: bit-exact pixels, larger files, no NVJPEG GPU
-      decode (falls back to PIL on CPU). The only safe choice if your data is
-      synthetic / has hard edges (``lerobot/pusht``) or if upstream stored it
-      bit-exact (``lerobot/pusht_image`` and other ``dtype=image`` datasets).
+    * ``jpeg_quality=100, chroma_subsampling=0`` → "best JPEG": 4:4:4 chroma
+      (no subsampling) + max quality. Nearly lossless on natural images,
+      full NVJPEG speed. Not bit-exact — JPEG's DCT quantization still
+      introduces small artifacts at hard edges.
 
-    * ``lossless=False, jpeg_quality=100, chroma_subsampling=0`` → "best JPEG":
-      4:4:4 chroma (no subsampling) + max quality. Nearly lossless on natural
-      images, ~5-10× smaller than PNG, full NVJPEG speed. Not bit-exact —
-      JPEG's DCT quantization still introduces small artifacts at hard edges.
+    * ``jpeg_quality=95, chroma_subsampling=2`` (defaults): 4:2:0 chroma
+      (half-resolution Cb/Cr) + q=95. Smallest, fastest, lossy enough to
+      measurably hurt training accuracy on synthetic / hard-edged content
+      (10pp env-success drop on pusht) and natural multi-camera data (~17%
+      held-out RMSE penalty on ALOHA-class).
 
-    * ``lossless=False, jpeg_quality=95, chroma_subsampling=2`` → default:
-      4:2:0 chroma (half-resolution Cb/Cr) + q=95. Smallest, fastest, lossy
-      enough to measurably hurt training accuracy on synthetic content
-      (10pp env-success drop on pusht) and ~17% RMSE penalty on ALOHA-class
-      multi-camera data.
+    For bit-exact storage of ``dtype=video`` sources, use
+    :func:`convert_to_lance_video` (mp4 bytes verbatim via Lance blob v2).
     """
     if isinstance(frame, torch.Tensor):
         frame = frame.detach().cpu().numpy()
@@ -117,21 +114,18 @@ def _encode_image(
     if arr.ndim == 3 and arr.shape[-1] == 1:
         arr = arr.squeeze(-1)
     buf = io.BytesIO()
-    if lossless:
-        Image.fromarray(arr).save(buf, format="PNG", optimize=False)
-    else:
-        Image.fromarray(arr).save(
-            buf,
-            format="JPEG",
-            quality=jpeg_quality,
-            subsampling=chroma_subsampling,
-        )
+    Image.fromarray(arr).save(
+        buf,
+        format="JPEG",
+        quality=jpeg_quality,
+        subsampling=chroma_subsampling,
+    )
     return buf.getvalue()
 
 
 def _encode_jpeg(frame: torch.Tensor | np.ndarray, jpeg_quality: int) -> bytes:
-    """Back-compat alias — equivalent to ``_encode_image(.., lossless=False)``."""
-    return _encode_image(frame, jpeg_quality, lossless=False)
+    """Back-compat alias — equivalent to ``_encode_image(jpeg_quality)``."""
+    return _encode_image(frame, jpeg_quality)
 
 
 def _build_schema(features: dict[str, dict], has_subtasks: bool) -> tuple[pa.Schema, dict[str, int]]:
@@ -170,7 +164,6 @@ def _episode_record_batch(
     video_keys: set[str],
     jpeg_quality: int,
     tolerance_s: float,
-    lossless: bool,
     chroma_subsampling: int,
 ) -> pa.RecordBatch:
     """Materialize one episode → one ``pa.RecordBatch``."""
@@ -241,7 +234,7 @@ def _episode_record_batch(
             frames = decoded_videos[key]
 
             def _enc_v(i: int, frames=frames):
-                return _encode_image(frames[i], jpeg_quality, lossless, chroma_subsampling)
+                return _encode_image(frames[i], jpeg_quality, chroma_subsampling)
 
             with ThreadPoolExecutor(max_workers=_ENCODE_WORKERS) as pool:
                 blobs = list(pool.map(_enc_v, range(ep_len)))
@@ -253,17 +246,14 @@ def _episode_record_batch(
                 v = col[i] if isinstance(col, list) else col[i]
                 if isinstance(v, Image.Image):
                     buf = io.BytesIO()
-                    if lossless:
-                        v.convert("RGB").save(buf, format="PNG", optimize=False)
-                    else:
-                        v.convert("RGB").save(
-                            buf,
-                            format="JPEG",
-                            quality=jpeg_quality,
-                            subsampling=chroma_subsampling,
-                        )
+                    v.convert("RGB").save(
+                        buf,
+                        format="JPEG",
+                        quality=jpeg_quality,
+                        subsampling=chroma_subsampling,
+                    )
                     return buf.getvalue()
-                return _encode_image(v, jpeg_quality, lossless, chroma_subsampling)
+                return _encode_image(v, jpeg_quality, chroma_subsampling)
 
             with ThreadPoolExecutor(max_workers=_ENCODE_WORKERS) as pool:
                 blobs = list(pool.map(_enc_i, range(ep_len)))
@@ -311,7 +301,6 @@ def convert_to_lance(
     table_name: str | None = None,
     jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
     chroma_subsampling: int = 2,
-    lossless: bool = False,
     tolerance_s: float = 1e-4,
     overwrite: bool = False,
     progress: bool = True,
@@ -319,13 +308,19 @@ def convert_to_lance(
 ) -> Path:
     """Convert an existing LeRobot dataset to a single Lance table.
 
-    ``lossless=True`` stores frames as PNG (bit-exact) instead of JPEG. Use
-    this for synthetic / hard-edged content (sim renders, sparse indicators,
-    UI overlays, ``lerobot/pusht`` etc.) where JPEG ringing around edges
-    measurably degrades downstream policy accuracy. The reader handles PNG
-    transparently via PIL; only NVJPEG GPU decode is skipped for PNG bytes.
-    For natural camera footage (ALOHA-class datasets), the JPEG default is
-    fine — see the README's parity section for measurements.
+    Frames are JPEG-encoded (per-row). Two knobs control the quality /
+    size / fidelity tradeoff:
+
+    * ``jpeg_quality`` (default 95) — bigger numbers, bigger files, fewer
+      artifacts. 100 + ``chroma_subsampling=0`` gets you near-lossless
+      JPEG while keeping the NVJPEG decode path.
+    * ``chroma_subsampling`` (default 2 = 4:2:0) — 0 = 4:4:4 (no
+      subsampling, max color fidelity); 1 = 4:2:2; 2 = 4:2:0 (half-res
+      chroma, the default).
+
+    For bit-exact storage of ``dtype=video`` sources, prefer
+    :func:`convert_to_lance_video` — it copies the source mp4 bytes
+    verbatim using Lance blob v2 and decodes on the fly with torchcodec.
     """
     import lancedb
 
@@ -375,7 +370,6 @@ def convert_to_lance(
                 video_keys,
                 jpeg_quality,
                 tolerance_s,
-                lossless,
                 chroma_subsampling,
             )
 
@@ -579,14 +573,14 @@ def convert_to_lance_video(
 
     Why this exists
     ---------------
-    The default :func:`convert_to_lance` re-encodes each video frame as JPEG
-    (or PNG with ``lossless=True``). That gives random-access frame reads
-    but introduces a second lossy step on top of upstream's AV1 video
-    (measured ~10pp env-success drop on pusht and ~17% held-out RMSE penalty
-    on ALOHA; see the README parity section). When you want bit-exact pixels
-    AND the speed benefits of Lance's storage layer, the alternative is to
-    keep the original mp4 bytes verbatim and decode on the fly — exactly
-    what upstream does, except Lance's blob v2 encoding handles the storage:
+    The default :func:`convert_to_lance` re-encodes each video frame as
+    JPEG. That gives random-access frame reads but introduces a second
+    lossy step on top of upstream's AV1 video (measured ~10pp env-success
+    drop on pusht and ~17% held-out RMSE penalty on ALOHA; see the README
+    parity section). When you want bit-exact pixels AND the speed benefits
+    of Lance's storage layer, the alternative is to keep the original mp4
+    bytes verbatim and decode on the fly — exactly what upstream does,
+    except Lance's blob v2 encoding handles the storage:
 
     * Bit-exact: blob bytes are byte-identical to the source mp4.
     * Streaming reads: blob columns aren't materialized into Arrow buffers;
@@ -620,8 +614,8 @@ def convert_to_lance_video(
     if image_keys:
         raise NotImplementedError(
             f"convert_to_lance_video requires `dtype=video` features in the source "
-            f"(got image_keys={image_keys}). Use convert_to_lance(..., lossless=True) "
-            "for image-stored datasets."
+            f"(got image_keys={image_keys}). Use convert_to_lance() for "
+            "image-stored datasets."
         )
     if not video_keys:
         raise ValueError("No video features found in source dataset — nothing to convert.")

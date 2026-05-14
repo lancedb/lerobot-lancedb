@@ -21,15 +21,14 @@ default :class:`LeRobotLanceDataset` introduces (~10pp env-success drop
 on pusht, ~17 % held-out RMSE penalty on ALOHA — see the README parity
 section).
 
-When to prefer this over ``convert_to_lance(..., lossless=True)``:
+When to prefer this over :func:`convert_to_lance`:
 
-* You want bit-exact pixels *and* per-camera storage size identical to the
-  upstream mp4 footprint (PNG-encoded individual frames are ~5-10× larger
-  than the equivalent AV1/H.264 video).
-* Your dataset is video-stored upstream (``dtype=video`` features). Image
-  datasets (``dtype=image``, e.g. ``lerobot/pusht_image``) don't have
-  source mp4 files — use ``convert_to_lance(..., lossless=True)`` for
-  those.
+* Your source dataset is video-stored (``dtype=video`` features — most
+  lerobot datasets). Image datasets (``dtype=image``, e.g.
+  ``lerobot/pusht_image``) don't have source mp4 files; use
+  :func:`convert_to_lance` with a high ``jpeg_quality`` for those.
+* You want bit-exact pixels *and* per-camera storage size identical to
+  the upstream mp4 footprint.
 
 Performance characteristics:
 
@@ -110,7 +109,7 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
 
     Subclasses :class:`LeRobotDataset` so existing trainers / samplers /
     ``isinstance`` checks accept it transparently. See module docstring for
-    why and when to use this over the default JPEG/PNG-per-frame format.
+    why and when to use this over the default JPEG-per-frame format.
 
     Args mirror :class:`LeRobotLanceDataset`: ``root`` for local, ``uri``
     for cloud, ``repo_id`` for HF Hub. ``decode_device`` is accepted for
@@ -190,7 +189,7 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
             raise NotImplementedError(
                 "LeRobotLanceVideoDataset requires `dtype=video` source features. "
                 "For `dtype=image` datasets (e.g. lerobot/pusht_image), use "
-                "LeRobotLanceDataset with `lossless=True` at conversion time."
+                "LeRobotLanceDataset with a high --jpeg-quality at conversion time."
             )
         if not self._video_keys:
             raise ValueError("No video features in dataset metadata — nothing to decode.")

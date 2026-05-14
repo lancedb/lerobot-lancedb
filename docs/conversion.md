@@ -1,22 +1,14 @@
 # Conversion
 
-Two converters are exposed as console scripts. Pick by source dtype:
+Two converters exposed as console scripts. Pick by source `dtype`:
 
-| Source dataset `dtype` | Use |
-|---|---|
-| `video` (most lerobot datasets) | [`lerobot-convert-to-lance-video`](#video-format) |
-| `image` (`lerobot/pusht_image`, etc.) | [`lerobot-convert-to-lance --lossless`](#frames-format) |
+- **`dtype=video`** (most lerobot datasets) → [`lerobot-convert-to-lance-video`](#video-format) (recommended — bit-exact, ~same disk size as upstream)
+- **`dtype=image`** (`lerobot/pusht_image`, etc.) → [`lerobot-convert-to-lance`](#frames-format) (JPEG; turn quality up for near-bit-exact storage)
 
-Either command lays out a self-contained directory:
+Either command lays out a self-contained directory next to a verbatim
+`meta/` copy from upstream.
 
-```
-<output>/
-  <table>.lance/         # one row per frame, tabular data
-  <table>_videos.lance/  # only for video-format: per-file mp4 blobs (lance-encoding:blob)
-  meta/                  # verbatim copy of upstream meta/
-```
-
-Both can optionally `--push-to-hub` to publish back to the HF Hub.
+---
 
 ## Video format
 
@@ -27,17 +19,24 @@ lerobot-convert-to-lance-video \
     --overwrite
 ```
 
+What it produces:
+
+```
+aloha_cups_open_lance_video/
+  aloha_static_cups_open.lance/         # one row per frame, tabular data
+  aloha_static_cups_open_videos.lance/  # one row per source mp4 file (blob v2)
+  meta/
+```
+
 What it does:
 
 1. Walks every episode in the source dataset.
-2. For each `(video_key, chunk_index, file_index)` triple — that is, every unique source mp4 file — copies the mp4 bytes **verbatim** into a Lance blob-v2-encoded column.
-3. Writes per-frame tabular columns (state, action, timestamps) into a sibling table.
+2. For each unique `(video_key, chunk_index, file_index)` triple — i.e. every distinct source mp4 file — copies the bytes verbatim into a Lance blob-v2-encoded `video_bytes` column.
+3. Writes per-frame tabular columns (state, action, timestamps, ...) into the sibling frames table.
 
-Decoding happens on the fly at read time via torchcodec. Because the bytes are bit-identical to upstream, pixel fidelity is preserved.
+Decoding happens on the fly at read time via torchcodec. Conversion is fast (usually under a minute) because no frame is ever decoded at write time.
 
-Conversion is fast — usually under a minute per dataset, regardless of the dataset's frame count, because no frame is ever decoded at write time.
-
-### CLI reference
+### CLI flags
 
 ```
 --repo-id REPO_ID           Source HF dataset (required)
@@ -49,38 +48,39 @@ Conversion is fast — usually under a minute per dataset, regardless of the dat
 --overwrite                 Drop and rewrite if the target already exists
 ```
 
+---
+
 ## Frames format
 
-```bash
-# Default: JPEG-95 (smallest, fastest single-frame, lossy)
-lerobot-convert-to-lance \
-    --repo-id=lerobot/pusht \
-    --output=./pusht_lance --overwrite
+The frames CLI re-encodes every frame as JPEG and stores the bytes per-row.
 
-# Bit-exact PNG (recommended for image-stored sources)
-lerobot-convert-to-lance \
-    --repo-id=lerobot/pusht_image \
-    --output=./pusht_image_lance \
-    --lossless --overwrite
+Three useful presets:
 
-# Near-lossless JPEG: q=100 + 4:4:4 chroma. Keeps the NVJPEG decode path.
-lerobot-convert-to-lance \
-    --repo-id=lerobot/pusht \
-    --output=./pusht_lance_high_quality \
-    --jpeg-quality=100 --jpeg-subsampling=0 --overwrite
-```
+- **Smallest / fastest** (default):
+  ```bash
+  lerobot-convert-to-lance \
+      --repo-id=lerobot/pusht \
+      --output=./pusht_lance --overwrite
+  ```
+  JPEG-95 + 4:2:0 chroma. Lossy — measurable pixel artifacts (1–14 % of pixels visibly differ depending on dataset). Use only when size / single-frame throughput trumps fidelity.
 
-What it does:
+- **Near-lossless JPEG** (best fidelity that still NVJPEG-decodes):
+  ```bash
+  lerobot-convert-to-lance \
+      --repo-id=lerobot/pusht_image \
+      --output=./pusht_image_lance \
+      --jpeg-quality=100 --jpeg-subsampling=0 --overwrite
+  ```
+  q=100 + 4:4:4 chroma. ~1.8× larger than the default. Visible-pixel artifacts drop 25–90× — typically below the threshold where it matters for training, but **not bit-exact**.
 
-1. For each episode, decode the source frames (mp4 or per-frame parquet bytes).
-2. Re-encode every frame as JPEG (or PNG with `--lossless`) using a 4–8-thread pool.
-3. Store the encoded bytes inline on each per-frame row.
+- **Push to the Hub** after converting locally:
+  ```bash
+  lerobot-convert-to-lance \
+      --repo-id=lerobot/pusht --output=./pusht_lance --overwrite \
+      --push-to-hub=me/pusht_lance
+  ```
 
-The encoding happens at convert time, so this path takes meaningfully longer than the video format — and on PNG-encoded multi-camera datasets it's the dominant cost (~13 min for `aloha_static_cups_open` at full PNG quality after the threading optimization).
-
-The JPEG default has measurable pixel artifacts (1.4 – 13.5 % of pixels visibly differ depending on dataset). The artifacts [translate to a real training-accuracy hit](benchmarks.md#training-accuracy-parity); use `--lossless` or the video format if accuracy parity matters.
-
-### CLI reference
+### CLI flags
 
 ```
 --repo-id REPO_ID           Source HF dataset (required)
@@ -90,10 +90,11 @@ The JPEG default has measurable pixel artifacts (1.4 – 13.5 % of pixels visibl
 --table-name TABLE_NAME     Override the Lance table name
 --jpeg-quality {1..100}     JPEG quality (default 95)
 --jpeg-subsampling {0,1,2}  JPEG chroma subsampling: 0=4:4:4, 1=4:2:2, 2=4:2:0 (default)
---lossless                  Use PNG instead of JPEG — bit-exact, larger, no NVJPEG GPU decode
 --overwrite                 Drop and rewrite if the target already exists
 --push-to-hub REPO          Optional HF Hub repo to upload to
 ```
+
+---
 
 ## Python API
 
@@ -107,33 +108,21 @@ convert_to_lance_video(
     overwrite=True,
 )
 
-# Frames format with explicit knobs
+# Frames format — defaults
 convert_to_lance(
     repo_id="lerobot/pusht",
     output="./pusht_lance",
-    jpeg_quality=100,
-    chroma_subsampling=0,  # 4:4:4 — near-lossless, NVJPEG-compatible
     overwrite=True,
 )
 
+# Frames format — near-lossless JPEG
 convert_to_lance(
     repo_id="lerobot/pusht_image",
     output="./pusht_image_lance",
-    lossless=True,         # PNG, bit-exact
+    jpeg_quality=100,
+    chroma_subsampling=0,
     overwrite=True,
 )
 ```
 
-## Push to the Hub
-
-The frames CLI supports `--push-to-hub=<user>/<repo>`. The video CLI doesn't yet — call the Python API and upload separately:
-
-```bash
-lerobot-convert-to-lance-video --repo-id=lerobot/pusht \
-    --output=./pusht_lance_video --overwrite
-huggingface-cli upload <user>/pusht_lance_video ./pusht_lance_video --repo-type=dataset
-```
-
-## Cloud sources
-
-Both converters read upstream sources via the HF cache. For cloud Lance reads at training time, see the [Frames](frames-format.md#cloud-reads) and [Video](video-format.md#cloud-reads) pages.
+If you want bit-exact pixel parity on a `dtype=video` source, use `convert_to_lance_video` — that's the whole reason it exists.

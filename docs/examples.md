@@ -1,13 +1,15 @@
 # Examples
 
-All scripts live under [`examples/`](https://github.com/lancedb/lerobot-lancedb/tree/main/examples) in the repo.
+All scripts live under [`examples/`](https://github.com/lancedb/lerobot-lancedb/tree/main/examples).
 
-## End-to-end training: `train_and_eval_lance.py`
+## `train_and_eval_lance.py` — end-to-end training
 
-Trains a `DiffusionPolicy` on a Lance-backed dataset using the same recipe as the published [`lerobot/diffusion_pusht`](https://huggingface.co/lerobot/diffusion_pusht) (200k steps, batch 64, `crop_shape=(84,84)` with random crop, grad-clip 10, cosine LR with 500 warmup, ImageNet image norm). Saves a checkpoint that `lerobot-eval` can load directly.
+Trains `DiffusionPolicy` on a Lance-backed dataset using the same recipe as the published [`lerobot/diffusion_pusht`](https://huggingface.co/lerobot/diffusion_pusht) (200k steps, batch 64, `crop_shape=(84,84)` with random crop, grad-clip 10, cosine LR with 500 warmup, ImageNet image norm). Saves a checkpoint that `lerobot-eval` can load directly.
+
+Typical flow:
 
 ```bash
-# 1. Convert pusht (recommended: video format)
+# 1. Convert
 lerobot-convert-to-lance-video \
     --repo-id=lerobot/pusht --output=./pusht_lance_video --overwrite
 
@@ -27,44 +29,41 @@ lerobot-eval \
 
 Useful flags:
 
-| Flag | Effect |
-|---|---|
-| `--video-loader` | Use `LeRobotLanceVideoDataset` (mp4 blob layout). |
-| `--upstream-loader` | Use upstream parquet+mp4 — for head-to-head comparisons. |
-| `--no-imagenet-stats` | Disable the ImageNet image-norm override. |
-| `--no-crop` | Disable the (84, 84) random crop augmentation. |
-| `--decode-device {auto,cpu,cuda}` | JPEG decode device (frames format only). |
+- `--video-loader` — use `LeRobotLanceVideoDataset` (mp4 blob layout).
+- `--upstream-loader` — use upstream parquet+mp4 (head-to-head comparisons).
+- `--no-imagenet-stats` — disable ImageNet image-norm override.
+- `--no-crop` — disable the (84, 84) random crop augmentation.
+- `--decode-device {auto,cpu,cuda}` — JPEG decode device (frames format only).
+- `--eval-fraction 0.1` — offline (held-out frames) eval instead of env rollouts.
 
-For the offline (held-out frames, no env) eval path use `--eval-fraction 0.1` and `--eval-max-frames N`.
+## `aloha_loader_parity.py` — head-to-head storage comparison
 
-## ALOHA loader parity: `aloha_loader_parity.py`
-
-Head-to-head training of an ACT policy across all storage layouts on `lerobot/aloha_static_cups_open`. Reports held-out action MSE / RMSE so you can compare storage modes apples-to-apples.
+Trains an ACT policy on `lerobot/aloha_static_cups_open` from three different loaders and reports held-out action MSE / RMSE.
 
 ```bash
-# Lance JPEG-95 (current default)
+# Lance JPEG-95
 python examples/aloha_loader_parity.py --loader lance \
     --lance-root ./aloha_cups_open_lance \
     --steps 30000 --seed 42 \
     --out outputs/train/aloha_parity_lance
 
-# Lance video-blob (recommended for video-stored sources)
+# Lance video-blob
 python examples/aloha_loader_parity.py --loader lance-video \
     --lance-root ./aloha_cups_open_lance_video \
     --steps 30000 --seed 42 \
     --out outputs/train/aloha_parity_lance_video
 
-# Upstream parquet+mp4 head-to-head
+# Upstream parquet+mp4
 python examples/aloha_loader_parity.py --loader upstream \
     --steps 30000 --seed 42 \
     --out outputs/train/aloha_parity_upstream
 ```
 
-Each run writes a `parity_metrics.json` next to the checkpoint with the loss curve + final held-out MSE / RMSE.
+Each run writes `parity_metrics.json` (loss curve + final held-out MSE / RMSE) next to the checkpoint.
 
-## Cross-format benchmark: `benchmark_formats.py`
+## `benchmark_formats.py` — cross-format benchmark
 
-Reproduces the tables in the [Benchmarks](benchmarks.md) page — size, throughput, and pixel fidelity across all four storage formats on a list of datasets.
+Reproduces the [Benchmarks](benchmarks.md) tables. Cached: re-runs skip already-converted formats.
 
 ```bash
 # Single-frame read pattern
@@ -74,28 +73,26 @@ python examples/benchmark_formats.py \
 
 # Delta-timestamps read pattern (realistic training)
 python examples/benchmark_formats.py \
-    --repos lerobot/pusht lerobot/aloha_static_cups_open \
+    --repos lerobot/aloha_static_cups_open \
     --num-batches 30 --warmup 5 --skip-pixel-diff \
     --delta-timestamps
 ```
 
-Conversions are cached under `--out-root` (default `outputs/datasets/`); re-runs skip already-converted formats.
+Useful flags:
 
-| Flag | Effect |
-|---|---|
-| `--formats jpeg-95 jpeg-100-444 png video` | Subset the format list. |
-| `--delta-timestamps` | Use a realistic 8-frame-per-sample delta window. |
-| `--skip-pixel-diff` | Don't measure pixel fidelity (faster). |
-| `--skip-throughput` | Just measure size + pixel fidelity. |
+- `--formats jpeg-95 jpeg-100-444 video` — subset the format list.
+- `--delta-timestamps` — realistic 8-frame-per-sample read pattern.
+- `--skip-pixel-diff` — don't measure pixel fidelity (faster).
+- `--skip-throughput` — just measure size + pixel fidelity.
 
-## Conversion driver: `conversion.py`
+## `conversion.py` — batch driver
 
-Batch-converts a list of datasets to the JPEG layout (the historical default). Also has a `--benchmark` mode that runs the GPU NVJPEG throughput benchmark used in the original README. Mostly useful for reproducing the initial release results; prefer `lerobot-convert-to-lance-video` / `lerobot-convert-to-lance` for new conversions.
+Converts a list of datasets to the default JPEG layout. Has a `--benchmark` mode that runs the legacy NVJPEG throughput benchmark used in pre-v0.x releases. Prefer `lerobot-convert-to-lance-video` / `lerobot-convert-to-lance` for new conversions.
 
-## Minimal smoke: `train_with_lance.py`
+## `train_with_lance.py` — minimal smoke test
 
-Ten-step DiffusionPolicy training loop on pusht, just to show the loader plugs into a stock LeRobot training loop with no other changes:
+Ten-step DiffusionPolicy training on pusht — proves the loader plugs into a stock LeRobot training loop unchanged.
 
 ```bash
-python examples/train_with_lance.py   # expects ./pusht_lance/ to exist
+python examples/train_with_lance.py
 ```

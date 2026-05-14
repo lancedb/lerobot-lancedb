@@ -42,16 +42,6 @@ def main() -> None:
         "1=4:2:2, 2=4:2:0 (default). Combining --jpeg-quality=100 --jpeg-subsampling=0 "
         "gets you near-lossless JPEG with full NVJPEG decode speed.",
     )
-    parser.add_argument(
-        "--lossless",
-        action="store_true",
-        help="Store frames as PNG (bit-exact) instead of JPEG. Required for accuracy "
-        "parity with upstream lerobot/* datasets (measured ~17%% RMSE penalty on ALOHA "
-        "and 10pp env-success drop on pusht with JPEG-95 default). Skips the GPU "
-        "NVJPEG path at read time and produces larger files; for inference-only "
-        "or size-constrained workloads where you don't care about training parity, "
-        "keep the JPEG default.",
-    )
     parser.add_argument("--tolerance-s", type=float, default=1e-4)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
@@ -70,7 +60,6 @@ def main() -> None:
         table_name=args.table_name,
         jpeg_quality=args.jpeg_quality,
         chroma_subsampling=args.jpeg_subsampling,
-        lossless=args.lossless,
         tolerance_s=args.tolerance_s,
         overwrite=args.overwrite,
         push_to_hub=args.push_to_hub,
