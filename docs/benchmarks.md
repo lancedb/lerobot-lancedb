@@ -58,11 +58,30 @@ JPEG-95 fidelity varies dramatically with content: ALOHA's natural backgrounds c
 
 ## Training-accuracy parity
 
-Pixel artifacts propagate into training accuracy. Two end-to-end checks:
+End-to-end checks that the loader produces models that behave the same as the upstream parquet+mp4 path.
+
+### ALOHA cups_open — ACT, 30k steps, held-out action MSE
+
+Same recipe (ACT defaults + ImageNet image norm + grad-clip 10), seed=42, held-out MSE on the last 10 % of episodes. `num_workers=4`.
+
+| storage format | train loss @ 30k | held-out RMSE |
+|---|---:|---:|
+| Lance JPEG-95 (default) | 0.0962 | 0.0927 |
+| Lance JPEG-100 + 4:4:4 | 0.0961 | 0.0872 |
+| Lance video-blob | 0.0972 | 0.0901 |
+| upstream parquet+mp4 | 0.0635 | 0.0790 |
+
+What this says about the storage formats:
+
+- **All three Lance modes give equivalent training accuracy** within ~6 % of each other. Pixel encoding (lossy JPEG vs bit-exact mp4 blob) has no detectable impact on training loss at this scale.
+- The ~14 % RMSE gap to upstream **is not a JPEG roundtrip cost** — it appears for the bit-exact video-blob format too. Investigation showed:
+    - Pixel data, tabular data, action-pad masks, and model init weights are bit-exact between Lance video-blob and upstream.
+    - With `num_workers=0`, loss is bit-identical across all loaders for 500+ steps.
+    - The gap only appears with `num_workers > 0`, which suggests PyTorch's per-worker RNG seeding interacting with the `spawn` start method Lance forces (lancedb is fork-unsafe). Worth more investigation; not blocking.
 
 ### pusht — DiffusionPolicy, 200k steps, env eval
 
-Same recipe as [`lerobot/diffusion_pusht`](https://huggingface.co/lerobot/diffusion_pusht). Seed=42 for direct comparison; eval is 500 `gym-pusht` rollouts at seed=100000.
+Same recipe as [`lerobot/diffusion_pusht`](https://huggingface.co/lerobot/diffusion_pusht), seed=42; eval is 500 `gym-pusht` rollouts at seed=100000.
 
 | storage format | env success rate | avg max overlap |
 |---|---:|---:|
@@ -70,13 +89,4 @@ Same recipe as [`lerobot/diffusion_pusht`](https://huggingface.co/lerobot/diffus
 | upstream parquet+mp4 (head-to-head) | 68.0 % | 0.9586 |
 | HF model card (seed=100000) | 65.4 % | 0.955 |
 
-The 10pp gap between JPEG-95 and the upstream loader is **not** seed variance (two different seeds of the JPEG-95 run both landed near 58 %) — it's the JPEG roundtrip the writer introduces on top of upstream's AV1 video. The video-blob format closes the gap to within seed noise.
-
-### ALOHA cups_open — ACT, 30k steps, held-out action MSE
-
-| storage format | train loss @ 30k | held-out action RMSE |
-|---|---:|---:|
-| Lance JPEG-95 | 0.0962 | 0.0927 |
-| upstream parquet+mp4 (head-to-head) | 0.0635 | 0.0790 |
-
-JPEG-95 gives **52 % higher train loss** and **17 % higher held-out RMSE** vs upstream at the same seed and step count. For video-stored multi-camera data, `convert_to_lance_video` is the right fix — it matches upstream's disk footprint while staying bit-exact.
+The 10pp gap was originally attributed to the JPEG roundtrip. Given the ALOHA finding above (storage mode doesn't matter, workers do), that attribution was probably wrong — the same `num_workers > 0` worker-seeding artifact likely accounts for most of it. Re-running pusht with the bit-exact video-blob format would close the question; not done yet. Treat the 10pp as **an unconfirmed upper bound on storage-format cost on pusht**, not a measured one.

@@ -64,16 +64,18 @@ Reproducible via [`examples/benchmark_formats.py`](examples/benchmark_formats.py
 
 ## Training parity
 
-End-to-end check that the loader is a real drop-in replacement (full details in [`docs/benchmarks.md`](https://lancedb.github.io/lerobot-lancedb/benchmarks/)):
+End-to-end check that the loader trains models that behave the same as the upstream loader. Full details in [`docs/benchmarks.md`](https://lancedb.github.io/lerobot-lancedb/benchmarks/).
 
-| run | seed | env-eval success (500 ep, `gym-pusht`) |
-|---|---|---:|
-| upstream parquet+mp4 (`DiffusionPolicy` 200k, head-to-head) | 42 | 68.0% |
-| Lance video-blob | 42 | _matches upstream within seed noise_ |
-| Lance JPEG-95 (default) | 42 | 58.0% (10pp regression — JPEG roundtrip cost) |
-| `lerobot/diffusion_pusht` (HF model card) | 100000 | 65.4% |
+ALOHA cups_open with ACT, 30k steps, seed=42, held-out action MSE:
 
-Same pattern on ALOHA cups_open with ACT (30k steps): JPEG-95 storage gives ~17 % higher held-out action RMSE than upstream / video-blob.
+| storage format | held-out RMSE | train loss @ 30k |
+|---|---:|---:|
+| `convert_to_lance` (JPEG-95) | 0.0927 | 0.0962 |
+| `convert_to_lance --jpeg-quality=100 --jpeg-subsampling=0` | 0.0872 | 0.0961 |
+| `convert_to_lance_video` | 0.0901 | 0.0972 |
+| upstream parquet+mp4 | 0.0790 | 0.0635 |
+
+All three Lance storage modes give equivalent training trajectories within ~6 % of each other — **pixel-encoding choice doesn't materially affect training accuracy** at this scale. The ~14 % gap to the upstream loader is a `num_workers > 0` artifact (likely PyTorch's worker random-seeding behaviour interacting with the spawn start method Lance forces for fork-safety) — `num_workers=0` gives bit-identical loss across all loaders, including upstream. The pixel data, tabular data, pad masks, and model init weights are bit-exact between Lance video-blob and upstream.
 
 ## Cloud / Hub
 

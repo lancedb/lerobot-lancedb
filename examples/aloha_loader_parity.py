@@ -83,6 +83,18 @@ def split_episodes(num_episodes: int, eval_fraction: float) -> tuple[list[int], 
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s", force=True)
+
+    # The Lance loaders force spawn-mode multiprocessing internally
+    # (lancedb is fork-unsafe). Force the same start method for the upstream
+    # loader so loss curves can be compared apples-to-apples. Setting it via
+    # AGENT_FORCE_SPAWN=1 in the env makes this opt-in.
+    import os, multiprocessing as mp  # noqa: E401
+    if os.environ.get("AGENT_FORCE_SPAWN") == "1":
+        try:
+            mp.set_start_method("spawn", force=True)
+        except RuntimeError:
+            pass
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
