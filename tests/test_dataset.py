@@ -119,7 +119,11 @@ def _open_src(src_root):
 def test_round_trip_single_item_matches_source(parquet_dataset, lance_dataset_dir):
     src_root, total_frames, _ = parquet_dataset
     src = _open_src(src_root)
-    lance_ds = LeRobotLanceDataset(root=lance_dataset_dir, return_uint8=True)
+    # Force CPU decode so we can compare bytewise against the parquet+mp4 source,
+    # which always returns CPU tensors. (With ``decode_device="auto"`` the Lance
+    # path produces CUDA tensors on a GPU box and the comparison crashes on the
+    # device mismatch.)
+    lance_ds = LeRobotLanceDataset(root=lance_dataset_dir, return_uint8=True, decode_device="cpu")
 
     assert len(lance_ds) == total_frames == len(src)
     assert lance_ds.fps == src.fps
