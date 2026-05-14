@@ -1,5 +1,7 @@
 # lerobot-lancedb
 
+📖 **Docs: <https://lancedb.github.io/lerobot-lancedb/>**
+
 Lance-backed datasets for [LeRobot](https://github.com/huggingface/lerobot) — frame-level random access on local disk and cloud (S3 / GCS / HF Hub / HF Buckets), with two storage layouts you can choose between depending on what you care about.
 
 `LeRobotLanceDataset` and `LeRobotLanceVideoDataset` both subclass `LeRobotDataset`, so any code that accepts a `LeRobotDataset` (the training factory, `EpisodeAwareSampler`, third-party trainers, `isinstance` checks) accepts a Lance-backed one too.

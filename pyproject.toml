@@ -46,8 +46,13 @@ test = [
     "pytest-timeout>=2.4.0,<3.0.0",
 ]
 dev = [
-    "lerobot-lancedb[test]",
+    "lerobot-lancedb[test,docs]",
     "ruff>=0.14.1",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "pymdown-extensions>=10.0",
 ]
 
 [project.scripts]

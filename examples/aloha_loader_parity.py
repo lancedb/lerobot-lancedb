@@ -42,14 +42,19 @@ from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.utils.constants import ACTION
 
-from lerobot_lancedb import LeRobotLanceDataset
+from lerobot_lancedb import LeRobotLanceDataset, LeRobotLanceVideoDataset
 
 log = logging.getLogger("aloha_loader_parity")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--loader", choices=("lance", "upstream"), required=True)
+    p.add_argument(
+        "--loader",
+        choices=("lance", "lance-video", "upstream"),
+        required=True,
+        help="lance: JPEG/PNG per-frame layout. lance-video: mp4-blob layout. upstream: parquet+mp4.",
+    )
     p.add_argument("--repo-id", default="lerobot/aloha_static_cups_open")
     p.add_argument("--lance-root", type=Path, default=Path("outputs/datasets/aloha_static_cups_open_lance"))
     p.add_argument("--out", type=Path, default=None,
@@ -87,7 +92,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info("loader=%s device=%s out=%s", args.loader, device, args.out)
 
-    if args.loader == "lance":
+    if args.loader in ("lance", "lance-video"):
         meta = LeRobotDatasetMetadata(repo_id=args.repo_id, root=args.lance_root)
     else:
         meta = LeRobotDatasetMetadata(repo_id=args.repo_id)
@@ -128,6 +133,13 @@ def main() -> None:
                 return_uint8=True,
                 decode_device=args.decode_device,
             )
+        if args.loader == "lance-video":
+            return LeRobotLanceVideoDataset(
+                root=args.lance_root,
+                repo_id=args.repo_id,
+                delta_timestamps=delta_timestamps,
+                return_uint8=True,
+            )
         return LeRobotDataset(repo_id=args.repo_id, delta_timestamps=delta_timestamps)
 
     train_dataset = make_dataset()
@@ -137,7 +149,8 @@ def main() -> None:
         episode_indices_to_use=train_eps,
         shuffle=True,
     )
-    pin = device.type == "cuda" and (args.loader == "upstream" or args.decode_device == "cpu")
+    # lance-video and upstream always return CPU tensors; lance only does if decode_device='cpu'.
+    pin = device.type == "cuda" and (args.loader in ("upstream", "lance-video") or args.decode_device == "cpu")
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         num_workers=args.num_workers,

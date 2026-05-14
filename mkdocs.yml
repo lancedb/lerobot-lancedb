@@ -1,0 +1,70 @@
+site_name: lerobot-lancedb
+site_url: https://lancedb.github.io/lerobot-lancedb/
+site_description: Lance-backed datasets for LeRobot — drop-in replacement with two storage layouts (per-frame and per-file-mp4-blob), bit-exact training parity, and cloud-native reads.
+repo_url: https://github.com/lancedb/lerobot-lancedb
+repo_name: lancedb/lerobot-lancedb
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+
+# README.md in docs/ is the contributor-facing "how to build the docs" file —
+# keep it out of the rendered site (index.md is the real landing page).
+exclude_docs: |
+  README.md
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+
+nav:
+  - Overview: index.md
+  - Conversion: conversion.md
+  - Frames format: frames-format.md
+  - Video format: video-format.md
+  - Examples: examples.md
+  - Benchmarks: benchmarks.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/lancedb/lerobot-lancedb
