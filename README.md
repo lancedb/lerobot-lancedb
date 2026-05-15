@@ -45,20 +45,20 @@ For the JPEG layout, use `lerobot-convert-to-lance` and `LeRobotLanceDataset` in
 
 Realistic training read pattern (`delta_timestamps`, 8 frames / sample, batch 32, num_workers 4, CPU decode, H100):
 
-| dataset | format | size MB | delta_ts fps | **speedup** | bit-exact? |
-|---|---|---:|---:|---:|:---:|
-| **pusht** (96×96, 1-cam) | upstream parquet+mp4 | 7.3 | 750 | 1.00× | ✓ |
-| | `convert_to_lance` (JPEG-95) | 60.0 | 3510 | **4.68×** | ✗ (6.2% pixels differ) |
-| | `convert_to_lance --jpeg-quality=100 --jpeg-subsampling=0` | 105.6 | 2909 | 3.88× | ✗ (0.07%) |
-| | **`convert_to_lance_video`** | **8.0** | 2853 | **3.80×** | **✓** |
-| **ALOHA cups_open** (480×640, 4-cam) | upstream parquet+mp4 | 485.6 | 18.7 | 1.00× | ✓ |
-| | `convert_to_lance` (JPEG-95) | 3626.0 | 46.0 | **2.46×** | ✗ (1.4%) |
-| | `convert_to_lance --jpeg-quality=100 --jpeg-subsampling=0` | 8735.4 | 32.5 | 1.74× | ✗ (0.06%) |
-| | **`convert_to_lance_video`** | **487.4** | 45.6 | **2.44×** | **✓** |
-| **Koch lego** (480×640, 2-cam) | upstream parquet+mp4 | 2014.1 | 26.6 | 1.00× | ✓ |
-| | `convert_to_lance` (JPEG-95) | 8541.0 | 70.8 | **2.66×** | ✗ (13.5%) |
-| | `convert_to_lance --jpeg-quality=100 --jpeg-subsampling=0` | 17 335.3 | 49.0 | 1.84× | ✗ (0.14%) |
-| | **`convert_to_lance_video`** | **2015.9** | 53.8 | **2.02×** | **✓** |
+| dataset | format | size MB | delta_ts fps | **speedup** |
+|---|---|---:|---:|---:|
+| **pusht** (96×96, 1-cam) | upstream parquet+mp4 | 7.3 | 750 | 1.00× |
+| | `convert_to_lance` (JPEG-95) | 60.0 | 3510 | **4.68×** |
+| | `convert_to_lance --jpeg-quality=100 --jpeg-subsampling=0` | 105.6 | 2909 | 3.88× |
+| | **`convert_to_lance_video`** | **8.0** | 2853 | **3.80×** |
+| **ALOHA cups_open** (480×640, 4-cam) | upstream parquet+mp4 | 485.6 | 18.7 | 1.00× |
+| | `convert_to_lance` (JPEG-95) | 3626.0 | 46.0 | **2.46×** |
+| | `convert_to_lance --jpeg-quality=100 --jpeg-subsampling=0` | 8735.4 | 32.5 | 1.74× |
+| | **`convert_to_lance_video`** | **487.4** | 45.6 | **2.44×** |
+| **Koch lego** (480×640, 2-cam) | upstream parquet+mp4 | 2014.1 | 26.6 | 1.00× |
+| | `convert_to_lance` (JPEG-95) | 8541.0 | 70.8 | **2.66×** |
+| | `convert_to_lance --jpeg-quality=100 --jpeg-subsampling=0` | 17 335.3 | 49.0 | 1.84× |
+| | **`convert_to_lance_video`** | **2015.9** | 53.8 | **2.02×** |
 
 Reproducible via [`examples/benchmark_formats.py`](examples/benchmark_formats.py).
 
