@@ -1,0 +1,52 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install ffmpeg (needed by torchcodec at decode time)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+
+      - name: Install package + test extras
+        run: |
+          python -m pip install --upgrade pip
+          # Force CPU torch wheels to keep the runner image lean.
+          pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          pip install -e '.[test]'
+
+      - name: Show resolved versions
+        run: |
+          python -c "import torch, torchvision, lerobot, lance, lancedb; \
+            print('torch', torch.__version__); \
+            print('torchvision', torchvision.__version__); \
+            print('lerobot', getattr(lerobot, '__version__', '?')); \
+            print('lance', lance.__version__); \
+            print('lancedb', lancedb.__version__)"
+
+      - name: Run tests
+        run: pytest -v --tb=short
