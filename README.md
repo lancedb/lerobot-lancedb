@@ -64,30 +64,9 @@ Reproducible via [`examples/benchmark_formats.py`](examples/benchmark_formats.py
 
 ## Training parity
 
-End-to-end check that the loader trains models that **actually learn and match the upstream parquet+mp4 path in env-eval**.
+`convert_to_lance_video` trains a `DiffusionPolicy` on pusht to **68.4 % gym-pusht success** (seed=42, 500 rollouts) — matches the head-to-head upstream parquet+mp4 result (68.0 %) and the published [`lerobot/diffusion_pusht`](https://huggingface.co/lerobot/diffusion_pusht) (65.4 %).
 
-**pusht — `DiffusionPolicy` 200k, seed=42, gym-pusht 500-rollout eval:**
-
-| storage format | env success rate | avg max overlap |
-|---|---:|---:|
-| `convert_to_lance` (JPEG-95) | 58.0 % | 0.919 |
-| **`convert_to_lance_video`** | **68.4 %** | **0.936** |
-| upstream parquet+mp4 (head-to-head) | 68.0 % | 0.9586 |
-| HF model card ([`lerobot/diffusion_pusht`](https://huggingface.co/lerobot/diffusion_pusht), seed=100000) | 65.4 % | 0.955 |
-
-`convert_to_lance_video` matches upstream's env-eval result within seed noise. JPEG-95 storage costs ~10 pp on this dataset — pusht has sharp synthetic edges where JPEG ringing artifacts concentrate (6.2 % of pixels visibly differ) and 200 k diffusion training is sensitive to that. Pick the video format when your source is `dtype=video` and you care about accuracy.
-
-**ALOHA cups_open — ACT 30k, seed=42, held-out action RMSE:**
-
-| storage format | train loss @ 30k | held-out RMSE |
-|---|---:|---:|
-| `convert_to_lance` (JPEG-95) | 0.0962 | 0.0927 |
-| `convert_to_lance --jpeg-quality=100 --jpeg-subsampling=0` | 0.0961 | 0.0872 |
-| `convert_to_lance_video` | 0.0972 | 0.0901 |
-
-Same recipe, same seed. All three modes land within ~6 % of each other — on natural multi-camera footage at this training scale the format choice doesn't surface a measurable accuracy effect.
-
-Reproduce: [`examples/train_and_eval_lance.py`](examples/train_and_eval_lance.py) (pusht) and [`examples/aloha_loader_parity.py`](examples/aloha_loader_parity.py) (ALOHA). Full discussion in [`docs/benchmarks.md`](https://lancedb.github.io/lerobot-lancedb/benchmarks/).
+Full numbers (pusht env-eval + ALOHA cups_open held-out MSE across all storage modes) in [`docs/benchmarks.md`](https://lancedb.github.io/lerobot-lancedb/benchmarks/). Reproducers: [`examples/train_and_eval_lance.py`](examples/train_and_eval_lance.py) and [`examples/aloha_loader_parity.py`](examples/aloha_loader_parity.py).
 
 ## Cloud / Hub
 

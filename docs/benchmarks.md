@@ -58,28 +58,20 @@ JPEG-95 fidelity varies dramatically with content: ALOHA's natural backgrounds c
 
 ## Training-accuracy parity
 
-End-to-end check that the loader trains models that actually learn and match upstream's behaviour. Two complementary tests: pusht with `DiffusionPolicy` + env rollouts (the rigorous one — measures actual task success), and ALOHA cups_open with ACT + held-out action MSE (no sim env exists for this dataset).
-
 ### pusht — `DiffusionPolicy`, 200k steps, env eval
 
-Same recipe as [`lerobot/diffusion_pusht`](https://huggingface.co/lerobot/diffusion_pusht). Seed=42 for direct comparison; eval is 500 `gym-pusht` rollouts at seed=100000.
+Recipe: [`lerobot/diffusion_pusht`](https://huggingface.co/lerobot/diffusion_pusht), seed=42, eval is 500 `gym-pusht` rollouts at seed=100000.
 
 | storage format | env success rate | avg max overlap |
 |---|---:|---:|
 | Lance JPEG-95 | 58.0 % | 0.919 |
-| Lance video-blob | **68.4 %** | **0.936** |
+| Lance video-blob | 68.4 % | 0.936 |
 | upstream parquet+mp4 (head-to-head) | 68.0 % | 0.9586 |
 | HF model card (seed=100000) | 65.4 % | 0.955 |
 
-What this says:
-
-- The **video-blob format trains a working policy that matches upstream's env-eval result** within seed-to-seed noise. The HF reference at seed=100000 lands at 65.4 % and our seed=42 upstream run lands at 68.0 %, putting video-blob's 68.4 % squarely in that range.
-- **JPEG-95 storage costs ~10 pp success rate on pusht.** pusht has sharp synthetic edges (a flat T-shape on flat background) — exactly the content type JPEG handles worst (6.2 % of pixels visibly differ vs source). 200 k diffusion training amplifies that into a measurable env-eval gap.
-- The fix on pusht is `convert_to_lance_video`. JPEG-100 + 4:4:4 would also help (visible-pixel artifacts drop ~90× vs JPEG-95) but we didn't run it end-to-end at 200 k.
-
 ### ALOHA cups_open — ACT, 30k steps, held-out action MSE
 
-Same recipe (ACT defaults + ImageNet image norm + grad-clip 10), seed=42, `num_workers=4`. Held-out MSE on the last 10 % of episodes.
+Recipe: ACT defaults + ImageNet image norm + grad-clip 10, seed=42, `num_workers=4`. Held-out MSE on the last 10 % of episodes.
 
 | storage format | train loss @ 30k | held-out RMSE |
 |---|---:|---:|
@@ -87,17 +79,4 @@ Same recipe (ACT defaults + ImageNet image norm + grad-clip 10), seed=42, `num_w
 | Lance JPEG-100 + 4:4:4 | 0.0961 | 0.0872 |
 | Lance video-blob | 0.0972 | 0.0901 |
 
-All three modes land within ~6 % of each other. On natural multi-camera footage at this training scale the format choice doesn't surface a measurable accuracy effect — JPEG-95's visible-pixel artifact rate on ALOHA is only 1.4 %, an order of magnitude lower than on pusht.
-
-So the two findings are consistent rather than contradictory: storage format matters when the content has sharp edges that JPEG rings on, and when the training pipeline is sensitive enough to surface it.
-
-### Bit-exact substantiation
-
-For `convert_to_lance_video` specifically, we verified by direct comparison against upstream:
-
-- Pixel bytes are bit-identical (multiple sample frames, all cameras).
-- Tabular fields (state, action, timestamps, indices) are bit-identical.
-- Action-pad masks under `delta_timestamps` match including at episode boundaries.
-- Model init weights at seed=42 are bit-identical regardless of which loader's metadata is loaded first.
-
-Reproduce: [`examples/train_and_eval_lance.py`](https://github.com/lancedb/lerobot-lancedb/blob/main/examples/train_and_eval_lance.py) (pusht) and [`examples/aloha_loader_parity.py`](https://github.com/lancedb/lerobot-lancedb/blob/main/examples/aloha_loader_parity.py) (ALOHA).
+Reproducers: [`examples/train_and_eval_lance.py`](https://github.com/lancedb/lerobot-lancedb/blob/main/examples/train_and_eval_lance.py) (pusht) and [`examples/aloha_loader_parity.py`](https://github.com/lancedb/lerobot-lancedb/blob/main/examples/aloha_loader_parity.py) (ALOHA).
