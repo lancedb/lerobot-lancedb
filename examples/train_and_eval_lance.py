@@ -186,6 +186,13 @@ def main() -> None:
                 repo_id=args.repo_id,
                 delta_timestamps=delta_timestamps,
             )
+        if args.video_loader:
+            return LeRobotLanceVideoDataset(
+                root=args.lance_root,
+                repo_id=args.repo_id,
+                delta_timestamps=delta_timestamps,
+                return_uint8=True,
+            )
         return LeRobotLanceDataset(
             root=args.lance_root,
             repo_id=args.repo_id,
@@ -206,7 +213,7 @@ def main() -> None:
         # pin_memory only works for CPU tensors. With decode_device='cpu' (the safer default)
         # or the upstream parquet+mp4 loader, tensors are on CPU and can be pinned.
         # With decode_device='cuda'/'auto', the Lance dataloader yields CUDA tensors and we can't.
-        pin = device.type == "cuda" and (args.upstream_loader or args.decode_device == "cpu")
+        pin = device.type == "cuda" and (args.upstream_loader or args.video_loader or args.decode_device == "cpu")
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             num_workers=args.num_workers,
@@ -284,7 +291,7 @@ def main() -> None:
 
     # New dataset instance; we drive sample selection ourselves via a SubsetSampler.
     eval_dataset = make_dataset()
-    eval_pin = device.type == "cuda" and (args.upstream_loader or args.decode_device == "cpu")
+    eval_pin = device.type == "cuda" and (args.upstream_loader or args.video_loader or args.decode_device == "cpu")
     eval_loader = torch.utils.data.DataLoader(
         eval_dataset,
         num_workers=args.num_workers,
