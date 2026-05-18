@@ -17,7 +17,6 @@ from .dataset import LeRobotLanceDataset
 from .lance_video_dataset import LeRobotLanceVideoDataset
 from .writer import convert_to_lance, convert_to_lance_video
 
-
 __version__ = "0.1.0.dev0"
 
 

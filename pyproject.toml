@@ -71,8 +71,13 @@ target-version = "py312"
 line-length = 110
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "UP", "B"]
+select = ["E", "W", "F", "I", "UP", "B", "PLC0415"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately gate imports behind ``pytest.importorskip`` for optional
+# extras, so allowing local imports inside test functions is intentional.
+"tests/*.py" = ["PLC0415"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

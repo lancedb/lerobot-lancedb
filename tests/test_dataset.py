@@ -25,7 +25,6 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_lancedb import LeRobotLanceDataset, convert_to_lance, make_lerobot_dataset
 from lerobot_lancedb.auto import _detect_backend
 
-
 _DEFAULT_FPS = 10
 _FEATURES = {
     "observation.state": {"dtype": "float32", "shape": (4,), "names": ["s0", "s1", "s2", "s3"]},

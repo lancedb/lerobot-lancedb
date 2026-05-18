@@ -33,16 +33,25 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import lancedb
 import numpy as np
+import pyarrow as pa
 import torch
 import torch.utils.data
-from PIL import Image
-
+from huggingface_hub import snapshot_download
+from lancedb.permutation import Permutation
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.feature_utils import check_delta_timestamps, get_delta_indices
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
+from PIL import Image
 
 from ._spawn_compat import force_spawn_for_lance
+
+try:
+    from huggingface_hub import get_token as _hf_get_token
+except ImportError:
+    _hf_get_token = None
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +68,8 @@ warnings.filterwarnings(
 try:
     from torchvision.io import (
         ImageReadMode as _TVImageReadMode,
+    )
+    from torchvision.io import (
         decode_jpeg as _tv_decode_jpeg,
     )
 
@@ -236,6 +247,8 @@ class LeRobotLanceDataset(LeRobotDataset):
         # modification.
         self.meta = self._load_metadata(self.repo_id, meta_root_resolved)
 
+        self._probe_table_exists()
+
         self.delta_indices = None
         if delta_timestamps is not None:
             check_delta_timestamps(delta_timestamps, self.meta.fps, tolerance_s)
@@ -275,10 +288,6 @@ class LeRobotLanceDataset(LeRobotDataset):
         repo_id: str, revision: str | None, table_name: str | None
     ) -> tuple[str, Path, str]:
         """Resolve a HF Hub ``repo_id`` to a lance URI + local meta sidecar."""
-        from huggingface_hub import snapshot_download
-
-        from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
-
         local_root = Path(
             snapshot_download(
                 repo_id,
@@ -346,13 +355,9 @@ class LeRobotLanceDataset(LeRobotDataset):
             storage_options.setdefault("virtual_hosted_style_request", "true")
 
         if uri.startswith("hf://") and "token" not in storage_options:
-            try:
-                from huggingface_hub import get_token
-            except ImportError:
-                get_token = None  # type: ignore[assignment]
             token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-            if token is None and get_token is not None:
-                token = get_token()
+            if token is None and _hf_get_token is not None:
+                token = _hf_get_token()
             if token:
                 storage_options["token"] = token
 
@@ -435,13 +440,34 @@ class LeRobotLanceDataset(LeRobotDataset):
 
     # ── lance handle management ───────────────────────────────────────
 
+    def _probe_table_exists(self) -> None:
+        """Verify the lance table exists at ``self._uri`` before lazy-open.
+
+        Surfaces "this URI is not a lerobot-lancedb dataset" at init time
+        with a clear message, instead of leaking a lance HTTP 404 from
+        ``__getitem__`` much later.
+        """
+        try:
+            db = lancedb.connect(self._uri, **self._connect_kwargs)
+            names = list(db.list_tables().tables)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Could not list lance tables at {self._uri!r}: {e}. "
+                "Check that the URI / repo exists and credentials are set."
+            ) from e
+        if self._table_name not in names:
+            raise FileNotFoundError(
+                f"No lance table named '{self._table_name}' at {self._uri!r} "
+                f"(existing tables: {names}). This doesn't look like a "
+                "lerobot-lancedb dataset — convert the source with "
+                "`lerobot-convert-to-lance` (frames) or "
+                "`lerobot-convert-to-lance-video` (video) first."
+            )
+
     def _ensure_open(self) -> None:
         """Connect to the table and build a Permutation read handle."""
         if self._perm is not None:
             return
-        import lancedb
-        from lancedb.permutation import Permutation
-
         self._db = lancedb.connect(self._uri, **self._connect_kwargs)
         self._table = self._db.open_table(self._table_name)
         if self._all_lance_columns is None:
@@ -564,7 +590,6 @@ class LeRobotLanceDataset(LeRobotDataset):
         if not indices:
             return []
         self._ensure_open()
-        import pyarrow as pa
 
         # Step 1.
         all_rows: list[int] = []

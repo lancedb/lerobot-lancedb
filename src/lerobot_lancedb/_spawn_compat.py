@@ -24,7 +24,6 @@ import logging
 import multiprocessing as mp
 import sys
 
-
 _SPAWN_FORCED = False
 
 
@@ -63,7 +62,7 @@ def force_spawn_for_lance() -> None:
         )
 
     try:
-        import torch
+        import torch  # noqa: PLC0415  — optional: tolerate torch missing at install time
 
         torch.multiprocessing.set_sharing_strategy("file_system")
     except (ImportError, RuntimeError) as exc:

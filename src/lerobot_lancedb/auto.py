@@ -41,7 +41,6 @@ from typing import Any
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -114,7 +113,7 @@ def make_lerobot_dataset(
     if chosen == "lance":
         # Local import — keeps the user-visible import surface focused and
         # lets parquet-only callers avoid importing lance if they never need it.
-        from .dataset import LeRobotLanceDataset
+        from .dataset import LeRobotLanceDataset  # noqa: PLC0415
 
         lance_kwargs = _split_lance_kwargs(repo_id_or_root, root, kwargs)
         return LeRobotLanceDataset(**lance_kwargs)

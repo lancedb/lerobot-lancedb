@@ -11,8 +11,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install ruff
+        run: pip install 'ruff>=0.14.1'
+      - name: Ruff check
+        # Enforces I (import sort), F (pyflakes), B (bugbear), PLC0415
+        # (no inline imports), etc. — see [tool.ruff.lint] in pyproject.toml.
+        run: ruff check src/ tests/
+
   pytest:
     runs-on: ubuntu-latest
+    needs: lint
     strategy:
       fail-fast: false
       matrix:
