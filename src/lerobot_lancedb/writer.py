@@ -23,6 +23,7 @@ Output layout::
 
 from __future__ import annotations
 
+import inspect
 import io
 import logging
 import os
@@ -31,14 +32,14 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import lancedb
 import numpy as np
 import pyarrow as pa
 import torch
-from PIL import Image
-
+from huggingface_hub import HfApi
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames
-
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +65,6 @@ def _decode_video_frames_compat(video_path, timestamps, tolerance_s, backend):
     """``decode_video_frames`` adds kwargs across lerobot versions; pass them
     conditionally so we work against 0.5.x as well as newer releases.
     """
-    import inspect
-
     sig = inspect.signature(decode_video_frames)
     kwargs = {}
     if "return_uint8" in sig.parameters:
@@ -322,8 +321,6 @@ def convert_to_lance(
     :func:`convert_to_lance_video` — it copies the source mp4 bytes
     verbatim using Lance blob v2 and decodes on the fly with torchcodec.
     """
-    import lancedb
-
     output = Path(output)
     if table_name is None:
         table_name = repo_id.split("/")[-1]
@@ -331,7 +328,6 @@ def convert_to_lance(
     # ``return_uint8`` is a recent addition to LeRobotDataset; we only pass it
     # when the installed version accepts it. Older versions return float32
     # frames anyway, which the writer's ``_encode_jpeg`` handles transparently.
-    import inspect
 
     src_kwargs: dict = {"root": src_root, "revision": revision, "tolerance_s": tolerance_s}
     if "return_uint8" in inspect.signature(LeRobotDataset.__init__).parameters:
@@ -380,8 +376,6 @@ def convert_to_lance(
     logger.info("Lance conversion complete: %s/%s.lance", output, table_name)
 
     if push_to_hub:
-        from huggingface_hub import HfApi
-
         api = HfApi()
         api.create_repo(push_to_hub, repo_type="dataset", exist_ok=True)
         logger.info("Uploading %s → hf://datasets/%s", output, push_to_hub)
@@ -595,13 +589,9 @@ def convert_to_lance_video(
           <name>_videos.lance/   # per-episode rows, one blob column per camera
           meta/                  # verbatim from upstream
     """
-    import lancedb
-
     output = Path(output)
     if table_name is None:
         table_name = repo_id.split("/")[-1]
-
-    import inspect
 
     src_kwargs: dict = {"root": src_root, "revision": revision, "tolerance_s": tolerance_s}
     if "return_uint8" in inspect.signature(LeRobotDataset.__init__).parameters:

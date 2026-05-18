@@ -83,5 +83,7 @@ def test_init_rejects_non_lance_hub_repo():
     with pytest.raises(FileNotFoundError, match="No lance table"):
         LeRobotLanceDataset(repo_id="lerobot/pusht")
 
-    with pytest.raises(FileNotFoundError, match="Missing lance table"):
+    # Video class pre-flights via HfApi.list_repo_files and refuses before
+    # paying the download cost.
+    with pytest.raises(FileNotFoundError, match="no '\\*.lance/' directory"):
         LeRobotLanceVideoDataset(repo_id="lerobot/pusht")

@@ -41,24 +41,33 @@ Performance characteristics:
 
 from __future__ import annotations
 
-import io
 import logging
 import os
 import warnings
-import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import lance
+import lancedb
 import numpy as np
+import pyarrow as pa
 import torch
 import torch.utils.data
-
+from huggingface_hub import HfApi, snapshot_download
+from lancedb.permutation import Permutation
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.feature_utils import check_delta_timestamps, get_delta_indices
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
+from torchcodec.decoders import VideoDecoder
 
 from ._spawn_compat import force_spawn_for_lance
+
+try:
+    from huggingface_hub import get_token as _hf_get_token
+except ImportError:
+    _hf_get_token = None
 
 
 logger = logging.getLogger(__name__)
@@ -90,8 +99,6 @@ class _VideoDecoderCache:
         self._order: list[tuple[int, int, str]] = []
 
     def get(self, key: tuple[int, int, str], blob_bytes: bytes):
-        from torchcodec.decoders import VideoDecoder
-
         hit = self._cache.get(key)
         if hit is not None:
             return hit
@@ -138,10 +145,21 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
         if root is None and uri is None and repo_id is None:
             raise TypeError("LeRobotLanceVideoDataset requires one of `root`, `uri`, or `repo_id`.")
 
-        if repo_id is not None and uri is None and root is None:
-            uri, hub_meta_root, table_name = self._materialize_from_hub(repo_id, revision, table_name)
-            if meta_root is None:
-                meta_root = hub_meta_root
+        # HF Hub path: download the whole dataset locally and proceed via
+        # ``root``. lance's pyarrow API has no ``hf://`` provider for blob v2
+        # reads (the ``_videos.lance`` table), so the hybrid "stream frames
+        # + download videos" was misleading — we'd be downloading anyway.
+        # Full download is more elegant and matches the actual cost.
+        if (repo_id is not None or (uri is not None and uri.startswith("hf://"))) and root is None:
+            if repo_id is None:
+                repo_id, revision = self._parse_hf_uri(uri, revision)
+                uri = None
+            logger.warning(
+                "LeRobotLanceVideoDataset over HF Hub will download the full dataset "
+                "to local disk (no true streaming for the video-blob layout). "
+                "For frame-by-frame streaming from HF, use LeRobotLanceDataset instead."
+            )
+            root = self._materialize_from_hub(repo_id, revision, table_name)
 
         self._uri, self._frames_name = self._resolve_uri_and_table(root, uri, table_name)
         self._videos_name = f"{self._frames_name}_videos"
@@ -180,13 +198,6 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
 
         # Probe both lance tables at init (see LeRobotLanceDataset for rationale).
         self._probe_tables_exist()
-
-        # ``take_blobs`` needs a local lance.Dataset (no hf:// provider). For
-        # Hub URIs, materialize the videos table once here so the path is
-        # pickle-shared with spawned workers and they don't race on download.
-        self._local_videos_path: Path | None = None
-        if self._uri.startswith("hf://"):
-            self._local_videos_path = self._materialize_videos_from_hub()
 
         self.delta_indices = None
         if delta_timestamps is not None:
@@ -238,49 +249,40 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
     # ── helpers reused from LeRobotLanceDataset (small enough to inline) ──
 
     @staticmethod
-    def _materialize_from_hub(repo_id, revision, table_name):
-        from huggingface_hub import snapshot_download
+    def _parse_hf_uri(uri: str, revision: str | None) -> tuple[str, str | None]:
+        """Split ``hf://datasets/<repo>[@rev]`` into ``(repo_id, revision)``."""
+        rest = uri[len("hf://datasets/") :].rstrip("/")
+        repo_id, _, embedded_rev = rest.partition("@")
+        return repo_id, revision or (embedded_rev or None)
 
-        from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
+    @staticmethod
+    def _materialize_from_hub(repo_id: str, revision: str | None, table_name: str | None) -> Path:
+        """Download the entire dataset (``meta/`` + both ``*.lance`` tables) locally.
 
-        local_root = Path(
-            snapshot_download(
-                repo_id,
-                repo_type="dataset",
-                revision=revision,
-                cache_dir=HF_LEROBOT_HUB_CACHE,
-                allow_patterns="meta/*",
-            )
-        )
-        if table_name is None:
-            table_name = repo_id.split("/")[-1]
-        suffix = f"@{revision}" if revision else ""
-        return f"hf://datasets/{repo_id}{suffix}", local_root, table_name
-
-    def _materialize_videos_from_hub(self) -> Path:
-        """Snapshot-download the ``_videos.lance`` table locally.
-
-        ``lance.LanceDataset.take_blobs()`` runs through lance's native
-        Rust object-store, which has no ``hf://`` provider. Frames stream
-        from the Hub fine (lancedb has its own HF client), but blob fetches
-        need the videos table on local disk. The download is one-shot per
-        repo — subsequent calls reuse the local copy.
-
-        Important: lance can't read through the symlink layout HF uses in
-        its default ``cache_dir``-style snapshots (manifest paths confuse
-        the byte-range check). We download via ``local_dir=`` so files
-        land as real bytes, not symlinks.
+        Pre-flights by listing the repo's files: if no ``*.lance/`` directory
+        exists on the Hub, fails immediately instead of paying a (potentially
+        hundreds-of-MB) download just to error out later. lance can't read
+        through HF's symlink cache layout, so we download via ``local_dir=``
+        to a flat directory of real files.
         """
-        from huggingface_hub import snapshot_download
-
-        from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
-
-        # self._uri is "hf://datasets/<repo_id>[@rev]" — recover repo_id + revision.
-        rest = self._uri[len("hf://datasets/") :]
-        repo_id, _, revision = rest.partition("@")
+        api = HfApi()
+        try:
+            files = api.list_repo_files(repo_id, revision=revision, repo_type="dataset")
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Could not list HF repo {repo_id!r}: {e}. "
+                "Check the repo exists and credentials are set."
+            ) from e
+        has_lance = any("/" in f and f.split("/", 1)[0].endswith(".lance") for f in files)
+        if not has_lance:
+            raise FileNotFoundError(
+                f"HF repo {repo_id!r} contains no '*.lance/' directory — doesn't "
+                "look like a lerobot-lancedb dataset. Convert the source first with "
+                "`lerobot-convert-to-lance` or `lerobot-convert-to-lance-video`."
+            )
         local_dir = (
             Path(HF_LEROBOT_HUB_CACHE)
-            / "lerobot-lancedb-video-tables"
+            / "lerobot-lancedb-datasets"
             / repo_id.replace("/", "--")
             / (revision or "main")
         )
@@ -288,11 +290,11 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
         snapshot_download(
             repo_id,
             repo_type="dataset",
-            revision=revision or None,
+            revision=revision,
             local_dir=local_dir,
-            allow_patterns=f"{self._videos_name}.lance/**",
+            allow_patterns=["meta/*", "*.lance/**"],
         )
-        return local_dir / f"{self._videos_name}.lance"
+        return local_dir
 
     @staticmethod
     def _resolve_uri_and_table(root, uri, table_name):
@@ -332,13 +334,9 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
             storage_options.setdefault("region", region)
             storage_options.setdefault("virtual_hosted_style_request", "true")
         if uri.startswith("hf://") and "token" not in storage_options:
-            try:
-                from huggingface_hub import get_token
-            except ImportError:
-                get_token = None
             token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-            if token is None and get_token is not None:
-                token = get_token()
+            if token is None and _hf_get_token is not None:
+                token = _hf_get_token()
             if token:
                 storage_options["token"] = token
         if storage_options:
@@ -376,8 +374,6 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
         time with a clear message, instead of leaking a lance HTTP 404
         from ``__getitem__`` much later.
         """
-        import lancedb
-
         try:
             db = lancedb.connect(self._uri, **self._connect_kwargs)
             names = list(db.list_tables().tables)
@@ -398,26 +394,15 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
     def _ensure_open(self) -> None:
         if self._frames_perm is not None:
             return
-        import lancedb
-        from lancedb.permutation import Permutation
 
         self._db = lancedb.connect(self._uri, **self._connect_kwargs)
         self._frames_table = self._db.open_table(self._frames_name)
         # ``take_blobs`` lives on ``lance.LanceDataset``. ``lance.dataset()``
-        # honors storage_options for s3/gs/az, but its native object-store
-        # registry has no ``hf`` provider — so for the Hub we read from the
-        # local copy materialized in __init__.
-        import lance
-
-        if self._local_videos_path is not None:
-            self._videos_dataset = lance.dataset(str(self._local_videos_path))
-        else:
-            videos_uri = f"{self._uri}/{self._videos_name}.lance"
-            storage_options = self._connect_kwargs.get("storage_options")
-            self._videos_dataset = lance.dataset(
-                videos_uri,
-                storage_options=storage_options,
-            )
+        # honors storage_options for s3/gs/az. HF Hub URIs never reach here
+        # (HF is fully materialized in __init__ via _materialize_from_hub).
+        videos_uri = f"{self._uri}/{self._videos_name}.lance"
+        storage_options = self._connect_kwargs.get("storage_options")
+        self._videos_dataset = lance.dataset(videos_uri, storage_options=storage_options)
 
         # Build a (video_key, chunk_index, file_index) → row offset map for take_blobs lookup.
         # Different cameras can use different (chunk, file) indexing for the same episode
@@ -539,7 +524,6 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
         if not indices:
             return []
         self._ensure_open()
-        import pyarrow as pa
 
         # 1. Lay out per-sample row positions.
         all_rows: list[int] = []
@@ -667,7 +651,9 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
             blob_files = self._videos_dataset.take_blobs(
                 blob_column="video_bytes", indices=row_idxs
             )
-            for (chunk, fidx, vid_key), blob_file in zip(files_needing_blobs, blob_files):
+            for (chunk, fidx, vid_key), blob_file in zip(
+                files_needing_blobs, blob_files, strict=True
+            ):
                 self._decoder_cache.get((chunk, fidx, vid_key), blob_file.readall())
                 blob_file.close()
 

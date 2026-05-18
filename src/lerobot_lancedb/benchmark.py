@@ -31,11 +31,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
-
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from .dataset import LeRobotLanceDataset
-
 
 logger = logging.getLogger(__name__)
 
