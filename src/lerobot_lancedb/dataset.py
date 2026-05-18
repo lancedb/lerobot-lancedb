@@ -236,6 +236,8 @@ class LeRobotLanceDataset(LeRobotDataset):
         # modification.
         self.meta = self._load_metadata(self.repo_id, meta_root_resolved)
 
+        self._probe_table_exists()
+
         self.delta_indices = None
         if delta_timestamps is not None:
             check_delta_timestamps(delta_timestamps, self.meta.fps, tolerance_s)
@@ -434,6 +436,32 @@ class LeRobotLanceDataset(LeRobotDataset):
         self.set_image_transforms(None)
 
     # ── lance handle management ───────────────────────────────────────
+
+    def _probe_table_exists(self) -> None:
+        """Verify the lance table exists at ``self._uri`` before lazy-open.
+
+        Surfaces "this URI is not a lerobot-lancedb dataset" at init time
+        with a clear message, instead of leaking a lance HTTP 404 from
+        ``__getitem__`` much later.
+        """
+        import lancedb
+
+        try:
+            db = lancedb.connect(self._uri, **self._connect_kwargs)
+            names = list(db.list_tables().tables)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Could not list lance tables at {self._uri!r}: {e}. "
+                "Check that the URI / repo exists and credentials are set."
+            ) from e
+        if self._table_name not in names:
+            raise FileNotFoundError(
+                f"No lance table named '{self._table_name}' at {self._uri!r} "
+                f"(existing tables: {names}). This doesn't look like a "
+                "lerobot-lancedb dataset — convert the source with "
+                "`lerobot-convert-to-lance` (frames) or "
+                "`lerobot-convert-to-lance-video` (video) first."
+            )
 
     def _ensure_open(self) -> None:
         """Connect to the table and build a Permutation read handle."""

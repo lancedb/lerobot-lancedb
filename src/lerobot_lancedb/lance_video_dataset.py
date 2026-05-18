@@ -177,6 +177,17 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
         force_spawn_for_lance()
 
         self.meta = self._load_metadata(self.repo_id, meta_root_resolved)
+
+        # Probe both lance tables at init (see LeRobotLanceDataset for rationale).
+        self._probe_tables_exist()
+
+        # ``take_blobs`` needs a local lance.Dataset (no hf:// provider). For
+        # Hub URIs, materialize the videos table once here so the path is
+        # pickle-shared with spawned workers and they don't race on download.
+        self._local_videos_path: Path | None = None
+        if self._uri.startswith("hf://"):
+            self._local_videos_path = self._materialize_videos_from_hub()
+
         self.delta_indices = None
         if delta_timestamps is not None:
             check_delta_timestamps(delta_timestamps, self.meta.fps, tolerance_s)
@@ -245,6 +256,43 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
             table_name = repo_id.split("/")[-1]
         suffix = f"@{revision}" if revision else ""
         return f"hf://datasets/{repo_id}{suffix}", local_root, table_name
+
+    def _materialize_videos_from_hub(self) -> Path:
+        """Snapshot-download the ``_videos.lance`` table locally.
+
+        ``lance.LanceDataset.take_blobs()`` runs through lance's native
+        Rust object-store, which has no ``hf://`` provider. Frames stream
+        from the Hub fine (lancedb has its own HF client), but blob fetches
+        need the videos table on local disk. The download is one-shot per
+        repo — subsequent calls reuse the local copy.
+
+        Important: lance can't read through the symlink layout HF uses in
+        its default ``cache_dir``-style snapshots (manifest paths confuse
+        the byte-range check). We download via ``local_dir=`` so files
+        land as real bytes, not symlinks.
+        """
+        from huggingface_hub import snapshot_download
+
+        from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
+
+        # self._uri is "hf://datasets/<repo_id>[@rev]" — recover repo_id + revision.
+        rest = self._uri[len("hf://datasets/") :]
+        repo_id, _, revision = rest.partition("@")
+        local_dir = (
+            Path(HF_LEROBOT_HUB_CACHE)
+            / "lerobot-lancedb-video-tables"
+            / repo_id.replace("/", "--")
+            / (revision or "main")
+        )
+        local_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id,
+            repo_type="dataset",
+            revision=revision or None,
+            local_dir=local_dir,
+            allow_patterns=f"{self._videos_name}.lance/**",
+        )
+        return local_dir / f"{self._videos_name}.lance"
 
     @staticmethod
     def _resolve_uri_and_table(root, uri, table_name):
@@ -321,6 +369,32 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
 
     # ── lance handle management ───────────────────────────────────────
 
+    def _probe_tables_exist(self) -> None:
+        """Verify both lance tables exist at ``self._uri`` before lazy-open.
+
+        Surfaces "this URI is not a lerobot-lancedb video dataset" at init
+        time with a clear message, instead of leaking a lance HTTP 404
+        from ``__getitem__`` much later.
+        """
+        import lancedb
+
+        try:
+            db = lancedb.connect(self._uri, **self._connect_kwargs)
+            names = list(db.list_tables().tables)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Could not list lance tables at {self._uri!r}: {e}. "
+                "Check that the URI / repo exists and credentials are set."
+            ) from e
+        missing = [n for n in (self._frames_name, self._videos_name) if n not in names]
+        if missing:
+            raise FileNotFoundError(
+                f"Missing lance table(s) {missing} at {self._uri!r} "
+                f"(existing tables: {names}). This doesn't look like a "
+                "lerobot-lancedb video dataset — convert the source with "
+                "`lerobot-convert-to-lance-video` first."
+            )
+
     def _ensure_open(self) -> None:
         if self._frames_perm is not None:
             return
@@ -329,13 +403,21 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
 
         self._db = lancedb.connect(self._uri, **self._connect_kwargs)
         self._frames_table = self._db.open_table(self._frames_name)
-        # The videos table is opened as a raw lance.Dataset (lancedb's wrapper
-        # doesn't expose take_blobs). The underlying lance Dataset is accessible
-        # via the same connect URI.
+        # ``take_blobs`` lives on ``lance.LanceDataset``. ``lance.dataset()``
+        # honors storage_options for s3/gs/az, but its native object-store
+        # registry has no ``hf`` provider — so for the Hub we read from the
+        # local copy materialized in __init__.
         import lance
 
-        videos_uri = f"{self._uri}/{self._videos_name}.lance"
-        self._videos_dataset = lance.dataset(videos_uri)
+        if self._local_videos_path is not None:
+            self._videos_dataset = lance.dataset(str(self._local_videos_path))
+        else:
+            videos_uri = f"{self._uri}/{self._videos_name}.lance"
+            storage_options = self._connect_kwargs.get("storage_options")
+            self._videos_dataset = lance.dataset(
+                videos_uri,
+                storage_options=storage_options,
+            )
 
         # Build a (video_key, chunk_index, file_index) → row offset map for take_blobs lookup.
         # Different cameras can use different (chunk, file) indexing for the same episode

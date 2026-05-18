@@ -72,6 +72,16 @@ Full numbers (pusht env-eval + ALOHA cups_open held-out MSE across all storage m
 
 Both readers accept `s3://`, `gs://`, `hf://datasets/...`, `hf://buckets/...` URIs and pick up credentials from the usual env vars (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, `HF_TOKEN`). Lance does byte-range fetches — no full-dataset download.
 
+Pre-converted reference datasets you can paste directly:
+
+```python
+from lerobot_lancedb import LeRobotLanceDataset, LeRobotLanceVideoDataset
+
+LeRobotLanceDataset(repo_id="lance-format/pusht-lerobot-lancedb")        # 60 MB JPEG layout
+LeRobotLanceVideoDataset(repo_id="lance-format/pusht-lerobot-lancedb-video")  # 8 MB video-blob layout
+```
+
+
 ## License
 
 Apache 2.0.
