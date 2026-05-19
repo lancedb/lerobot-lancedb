@@ -11,13 +11,11 @@ Both subclass `LeRobotDataset` so existing trainers / samplers / `isinstance` ch
 
 ## Install
 
-Until the first PyPI release, install from GitHub:
-
 ```bash
-pip install git+https://github.com/lancedb/lerobot-lancedb.git
+pip install lerobot-lancedb
 ```
 
-Or, for local development:
+For local development:
 
 ```bash
 git clone https://github.com/lancedb/lerobot-lancedb.git
