@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url>
+         <loc>https://lancedb.github.io/lerobot-lancedb/</loc>
+         <lastmod>2026-05-19</lastmod>
+    </url>
+    <url>
+         <loc>https://lancedb.github.io/lerobot-lancedb/benchmarks/</loc>
+         <lastmod>2026-05-19</lastmod>
+    </url>
+    <url>
+         <loc>https://lancedb.github.io/lerobot-lancedb/conversion/</loc>
+         <lastmod>2026-05-19</lastmod>
+    </url>
+    <url>
+         <loc>https://lancedb.github.io/lerobot-lancedb/examples/</loc>
+         <lastmod>2026-05-19</lastmod>
+    </url>
+    <url>
+         <loc>https://lancedb.github.io/lerobot-lancedb/frames-format/</loc>
+         <lastmod>2026-05-19</lastmod>
+    </url>
+    <url>
+         <loc>https://lancedb.github.io/lerobot-lancedb/video-format/</loc>
+         <lastmod>2026-05-19</lastmod>
+    </url>
+</urlset>
