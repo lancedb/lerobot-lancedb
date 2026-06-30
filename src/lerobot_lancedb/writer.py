@@ -27,16 +27,22 @@ import inspect
 import io
 import logging
 import os
+import queue
 import shutil
+import threading
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import lancedb
 import numpy as np
 import pyarrow as pa
 import torch
 from huggingface_hub import HfApi
+from lerobot.datasets.compute_stats import DEFAULT_QUANTILES, get_feature_stats
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.datasets.feature_utils import DEFAULT_FEATURES, validate_episode_buffer, validate_frame
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import decode_video_frames
 from PIL import Image
@@ -152,6 +158,468 @@ def _build_schema(features: dict[str, dict], has_subtasks: bool) -> tuple[pa.Sch
             dims[lance_key] = dim
             fields.append(pa.field(lance_key, pa.list_(pa.float32(), dim)))
     return pa.schema(fields), dims
+
+
+def _to_numpy_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return value
+
+
+def _frame_to_chw_uint8(frame: Any) -> np.ndarray:
+    """Normalize a LeRobot image/video frame value to CHW uint8."""
+    if isinstance(frame, Image.Image):
+        arr = np.asarray(frame.convert("RGB"))
+    else:
+        arr = np.asarray(_to_numpy_value(frame))
+
+    if arr.dtype != np.uint8:
+        if arr.dtype.kind == "f":
+            arr = (arr.clip(0, 1) * 255.0).round().astype(np.uint8)
+        else:
+            arr = arr.astype(np.uint8)
+
+    if arr.ndim == 3 and arr.shape[0] in (1, 3, 4):
+        chw = arr
+    elif arr.ndim == 3 and arr.shape[-1] in (1, 3, 4):
+        chw = np.transpose(arr, (2, 0, 1))
+    else:
+        raise ValueError(f"Expected CHW or HWC image frame, got shape {arr.shape}.")
+
+    if chw.shape[0] == 1:
+        chw = np.repeat(chw, 3, axis=0)
+    elif chw.shape[0] == 4:
+        chw = chw[:3]
+    return chw
+
+
+def _compute_episode_stats_in_memory(
+    episode_data: dict[str, Any],
+    features: dict[str, dict],
+    quantile_list: list[float] | None = None,
+) -> dict[str, dict[str, np.ndarray]]:
+    """Compute LeRobot-compatible stats without materializing images on disk."""
+    if quantile_list is None:
+        quantile_list = DEFAULT_QUANTILES
+
+    ep_stats: dict[str, dict[str, np.ndarray]] = {}
+    for key, data in episode_data.items():
+        if key not in features or features[key]["dtype"] in {"string", "language"}:
+            continue
+
+        if features[key]["dtype"] in {"image", "video"}:
+            frames = [_frame_to_chw_uint8(frame) for frame in data]
+            ep_ft_array = np.stack(frames)
+            stats = get_feature_stats(
+                ep_ft_array,
+                axis=(0, 2, 3),
+                keepdims=True,
+                quantile_list=quantile_list,
+            )
+            ep_stats[key] = {
+                stat_key: stat_value if stat_key == "count" else np.squeeze(stat_value / 255.0, axis=0)
+                for stat_key, stat_value in stats.items()
+            }
+        else:
+            ep_ft_array = np.asarray(data)
+            ep_stats[key] = get_feature_stats(
+                ep_ft_array,
+                axis=0,
+                keepdims=ep_ft_array.ndim == 1,
+                quantile_list=quantile_list,
+            )
+
+    return ep_stats
+
+
+def _episode_buffer_record_batch(
+    meta: LeRobotDatasetMetadata,
+    episode_buffer: dict[str, Any],
+    schema: pa.Schema,
+    tabular_dims: dict[str, int],
+    image_keys: set[str],
+    video_keys: set[str],
+    jpeg_quality: int,
+    chroma_subsampling: int,
+) -> pa.RecordBatch:
+    ep_len = int(len(episode_buffer["index"]))
+    arrays: dict[str, pa.Array] = {}
+
+    def _to_numpy_scalar_column(values, dtype) -> np.ndarray:
+        if isinstance(values, torch.Tensor):
+            return values.detach().cpu().numpy().astype(dtype)
+        if isinstance(values, list) and values and isinstance(values[0], torch.Tensor):
+            return torch.stack(values).detach().cpu().numpy().astype(dtype)
+        return np.asarray(values, dtype=dtype)
+
+    arrays["episode_index"] = pa.array(
+        _to_numpy_scalar_column(episode_buffer["episode_index"], np.int32), type=pa.int32()
+    )
+    arrays["frame_index"] = pa.array(
+        _to_numpy_scalar_column(episode_buffer["frame_index"], np.int32), type=pa.int32()
+    )
+    arrays["index"] = pa.array(
+        _to_numpy_scalar_column(episode_buffer["index"], np.int64), type=pa.int64()
+    )
+    arrays["timestamp"] = pa.array(
+        _to_numpy_scalar_column(episode_buffer["timestamp"], np.float32), type=pa.float32()
+    )
+    arrays["task_index"] = pa.array(
+        _to_numpy_scalar_column(episode_buffer["task_index"], np.int32), type=pa.int32()
+    )
+    if "subtask_index" in [f.name for f in schema]:
+        sub_idx = episode_buffer.get("subtask_index", np.zeros(ep_len, dtype=np.int32))
+        arrays["subtask_index"] = pa.array(
+            _to_numpy_scalar_column(sub_idx, np.int32), type=pa.int32()
+        )
+
+    for key, _ft in meta.features.items():
+        lance_key = _to_lance_name(key)
+        if lance_key in arrays:
+            continue
+        if key in video_keys or key in image_keys:
+            col = episode_buffer[key]
+
+            def _enc_i(i: int, col=col):
+                v = col[i] if isinstance(col, list) else col[i]
+                if isinstance(v, Image.Image):
+                    buf = io.BytesIO()
+                    v.convert("RGB").save(
+                        buf,
+                        format="JPEG",
+                        quality=jpeg_quality,
+                        subsampling=chroma_subsampling,
+                    )
+                    return buf.getvalue()
+                return _encode_image(v, jpeg_quality, chroma_subsampling)
+
+            with ThreadPoolExecutor(max_workers=_ENCODE_WORKERS) as pool:
+                blobs = list(pool.map(_enc_i, range(ep_len)))
+            arrays[lance_key] = pa.array(blobs, type=pa.binary())
+        else:
+            dim = tabular_dims[lance_key]
+            col = episode_buffer[key]
+            if isinstance(col, torch.Tensor):
+                flat = col.detach().cpu().numpy().astype(np.float32).reshape(ep_len, dim).reshape(-1)
+            elif isinstance(col, list) and col and isinstance(col[0], torch.Tensor):
+                flat = (
+                    torch.stack(col)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                    .reshape(ep_len, dim)
+                    .reshape(-1)
+                )
+            else:
+                flat = np.asarray(col, dtype=np.float32).reshape(ep_len, dim).reshape(-1)
+            arrays[lance_key] = pa.FixedSizeListArray.from_arrays(
+                pa.array(flat, type=pa.float32()), dim
+            )
+
+    ordered = [arrays[f.name] for f in schema]
+    return pa.RecordBatch.from_arrays(ordered, schema=schema)
+
+
+class _StreamingLanceTableWriter:
+    """Append RecordBatches to an existing LanceDB table with one reader."""
+
+    _STOP = object()
+
+    def __init__(self, table: Any, schema: pa.Schema, max_pending_batches: int = 2) -> None:
+        if max_pending_batches < 1:
+            raise ValueError("max_pending_batches must be >= 1.")
+        self._table = table
+        self._schema = schema
+        self._queue: queue.Queue[pa.RecordBatch | object] = queue.Queue(maxsize=max_pending_batches)
+        self._error: BaseException | None = None
+        self._error_lock = threading.Lock()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="lerobot-lancedb-writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _iter_batches(self) -> Iterable[pa.RecordBatch]:
+        while True:
+            item = self._queue.get()
+            if item is self._STOP:
+                break
+            yield item
+
+    def _run(self) -> None:
+        try:
+            reader = pa.RecordBatchReader.from_batches(self._schema, self._iter_batches())
+            self._table.add(reader, mode="append")
+        except BaseException as exc:
+            with self._error_lock:
+                self._error = exc
+
+    def _raise_if_failed(self) -> None:
+        with self._error_lock:
+            error = self._error
+        if error is not None:
+            raise RuntimeError("Lance table writer failed.") from error
+
+    def _put(self, item: pa.RecordBatch | object) -> None:
+        while True:
+            self._raise_if_failed()
+            try:
+                self._queue.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def write(self, batch: pa.RecordBatch) -> None:
+        if self._closed:
+            raise RuntimeError("Cannot write to a closed Lance table writer.")
+        self._put(batch)
+        self._raise_if_failed()
+
+    def close(self) -> None:
+        if self._closed:
+            self._raise_if_failed()
+            return
+        self._closed = True
+        self._put(self._STOP)
+        self._thread.join()
+        self._raise_if_failed()
+
+
+class LanceFramesWriter:
+    """Write-mode companion for :class:`LeRobotLanceDataset` frames layout."""
+
+    def __init__(
+        self,
+        *,
+        meta: LeRobotDatasetMetadata,
+        root: Path,
+        table_name: str,
+        jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
+        chroma_subsampling: int = 2,
+    ) -> None:
+        self._meta = meta
+        self._root = root
+        self._table_name = table_name
+        self._jpeg_quality = jpeg_quality
+        self._chroma_subsampling = chroma_subsampling
+        self._image_keys = set(meta.image_keys)
+        self._video_keys = set(meta.video_keys)
+        self._schema, self._tabular_dims = _build_schema(
+            meta.features,
+            has_subtasks="subtask_index" in meta.features and meta.subtasks is not None,
+        )
+        self.episode_buffer: dict = self._create_episode_buffer()
+        self._db = None
+        self._table = None
+        self._table_writer: _StreamingLanceTableWriter | None = None
+        self._finalized = False
+
+    def _create_episode_buffer(self, episode_index: int | None = None) -> dict:
+        current_ep_idx = self._meta.total_episodes if episode_index is None else episode_index
+        ep_buffer: dict[str, Any] = {"size": 0, "task": []}
+        for key in self._meta.features:
+            ep_buffer[key] = current_ep_idx if key == "episode_index" else []
+        return ep_buffer
+
+    def add_frame(self, frame: dict) -> None:
+        frame = {key: _to_numpy_value(value) for key, value in frame.items()}
+        validate_frame(frame, self._meta.features)
+
+        frame_index = self.episode_buffer["size"]
+        timestamp = frame_index / self._meta.fps
+        self.episode_buffer["frame_index"].append(frame_index)
+        self.episode_buffer["timestamp"].append(timestamp)
+        self.episode_buffer["task"].append(frame["task"])
+
+        for key, value in frame.items():
+            if key == "task":
+                continue
+            if key not in self._meta.features:
+                raise ValueError(
+                    f"An element of the frame is not in the features. '{key}' not in "
+                    f"'{self._meta.features.keys()}'."
+                )
+            self.episode_buffer[key].append(value)
+
+        self.episode_buffer["size"] += 1
+
+    def _looks_like_episode_buffer(self, episode_data: dict[str, Any]) -> bool:
+        return "size" in episode_data and "episode_index" in episode_data
+
+    def _episode_length_from_columns(self, episode_data: dict[str, Any]) -> int:
+        lengths = []
+        for key, value in episode_data.items():
+            if key in DEFAULT_FEATURES:
+                continue
+            if key == "task":
+                if isinstance(value, str):
+                    continue
+                lengths.append(len(value))
+                continue
+            if key not in self._meta.features:
+                continue
+            value = _to_numpy_value(value)
+            if isinstance(value, Image.Image):
+                continue
+            if isinstance(value, np.ndarray):
+                feature_shape = tuple(self._meta.features[key].get("shape", ()))
+                lengths.append(1 if value.shape == feature_shape else len(value))
+            else:
+                lengths.append(len(value))
+
+        if not lengths:
+            raise ValueError("Could not infer episode length from episode_data.")
+        if len(set(lengths)) != 1:
+            raise ValueError(f"episode_data columns have inconsistent lengths: {lengths}")
+        return int(lengths[0])
+
+    def _split_column(self, key: str, value: Any, length: int) -> list[Any]:
+        value = _to_numpy_value(value)
+        if isinstance(value, Image.Image):
+            if length != 1:
+                raise ValueError(f"Feature '{key}' provides one image but episode length is {length}.")
+            return [value]
+        if isinstance(value, np.ndarray):
+            feature_shape = tuple(self._meta.features[key].get("shape", ()))
+            if value.shape == feature_shape:
+                if length != 1:
+                    raise ValueError(
+                        f"Feature '{key}' provides one value with shape {value.shape} "
+                        f"but episode length is {length}."
+                    )
+                return [value]
+            if len(value) != length:
+                raise ValueError(
+                    f"Feature '{key}' length {len(value)} does not match episode length {length}."
+                )
+            return [value[i] for i in range(length)]
+        if len(value) != length:
+            raise ValueError(f"Feature '{key}' length {len(value)} does not match episode length {length}.")
+        return [_to_numpy_value(v) for v in value]
+
+    def _normalize_episode_data(self, episode_data: dict[str, Any]) -> dict:
+        if self._looks_like_episode_buffer(episode_data):
+            return {
+                key: list(value) if isinstance(value, list) else value
+                for key, value in episode_data.items()
+            }
+
+        length = self._episode_length_from_columns(episode_data)
+        tasks_raw = episode_data.get("task")
+        if tasks_raw is None:
+            raise ValueError("episode_data must include a 'task' entry.")
+        tasks = [tasks_raw] * length if isinstance(tasks_raw, str) else list(tasks_raw)
+        if len(tasks) != length:
+            raise ValueError(f"task length {len(tasks)} does not match episode length {length}.")
+
+        columns = {
+            key: self._split_column(key, value, length)
+            for key, value in episode_data.items()
+            if key != "task" and key not in DEFAULT_FEATURES
+        }
+        ep_buffer = self._create_episode_buffer()
+        for i in range(length):
+            frame = {key: values[i] for key, values in columns.items()}
+            frame["task"] = tasks[i]
+            frame = {key: _to_numpy_value(value) for key, value in frame.items()}
+            validate_frame(frame, self._meta.features)
+            ep_buffer["frame_index"].append(i)
+            ep_buffer["timestamp"].append(i / self._meta.fps)
+            ep_buffer["task"].append(frame["task"])
+            for key, value in frame.items():
+                if key != "task":
+                    ep_buffer[key].append(value)
+            ep_buffer["size"] += 1
+        return ep_buffer
+
+    def _ensure_table_writer(self) -> _StreamingLanceTableWriter:
+        if self._db is None:
+            self._db = lancedb.connect(str(self._root))
+        if self._table is None:
+            names = list(self._db.list_tables().tables)
+            if self._table_name in names:
+                raise FileExistsError(
+                    f"Lance table '{self._table_name}' already exists at '{self._root}'."
+                )
+            self._table = self._db.create_table(self._table_name, data=None, schema=self._schema)
+        if self._table_writer is None:
+            self._table_writer = _StreamingLanceTableWriter(self._table, self._schema)
+        return self._table_writer
+
+    def _write_record_batch(self, batch: pa.RecordBatch) -> None:
+        self._ensure_table_writer().write(batch)
+
+    def save_episode(self, episode_data: dict | None = None, parallel_encoding: bool = True) -> None:
+        del parallel_encoding
+        episode_buffer = (
+            self._normalize_episode_data(episode_data)
+            if episode_data is not None
+            else self.episode_buffer
+        )
+        validate_episode_buffer(episode_buffer, self._meta.total_episodes, self._meta.features)
+
+        episode_length = int(episode_buffer.pop("size"))
+        tasks = episode_buffer.pop("task")
+        episode_tasks = list(set(tasks))
+        episode_index = int(episode_buffer["episode_index"])
+
+        episode_buffer["index"] = np.arange(
+            self._meta.total_frames, self._meta.total_frames + episode_length, dtype=np.int64
+        )
+        episode_buffer["episode_index"] = np.full((episode_length,), episode_index, dtype=np.int64)
+
+        self._meta.save_episode_tasks(episode_tasks)
+        episode_buffer["task_index"] = np.array(
+            [self._meta.get_task_index(task) for task in tasks], dtype=np.int64
+        )
+
+        for key, ft in self._meta.features.items():
+            if key in {"index", "episode_index", "task_index"} or ft["dtype"] in {"image", "video"}:
+                continue
+            stacked_values = np.stack(episode_buffer[key])
+            if tuple(ft["shape"]) == (1,) and ft["dtype"] != "string":
+                stacked_values = stacked_values.reshape(episode_length)
+            episode_buffer[key] = stacked_values
+
+        ep_stats = _compute_episode_stats_in_memory(episode_buffer, self._meta.features)
+        batch = _episode_buffer_record_batch(
+            self._meta,
+            episode_buffer,
+            self._schema,
+            self._tabular_dims,
+            self._image_keys,
+            self._video_keys,
+            self._jpeg_quality,
+            self._chroma_subsampling,
+        )
+        self._write_record_batch(batch)
+
+        # LeRobot's metadata writer builds parquet schemas from dict insertion
+        # order. Seed the frame range keys so every metadata buffer flush keeps
+        # the same schema order; the metadata layer still owns the final values.
+        episode_metadata = {
+            "dataset_from_index": int(self._meta.total_frames),
+            "dataset_to_index": int(self._meta.total_frames) + episode_length,
+        }
+        self._meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, episode_metadata)
+
+        if episode_data is None or self.episode_buffer["size"] == 0:
+            self.clear_episode_buffer()
+
+    def clear_episode_buffer(self, delete_images: bool = True) -> None:
+        del delete_images
+        self.episode_buffer = self._create_episode_buffer()
+
+    def finalize(self) -> None:
+        if self._finalized:
+            return
+        if self._table_writer is not None:
+            self._table_writer.close()
+        self._meta.finalize()
+        self._finalized = True
 
 
 def _episode_record_batch(
