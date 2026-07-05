@@ -16,7 +16,6 @@ Formats:
 
 * ``jpeg-95`` — current default (JPEG-95, 4:2:0 chroma)
 * ``jpeg-100-444`` — near-lossless JPEG (q=100, no chroma subsampling)
-* ``png`` — bit-exact, lossless (CPU decode only)
 * ``video`` — Lance blob v2 with the original mp4 bytes stored verbatim;
   on-the-fly torchcodec decode
 
@@ -51,7 +50,7 @@ from lerobot_lancedb.writer import convert_to_lance, convert_to_lance_video
 log = logging.getLogger("benchmark_formats")
 
 
-FORMATS = ("jpeg-95", "jpeg-100-444", "png", "video")
+FORMATS = ("jpeg-95", "jpeg-100-444", "video")
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,9 +83,10 @@ def _format_dir(out_root: Path, repo_id: str, fmt: str) -> Path:
     suffix = {
         "jpeg-95": "_lance",
         "jpeg-100-444": "_lance_j100",
-        "png": "_lance_lossless",
         "video": "_lance_video",
-    }[fmt]
+    }.get(fmt)
+    if suffix is None:
+        raise ValueError(f"unknown format {fmt!r}")
     return out_root / f"{base}{suffix}"
 
 
@@ -116,10 +116,6 @@ def ensure_dataset(repo_id: str, fmt: str, out_root: Path) -> Path | None:
         convert_to_lance(
             repo_id=repo_id, output=target, jpeg_quality=100,
             chroma_subsampling=0, overwrite=True, progress=False,
-        )
-    elif fmt == "png":
-        convert_to_lance(
-            repo_id=repo_id, output=target, lossless=True, overwrite=True, progress=False,
         )
     elif fmt == "video":
         convert_to_lance_video(repo_id=repo_id, output=target, overwrite=True, progress=False)
