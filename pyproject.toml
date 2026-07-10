@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lerobot-lancedb"
-version = "0.2.0"
+version = "0.2.1"
 description = "Lance-backed datasets for LeRobot — frame-level random access on local disk and cloud (S3 / GCS / HF Hub / HF Buckets)."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -25,11 +25,10 @@ keywords = ["lerobot", "lancedb", "lance", "robotics", "datasets", "dataloader"]
 
 dependencies = [
     # We subclass lerobot.datasets.LeRobotDataset so isinstance checks pass
-    # for downstream training code (factories, samplers, etc.). We don't
-    # depend on the [dataset] extra explicitly because older lerobot versions
-    # bundled those deps into the base install. Users on lerobot>=0.6 should
-    # install with `lerobot-lancedb` + `lerobot[dataset]` together.
-    "lerobot>=0.5.0",
+    # for downstream training code (factories, samplers, etc.). The [dataset]
+    # extra is required since lerobot 0.6 moved av/torchcodec behind it; on
+    # older versions pip merely warns about the unknown extra.
+    "lerobot[dataset]>=0.5.0",
     "datasets>=4.0.0,<5.0.0",
     "pyarrow>=21.0.0,<30.0.0",
     "lancedb>=0.20.0,<1.0.0",
