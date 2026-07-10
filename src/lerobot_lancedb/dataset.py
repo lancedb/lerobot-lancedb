@@ -683,7 +683,7 @@ class LeRobotLanceDataset(LeRobotDataset):
                 item["task"] = self.meta.tasks.iloc[task_idx].name
             except (IndexError, AttributeError):
                 item["task"] = ""
-            if subtask_arr is not None and self.meta.subtasks is not None:
+            if subtask_arr is not None and getattr(self.meta, "subtasks", None) is not None:
                 try:
                     item["subtask"] = self.meta.subtasks.iloc[int(item["subtask_index"])].name
                 except (IndexError, AttributeError):

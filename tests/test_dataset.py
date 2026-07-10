@@ -39,6 +39,21 @@ _FEATURES = {
 }
 
 
+def _h264_encoder_kwargs() -> dict:
+    """Encoder kwargs for LeRobotDataset.create across lerobot versions.
+
+    h264 instead of the libsvtav1 default: faster and always present in CI ffmpeg.
+    """
+    import inspect
+
+    params = inspect.signature(LeRobotDataset.create).parameters
+    if "vcodec" in params:
+        return {"vcodec": "h264"}
+    from lerobot.configs.video import RGBEncoderConfig
+
+    return {"rgb_encoder": RGBEncoderConfig(vcodec="h264")}
+
+
 def _make_frame(rng: np.random.Generator) -> dict:
     img = rng.integers(0, 256, size=(3, 32, 48), dtype=np.uint8)
     return {
@@ -371,6 +386,8 @@ def test_multicam_batched_decode_is_one_call_per_key(multicam_lance_dir):
 def subtasks_lance_dir(parquet_dataset, tmp_path_factory):
     """Reuse the standard parquet fixture; add a subtasks sidecar manually.
 
+    Skipped under lerobot>=0.6, which removed ``meta.subtasks``.
+
     Subtasks aren't writable via LeRobotDataset.add_frame in 0.5.x — they
     live as a parquet sidecar (``meta/subtasks.parquet``) that the converter
     copies verbatim. We synthesise one with a single subtask row + a
@@ -383,6 +400,10 @@ def subtasks_lance_dir(parquet_dataset, tmp_path_factory):
     import pyarrow.parquet as pq
 
     src_root, _, _ = parquet_dataset
+    from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+
+    if not hasattr(LeRobotDatasetMetadata, "subtasks"):
+        pytest.skip("installed lerobot does not expose meta.subtasks (removed in 0.6)")
     holder = tmp_path_factory.mktemp("subtasks_holder")
     src_copy = holder / "ds"
     shutil.copytree(src_root, src_copy)
@@ -481,7 +502,8 @@ def video_parquet_dataset(tmp_path_factory):
         features=features,
         root=root,
         use_videos=True,
-        vcodec="h264",
+        # lerobot<0.6 takes vcodec=...; >=0.6 takes rgb_encoder=RGBEncoderConfig(...)
+        **_h264_encoder_kwargs(),
     )
     rng = np.random.default_rng(11)
     for _ in range(2):
