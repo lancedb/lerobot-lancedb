@@ -132,14 +132,21 @@ class LeRobotLanceDataset(LeRobotDataset):
             ``storage_options={...}`` to override env-derived defaults.
     """
 
+    # Lance serves every frame by absolute dataset index; the absolute->relative
+    # row remap only exists for episode-filtered parquet readers upstream.
+    # Shadow the upstream property so trainers (e.g. lerobot-train's
+    # EpisodeAwareSampler wiring) can read it without touching a parquet reader.
+    absolute_to_relative_idx = None
+
+
     def __init__(
         self,
+        repo_id: str | None = None,
         root: str | Path | None = None,
         *,
         uri: str | None = None,
         meta_root: str | Path | None = None,
         table_name: str | None = None,
-        repo_id: str | None = None,
         revision: str | None = None,
         episodes: list[int] | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
@@ -147,6 +154,12 @@ class LeRobotLanceDataset(LeRobotDataset):
         tolerance_s: float = 1e-4,
         return_uint8: bool = False,
         connect_kwargs: dict[str, Any] | None = None,
+        # Accepted for drop-in compatibility with lerobot's dataset factory
+        # (`make_dataset` passes these); they have no effect on Lance reads.
+        video_backend: str | None = None,
+        download_videos: bool | None = None,
+        force_cache_sync: bool | None = None,
+        depth_output_unit: str | None = None,
         decode_device: str | torch.device | None = "auto",
     ) -> None:
         """``decode_device`` decodes JPEGs on the named torch device.
@@ -168,6 +181,10 @@ class LeRobotLanceDataset(LeRobotDataset):
         # here. Go straight to torch.utils.data.Dataset for the bookkeeping
         # that PyTorch's loader needs.
         torch.utils.data.Dataset.__init__(self)
+
+        if repo_id is not None and root is None and uri is None and Path(repo_id).is_dir():
+            # positional local path (pre-0.2 call style): treat as root
+            repo_id, root = None, repo_id
 
         if root is None and uri is None and repo_id is None:
             raise TypeError(
