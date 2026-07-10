@@ -337,7 +337,7 @@ def convert_to_lance(
 
     image_keys = set(meta.image_keys)
     video_keys = set(meta.video_keys)
-    has_subtasks = "subtask_index" in meta.features and meta.subtasks is not None
+    has_subtasks = "subtask_index" in meta.features and getattr(meta, "subtasks", None) is not None
 
     schema, tabular_dims = _build_schema(meta.features, has_subtasks)
 
@@ -610,7 +610,7 @@ def convert_to_lance_video(
     if not video_keys:
         raise ValueError("No video features found in source dataset — nothing to convert.")
 
-    has_subtasks = "subtask_index" in meta.features and meta.subtasks is not None
+    has_subtasks = "subtask_index" in meta.features and getattr(meta, "subtasks", None) is not None
     frames_schema, tabular_dims = _frames_schema_no_images(meta.features, has_subtasks)
     videos_schema = _video_schema()
 

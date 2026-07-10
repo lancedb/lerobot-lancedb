@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lerobot-lancedb"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lance-backed datasets for LeRobot — frame-level random access on local disk and cloud (S3 / GCS / HF Hub / HF Buckets)."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -44,6 +44,11 @@ dependencies = [
 test = [
     "pytest>=8.1.0,<9.0.0",
     "pytest-timeout>=2.4.0,<3.0.0",
+    # lerobot>=0.6 moved av/torchcodec behind the [dataset] extra; tests import
+    # lerobot.datasets which needs them. torchcodec pinned to 0.10.x: the 0.11.x
+    # wheels on PyPI are built against unreleased torch and fail to load.
+    "lerobot[dataset]>=0.5.0",
+    "torchcodec==0.10.*",
 ]
 dev = [
     "lerobot-lancedb[test,docs]",
