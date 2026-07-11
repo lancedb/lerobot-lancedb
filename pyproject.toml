@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lerobot-lancedb"
-version = "0.2.1"
+version = "0.2.2"
 description = "Lance-backed datasets for LeRobot — frame-level random access on local disk and cloud (S3 / GCS / HF Hub / HF Buckets)."
 readme = "README.md"
 license = { text = "Apache-2.0" }
