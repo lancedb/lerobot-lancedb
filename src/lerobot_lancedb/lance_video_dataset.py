@@ -654,11 +654,15 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
         # 6. Per-file-key decode. Unique (chunk, file, vid_key) triples cost one
         # take_blobs + one VideoDecoder; samples using that file share the decoder.
         # Misses come from the per-worker cache; hits skip the take_blobs entirely.
-        files_needing_blobs = [
-            (chunk, fidx, vid_key)
-            for (chunk, fidx, vid_key) in video_plan.keys()
-            if (chunk, fidx, vid_key) not in self._decoder_cache._cache
-        ]
+        # Hold per-batch local references: a batch may touch more files than the
+        # LRU capacity, in which case entries loaded early in this very batch
+        # would already be evicted by the time we decode from them.
+        batch_decoders = {
+            key: self._decoder_cache._cache[key]
+            for key in video_plan.keys()
+            if key in self._decoder_cache._cache
+        }
+        files_needing_blobs = [key for key in video_plan.keys() if key not in batch_decoders]
         # Fetch all needed blobs from the single video_bytes column in one call.
         if files_needing_blobs:
             row_idxs = [
@@ -668,14 +672,12 @@ class LeRobotLanceVideoDataset(LeRobotDataset):
             blob_files = self._videos_dataset.take_blobs(
                 blob_column="video_bytes", indices=row_idxs
             )
-            for (chunk, fidx, vid_key), blob_file in zip(
-                files_needing_blobs, blob_files, strict=True
-            ):
-                self._decoder_cache.get((chunk, fidx, vid_key), blob_file.readall())
+            for key, blob_file in zip(files_needing_blobs, blob_files, strict=True):
+                batch_decoders[key] = self._decoder_cache.get(key, blob_file.readall())
                 blob_file.close()
 
         for (chunk, fidx, vid_key), plan in video_plan.items():
-            decoder = self._decoder_cache._cache[(chunk, fidx, vid_key)]
+            decoder = batch_decoders[(chunk, fidx, vid_key)]
             avg_fps = decoder.metadata.average_fps
             use_delta = self.delta_indices is not None and vid_key in self.delta_indices
 
