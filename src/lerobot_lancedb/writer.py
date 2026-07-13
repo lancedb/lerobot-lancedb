@@ -167,7 +167,12 @@ def _to_numpy_value(value: Any) -> Any:
 
 
 def _frame_to_chw_uint8(frame: Any) -> np.ndarray:
-    """Normalize a LeRobot image/video frame value to CHW uint8."""
+    """Normalize a LeRobot image/video frame value to CHW uint8.
+
+    Single-channel inputs are repeated to RGB without changing their pixel
+    values. Four-channel inputs drop alpha rather than compositing it, matching
+    the RGB output produced when JPEG frames are read back.
+    """
     if isinstance(frame, Image.Image):
         arr = np.asarray(frame.convert("RGB"))
     else:
@@ -409,7 +414,8 @@ class LanceFramesWriter:
         self._video_keys = set(meta.video_keys)
         self._schema, self._tabular_dims = _build_schema(
             meta.features,
-            has_subtasks="subtask_index" in meta.features and meta.subtasks is not None,
+            has_subtasks="subtask_index" in meta.features
+            and getattr(meta, "subtasks", None) is not None,
         )
         self.episode_buffer: dict = self._create_episode_buffer()
         self._db = None

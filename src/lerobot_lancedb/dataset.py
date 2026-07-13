@@ -90,6 +90,18 @@ def _to_lance_name(name: str) -> str:
     return name.replace(".", "_")
 
 
+def _resolve_decode_device(decode_device: str | torch.device | None) -> torch.device | None:
+    # Resolve ``decode_device``:
+    #   "auto" (default) → cuda if available, else cpu
+    #   None             → cpu (back-compat with the original API)
+    #   "cuda"/"cpu"/torch.device(...) → use as-is
+    if decode_device == "auto":
+        decode_device = "cuda" if torch.cuda.is_available() else None
+    if decode_device in (None, "cpu"):
+        return None
+    return torch.device(decode_device)
+
+
 class LeRobotLanceDataset(LeRobotDataset):
     """Map-style dataset that reads frames from a Lance table.
 
@@ -230,16 +242,7 @@ class LeRobotLanceDataset(LeRobotDataset):
         self.delta_timestamps = delta_timestamps
         self.set_image_transforms(image_transforms)
         self._return_uint8 = return_uint8
-        # Resolve ``decode_device``:
-        #   "auto" (default) → cuda if available, else cpu
-        #   None             → cpu (back-compat with the original API)
-        #   "cuda"/"cpu"/torch.device(...) → use as-is
-        if decode_device == "auto":
-            decode_device = "cuda" if torch.cuda.is_available() else None
-        if decode_device in (None, "cpu"):
-            self._decode_device = None
-        else:
-            self._decode_device = torch.device(decode_device)
+        self._decode_device = _resolve_decode_device(decode_device)
 
         # The parent has a few video-encoder-specific attributes used only on
         # the write path. We won't ever write, but pyright/static checks and
@@ -353,7 +356,7 @@ class LeRobotLanceDataset(LeRobotDataset):
         obj.delta_timestamps = None
         obj.set_image_transforms(None)
         obj._return_uint8 = False
-        obj._decode_device = torch.device("cuda") if torch.cuda.is_available() else None
+        obj._decode_device = _resolve_decode_device("auto")
         obj._video_backend = video_backend
         obj._batch_encoding_size = 1
         obj._vcodec = None

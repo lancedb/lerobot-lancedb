@@ -282,6 +282,8 @@ def test_direct_writer_add_frame_round_trip(tmp_path):
         root=root,
         use_videos=False,
     )
+    expected_decode_device = torch.device("cuda") if torch.cuda.is_available() else None
+    assert ds._decode_device == expected_decode_device
     rng = np.random.default_rng(123)
     frames = [_make_frame(rng) for _ in range(4)]
     for frame in frames:
@@ -308,6 +310,43 @@ def test_direct_writer_add_frame_round_trip(tmp_path):
     assert item["task"] == "test_task"
     assert item["observation.image"].shape == (3, 32, 48)
     assert item["observation.image"].dtype == torch.float32
+
+
+def test_direct_writer_accepts_metadata_without_subtasks(tmp_path):
+    from lerobot_lancedb.writer import LanceFramesWriter
+
+    class MetaWithoutSubtasks:
+        features = {"subtask_index": {"dtype": "int64", "shape": (1,)}}
+        image_keys: list[str] = []
+        video_keys: list[str] = []
+        total_episodes = 0
+
+    writer = LanceFramesWriter(
+        meta=MetaWithoutSubtasks(),
+        root=tmp_path,
+        table_name="without_subtasks",
+    )
+
+    assert "subtask_index" not in writer._schema.names
+
+
+def test_direct_writer_preserves_legacy_subtask_schema(tmp_path):
+    from lerobot_lancedb.writer import LanceFramesWriter
+
+    class MetaWithSubtasks:
+        features = {"subtask_index": {"dtype": "int64", "shape": (1,)}}
+        image_keys: list[str] = []
+        video_keys: list[str] = []
+        total_episodes = 0
+        subtasks = object()
+
+    writer = LanceFramesWriter(
+        meta=MetaWithSubtasks(),
+        root=tmp_path,
+        table_name="with_subtasks",
+    )
+
+    assert "subtask_index" in writer._schema.names
 
 
 def test_direct_writer_save_episode_batch(tmp_path):

@@ -28,10 +28,10 @@ dependencies = [
     # for downstream training code (factories, samplers, etc.). The [dataset]
     # extra is required since lerobot 0.6 moved av/torchcodec behind it; on
     # older versions pip merely warns about the unknown extra.
-    "lerobot[dataset]>=0.5.0",
+    "lerobot[dataset]>=0.5.1",
     "datasets>=4.0.0,<5.0.0",
     "pyarrow>=21.0.0,<30.0.0",
-    "lancedb>=0.20.0,<1.0.0",
+    "lancedb>=0.24.1,<1.0.0",
     "pylance>=0.20.0,<1.0.0",
     "numpy>=2.0.0,<2.3.0",
     "Pillow>=10.0.0",
@@ -46,7 +46,7 @@ test = [
     # lerobot>=0.6 moved av/torchcodec behind the [dataset] extra; tests import
     # lerobot.datasets which needs them. torchcodec pinned to 0.10.x: the 0.11.x
     # wheels on PyPI are built against unreleased torch and fail to load.
-    "lerobot[dataset]>=0.5.0",
+    "lerobot[dataset]>=0.5.1",
     "torchcodec==0.10.*",
 ]
 dev = [
