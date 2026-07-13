@@ -110,6 +110,14 @@ def test_is_lerobot_dataset_subclass(lance_dataset_dir):
     assert isinstance(ds, LeRobotDataset)
 
 
+def test_lance_dataset_owns_write_api_delegation():
+    """Write API shape matches LeRobot without inheriting its writer internals."""
+    assert LeRobotLanceDataset.add_frame is not LeRobotDataset.add_frame
+    assert LeRobotLanceDataset.save_episode is not LeRobotDataset.save_episode
+    assert LeRobotLanceDataset.clear_episode_buffer is not LeRobotDataset.clear_episode_buffer
+    assert LeRobotLanceDataset.has_pending_frames is not LeRobotDataset.has_pending_frames
+
+
 # ── round-trip / structure ───────────────────────────────────────────
 
 
@@ -260,6 +268,198 @@ def test_make_lerobot_dataset_routes_to_lance(lance_dataset_dir):
 def test_make_lerobot_dataset_forces_lance(lance_dataset_dir):
     ds = make_lerobot_dataset(backend="lance", root=lance_dataset_dir, return_uint8=True)
     assert isinstance(ds, LeRobotLanceDataset)
+
+
+# ── direct Lance writer ──────────────────────────────────────────────
+
+
+def test_direct_writer_add_frame_round_trip(tmp_path):
+    root = tmp_path / "direct_lance"
+    ds = LeRobotLanceDataset.create(
+        repo_id="lance_test/direct",
+        fps=_DEFAULT_FPS,
+        features=_FEATURES,
+        root=root,
+        use_videos=False,
+    )
+    expected_decode_device = torch.device("cuda") if torch.cuda.is_available() else None
+    assert ds._decode_device == expected_decode_device
+    rng = np.random.default_rng(123)
+    frames = [_make_frame(rng) for _ in range(4)]
+    for frame in frames:
+        ds.add_frame(frame)
+    ds.save_episode()
+    ds.finalize()
+
+    assert (root / "direct.lance").is_dir()
+    assert (root / "meta" / "info.json").is_file()
+    assert (root / "meta" / "stats.json").is_file()
+    assert (root / "meta" / "tasks.parquet").is_file()
+
+    read = LeRobotLanceDataset(root=root, return_uint8=True, decode_device="cpu")
+    assert len(read) == 4
+    assert read.fps == _DEFAULT_FPS
+    assert set(read.features) == set(ds.features)
+
+    item = read[0]
+    torch.testing.assert_close(item["observation.state"], frames[0]["observation.state"])
+    torch.testing.assert_close(item["action"], frames[0]["action"])
+    assert int(item["episode_index"]) == 0
+    assert int(item["frame_index"]) == 0
+    assert int(item["index"]) == 0
+    assert item["task"] == "test_task"
+    assert item["observation.image"].shape == (3, 32, 48)
+    assert item["observation.image"].dtype == torch.float32
+
+
+def test_direct_writer_accepts_metadata_without_subtasks(tmp_path):
+    from lerobot_lancedb.writer import LanceFramesWriter
+
+    class MetaWithoutSubtasks:
+        features = {"subtask_index": {"dtype": "int64", "shape": (1,)}}
+        image_keys: list[str] = []
+        video_keys: list[str] = []
+        total_episodes = 0
+
+    writer = LanceFramesWriter(
+        meta=MetaWithoutSubtasks(),
+        root=tmp_path,
+        table_name="without_subtasks",
+    )
+
+    assert "subtask_index" not in writer._schema.names
+
+
+def test_direct_writer_preserves_legacy_subtask_schema(tmp_path):
+    from lerobot_lancedb.writer import LanceFramesWriter
+
+    class MetaWithSubtasks:
+        features = {"subtask_index": {"dtype": "int64", "shape": (1,)}}
+        image_keys: list[str] = []
+        video_keys: list[str] = []
+        total_episodes = 0
+        subtasks = object()
+
+    writer = LanceFramesWriter(
+        meta=MetaWithSubtasks(),
+        root=tmp_path,
+        table_name="with_subtasks",
+    )
+
+    assert "subtask_index" in writer._schema.names
+
+
+def test_direct_writer_save_episode_batch(tmp_path):
+    root = tmp_path / "direct_batch_lance"
+    ds = LeRobotLanceDataset.create(
+        repo_id="lance_test/direct_batch",
+        fps=_DEFAULT_FPS,
+        features=_FEATURES,
+        root=root,
+        use_videos=False,
+        data_files_size_in_mb=64,
+        video_files_size_in_mb=128,
+    )
+    assert ds.meta.data_files_size_in_mb == 64
+    assert ds.meta.video_files_size_in_mb == 128
+    rng = np.random.default_rng(321)
+    states = rng.standard_normal((3, 4)).astype(np.float32)
+    actions = rng.standard_normal((3, 2)).astype(np.float32)
+    images = rng.integers(0, 256, size=(3, 3, 32, 48), dtype=np.uint8)
+    ds.save_episode(
+        {
+            "observation.state": states,
+            "action": actions,
+            "observation.image": images,
+            "task": "batch_task",
+        }
+    )
+    ds.finalize()
+
+    read = LeRobotLanceDataset(root=root, return_uint8=True, decode_device="cpu")
+    assert len(read) == 3
+    item = read[2]
+    torch.testing.assert_close(item["observation.state"], torch.from_numpy(states[2]))
+    torch.testing.assert_close(item["action"], torch.from_numpy(actions[2]))
+    assert int(item["frame_index"]) == 2
+    assert item["task"] == "batch_task"
+
+
+def test_direct_writer_streams_multiple_episodes_to_one_fragment(tmp_path):
+    import lancedb
+
+    root = tmp_path / "direct_multi_episode_lance"
+    ds = LeRobotLanceDataset.create(
+        repo_id="lance_test/direct_multi_episode",
+        fps=_DEFAULT_FPS,
+        features=_FEATURES,
+        root=root,
+        use_videos=False,
+    )
+    rng = np.random.default_rng(456)
+
+    for _ in range(3):
+        for _ in range(2):
+            ds.add_frame(_make_frame(rng))
+        ds.save_episode()
+    ds.finalize()
+
+    db = lancedb.connect(str(root))
+    table = db.open_table("direct_multi_episode")
+    lance_ds = table.to_lance()
+    assert lance_ds.count_rows() == 6
+    assert len(lance_ds.get_fragments()) == 1
+
+    read = LeRobotLanceDataset(root=root, return_uint8=True, decode_device="cpu")
+    assert len(read) == 6
+    assert int(read[0]["episode_index"]) == 0
+    assert int(read[2]["episode_index"]) == 1
+    assert int(read[5]["episode_index"]) == 2
+    assert int(read[5]["index"]) == 5
+
+
+def test_direct_writer_video_dtype_uses_frames_layout(tmp_path):
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (4,),
+            "names": ["s0", "s1", "s2", "s3"],
+        },
+        "action": {"dtype": "float32", "shape": (2,), "names": ["a0", "a1"]},
+        "observation.image": {
+            "dtype": "video",
+            "shape": (3, 32, 48),
+            "names": ["channels", "height", "width"],
+        },
+    }
+    root = tmp_path / "direct_video_lance"
+    ds = LeRobotLanceDataset.create(
+        repo_id="lance_test/direct_video",
+        fps=_DEFAULT_FPS,
+        features=features,
+        root=root,
+        use_videos=True,
+    )
+    rng = np.random.default_rng(55)
+    for _ in range(2):
+        ds.add_frame(
+            {
+                "observation.state": rng.standard_normal(4).astype(np.float32),
+                "action": rng.standard_normal(2).astype(np.float32),
+                "observation.image": rng.integers(0, 256, size=(3, 32, 48), dtype=np.uint8),
+                "task": "video_task",
+            }
+        )
+    ds.save_episode()
+    ds.finalize()
+
+    read = LeRobotLanceDataset(root=root, return_uint8=True, decode_device="cpu")
+    item = read[0]
+    assert read.meta.video_keys == ["observation.image"]
+    assert (root / "direct_video.lance").is_dir()
+    assert not (root / "direct_video_videos.lance").exists()
+    assert item["observation.image"].shape == (3, 32, 48)
+    assert item["observation.image"].dtype == torch.uint8
 
 
 # ── GPU JPEG decode (skipped if no CUDA) ──────────────────────────────

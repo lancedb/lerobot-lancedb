@@ -47,6 +47,7 @@ from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
 from PIL import Image
 
 from ._spawn_compat import force_spawn_for_lance
+from .writer import _DEFAULT_JPEG_QUALITY, LanceFramesWriter
 
 try:
     from huggingface_hub import get_token as _hf_get_token
@@ -89,14 +90,25 @@ def _to_lance_name(name: str) -> str:
     return name.replace(".", "_")
 
 
+def _resolve_decode_device(decode_device: str | torch.device | None) -> torch.device | None:
+    # Resolve ``decode_device``:
+    #   "auto" (default) → cuda if available, else cpu
+    #   None             → cpu (back-compat with the original API)
+    #   "cuda"/"cpu"/torch.device(...) → use as-is
+    if decode_device == "auto":
+        decode_device = "cuda" if torch.cuda.is_available() else None
+    if decode_device in (None, "cpu"):
+        return None
+    return torch.device(decode_device)
+
+
 class LeRobotLanceDataset(LeRobotDataset):
     """Map-style dataset that reads frames from a Lance table.
 
     Subclasses :class:`LeRobotDataset` so existing trainers / samplers /
-    ``isinstance`` checks accept it transparently. Recording / writing is
-    intentionally not supported — convert from an existing
-    :class:`LeRobotDataset` via
-    :func:`lerobot_lancedb.writer.convert_to_lance`.
+    ``isinstance`` checks accept it transparently. Read-mode instances load
+    frames from Lance; :meth:`create` returns a write-mode instance backed by
+    :class:`~lerobot_lancedb.writer.LanceFramesWriter`.
 
     Args:
         root: Local directory containing the Lance table and ``meta/`` sidecar.
@@ -230,16 +242,7 @@ class LeRobotLanceDataset(LeRobotDataset):
         self.delta_timestamps = delta_timestamps
         self.set_image_transforms(image_transforms)
         self._return_uint8 = return_uint8
-        # Resolve ``decode_device``:
-        #   "auto" (default) → cuda if available, else cpu
-        #   None             → cpu (back-compat with the original API)
-        #   "cuda"/"cpu"/torch.device(...) → use as-is
-        if decode_device == "auto":
-            decode_device = "cuda" if torch.cuda.is_available() else None
-        if decode_device in (None, "cpu"):
-            self._decode_device = None
-        else:
-            self._decode_device = torch.device(decode_device)
+        self._decode_device = _resolve_decode_device(decode_device)
 
         # The parent has a few video-encoder-specific attributes used only on
         # the write path. We won't ever write, but pyright/static checks and
@@ -266,39 +269,113 @@ class LeRobotLanceDataset(LeRobotDataset):
 
         self._probe_table_exists()
 
-        self.delta_indices = None
-        if delta_timestamps is not None:
-            check_delta_timestamps(delta_timestamps, self.meta.fps, tolerance_s)
-            self.delta_indices = get_delta_indices(delta_timestamps, self.meta.fps)
-
-        # meta.features includes auto-populated index columns; the user's
-        # actual feature columns are everything else.
-        self._original_keys = [k for k in self.meta.features.keys() if k not in _RESERVED_KEYS]
-        self._lance_to_dot = {_to_lance_name(k): k for k in self._original_keys}
-        self._image_only_keys = set(self.meta.image_keys)
-        self._video_keys = set(self.meta.video_keys)
-        self._image_keys = self._image_only_keys | self._video_keys
-        self._image_keys_lance = frozenset(_to_lance_name(k) for k in self._image_keys)
-
-        # Episode bounds for delta-window clamping and binary-search lookup.
-        sorted_eps = sorted(self._extract_episode_bounds(self.meta).items(), key=lambda kv: kv[1][0])
-        if sorted_eps:
-            self._ep_starts = np.array([v[0] for _, v in sorted_eps], dtype=np.int64)
-            self._ep_ends = np.array([v[1] for _, v in sorted_eps], dtype=np.int64)
-            self._ep_ids = np.array([k for k, _ in sorted_eps], dtype=np.int64)
-        else:
-            self._ep_starts = np.empty(0, dtype=np.int64)
-            self._ep_ends = np.empty(0, dtype=np.int64)
-            self._ep_ids = np.empty(0, dtype=np.int64)
-
-        # Lazy lance handles; rebuilt per worker after spawn pickling.
-        self._db = None
-        self._table = None
-        self._perm = None
-        self._fetch_columns: list[str] | None = None
-        self._all_lance_columns: list[str] | None = None
+        self._refresh_metadata_state()
 
     # ── construction helpers ──────────────────────────────────────────
+
+    @classmethod
+    def create(
+        cls,
+        repo_id: str,
+        fps: int,
+        features: dict,
+        root: str | Path | None = None,
+        robot_type: str | None = None,
+        use_videos: bool = True,
+        tolerance_s: float = 1e-4,
+        image_writer_processes: int = 0,
+        image_writer_threads: int = 0,
+        video_backend: str | None = None,
+        batch_encoding_size: int = 1,
+        camera_encoder: Any | None = None,
+        metadata_buffer_size: int = 10,
+        streaming_encoding: bool = False,
+        encoder_queue_maxsize: int = 30,
+        encoder_threads: int | None = None,
+        video_files_size_in_mb: int | None = None,
+        data_files_size_in_mb: int | None = None,
+        table_name: str | None = None,
+        jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
+        chroma_subsampling: int = 2,
+    ) -> LeRobotLanceDataset:
+        """Create a write-mode Lance frames dataset.
+
+        The public shape mirrors :meth:`LeRobotDataset.create`, but v1 always
+        writes the same frames layout as ``convert_to_lance``. ``use_videos`` is
+        accepted for drop-in call-site compatibility; ``features[*]["dtype"]``
+        remains the source of truth for reader semantics.
+        """
+        del use_videos
+        unsupported = []
+        if image_writer_processes:
+            unsupported.append("image_writer_processes")
+        if image_writer_threads:
+            unsupported.append("image_writer_threads")
+        if batch_encoding_size != 1:
+            unsupported.append("batch_encoding_size")
+        if camera_encoder is not None:
+            unsupported.append("camera_encoder")
+        if streaming_encoding:
+            unsupported.append("streaming_encoding")
+        if encoder_queue_maxsize != 30:
+            unsupported.append("encoder_queue_maxsize")
+        if encoder_threads is not None:
+            unsupported.append("encoder_threads")
+        if unsupported:
+            joined = ", ".join(unsupported)
+            raise NotImplementedError(
+                f"LeRobotLanceDataset.create() writes the frames layout only; "
+                f"native file/video writer options are not supported: {joined}."
+            )
+
+        if table_name is None:
+            table_name = repo_id.split("/")[-1]
+
+        metadata_use_videos = any(ft["dtype"] == "video" for ft in features.values())
+        meta = LeRobotDatasetMetadata.create(
+            repo_id=repo_id,
+            fps=fps,
+            robot_type=robot_type,
+            features=features,
+            root=root,
+            use_videos=metadata_use_videos,
+            metadata_buffer_size=metadata_buffer_size,
+            data_files_size_in_mb=data_files_size_in_mb,
+            video_files_size_in_mb=video_files_size_in_mb,
+        )
+
+        obj = cls.__new__(cls)
+        torch.utils.data.Dataset.__init__(obj)
+        obj.meta = meta
+        obj.repo_id = meta.repo_id
+        obj._requested_root = meta.root
+        obj.root = meta.root
+        obj.revision = None
+        obj.episodes = None
+        obj.tolerance_s = tolerance_s
+        obj.delta_timestamps = None
+        obj.set_image_transforms(None)
+        obj._return_uint8 = False
+        obj._decode_device = _resolve_decode_device("auto")
+        obj._video_backend = video_backend
+        obj._batch_encoding_size = 1
+        obj._vcodec = None
+        obj._encoder_threads = None
+        obj.reader = None
+        obj.writer = LanceFramesWriter(
+            meta=meta,
+            root=meta.root,
+            table_name=table_name,
+            jpeg_quality=jpeg_quality,
+            chroma_subsampling=chroma_subsampling,
+        )
+        obj._is_finalized = False
+        obj._uri = str(meta.root)
+        obj._table_name = table_name
+        obj._connect_kwargs = obj._auto_connect_kwargs(obj._uri, None)
+        force_spawn_for_lance()
+        obj._refresh_metadata_state()
+        return obj
 
     @staticmethod
     def _materialize_from_hub(
@@ -404,6 +481,38 @@ class LeRobotLanceDataset(LeRobotDataset):
             out[ep_idx] = (int(row["dataset_from_index"]), int(row["dataset_to_index"]))
         return out
 
+    def _reset_lance_handles(self) -> None:
+        self._db = None
+        self._table = None
+        self._perm = None
+        self._fetch_columns: list[str] | None = None
+        self._all_lance_columns: list[str] | None = None
+
+    def _refresh_metadata_state(self) -> None:
+        self.delta_indices = None
+        if self.delta_timestamps is not None:
+            check_delta_timestamps(self.delta_timestamps, self.meta.fps, self.tolerance_s)
+            self.delta_indices = get_delta_indices(self.delta_timestamps, self.meta.fps)
+
+        self._original_keys = [k for k in self.meta.features.keys() if k not in _RESERVED_KEYS]
+        self._lance_to_dot = {_to_lance_name(k): k for k in self._original_keys}
+        self._image_only_keys = set(self.meta.image_keys)
+        self._video_keys = set(self.meta.video_keys)
+        self._image_keys = self._image_only_keys | self._video_keys
+        self._image_keys_lance = frozenset(_to_lance_name(k) for k in self._image_keys)
+
+        sorted_eps = sorted(self._extract_episode_bounds(self.meta).items(), key=lambda kv: kv[1][0])
+        if sorted_eps:
+            self._ep_starts = np.array([v[0] for _, v in sorted_eps], dtype=np.int64)
+            self._ep_ends = np.array([v[1] for _, v in sorted_eps], dtype=np.int64)
+            self._ep_ids = np.array([k for k, _ in sorted_eps], dtype=np.int64)
+        else:
+            self._ep_starts = np.empty(0, dtype=np.int64)
+            self._ep_ends = np.empty(0, dtype=np.int64)
+            self._ep_ids = np.empty(0, dtype=np.int64)
+
+        self._reset_lance_handles()
+
     # ── pickling for spawn-mode workers ───────────────────────────────
 
     def __getstate__(self) -> dict:
@@ -454,6 +563,46 @@ class LeRobotLanceDataset(LeRobotDataset):
 
     def clear_image_transforms(self) -> None:
         self.set_image_transforms(None)
+
+    def _require_lance_writer(self, method_name: str) -> LanceFramesWriter:
+        writer = self.writer
+        if writer is None:
+            raise RuntimeError(
+                f"Cannot call `{method_name}` on a read-only LeRobotLanceDataset. "
+                "Use `LeRobotLanceDataset.create(...)` to create a write-mode dataset."
+            )
+        return writer
+
+    def add_frame(self, frame: dict) -> None:
+        """Add one frame to the active Lance episode buffer."""
+        self._require_lance_writer("add_frame").add_frame(frame)
+
+    def save_episode(self, episode_data: dict | None = None, parallel_encoding: bool = True) -> None:
+        """Write one episode to the Lance frames table and update metadata."""
+        self._require_lance_writer("save_episode").save_episode(episode_data, parallel_encoding)
+
+    def clear_episode_buffer(self, delete_images: bool = True) -> None:
+        """Discard the active Lance episode buffer without saving it."""
+        self._require_lance_writer("clear_episode_buffer").clear_episode_buffer(delete_images)
+
+    def has_pending_frames(self) -> bool:
+        """Return whether a write-mode dataset has unsaved frames."""
+        return self.writer is not None and self.writer.episode_buffer["size"] > 0
+
+    def finalize(self):
+        """Flush a write-mode Lance dataset and make the instance readable."""
+        if self._is_finalized:
+            return
+        if self.writer is not None:
+            self.writer.finalize()
+        self._is_finalized = True
+        if self.meta.total_frames > 0:
+            if hasattr(self.meta, "ensure_readable"):
+                self.meta.ensure_readable()
+            else:
+                self.meta._load_metadata()
+            self._refresh_metadata_state()
+            self._probe_table_exists()
 
     # ── lance handle management ───────────────────────────────────────
 
