@@ -22,63 +22,21 @@ jobs:
       - name: Install ruff
         run: pip install 'ruff>=0.14.1'
       - name: Ruff check
-        # Enforces I (import sort), F (pyflakes), B (bugbear), PLC0415
-        # (no inline imports), etc. — see [tool.ruff.lint] in pyproject.toml.
-        run: ruff check src/ tests/
+        # Enforces I (import sort), F (pyflakes), B (bugbear), etc. — see
+        # [tool.ruff.lint] in pyproject.toml.
+        run: ruff check src/
 
-  pytest:
+  build:
     runs-on: ubuntu-latest
     needs: lint
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.12"]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Free up disk space
-        # Default GH-hosted runners ship with ~14 GB free, which is too tight
-        # for the torch + lerobot + lance + torchcodec install. This action
-        # removes the Android SDK, .NET, Haskell, etc. that we don't need.
-        uses: jlumbroso/free-disk-space@main
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          tool-cache: false       # keep the python toolchain
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
           cache: pip
-
-      - name: Install ffmpeg (needed by torchcodec at decode time)
+      - name: Build sdist + wheel and check metadata
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg
-
-      - name: Install package + test extras
-        run: |
-          python -m pip install --upgrade pip
-          # CPU-only torch wheels to keep the install small.
-          pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
-          pip install -e '.[test]'
-          # Free the pip cache after install; we don't need it during pytest.
-          pip cache purge || true
-
-      - name: Show resolved versions
-        run: |
-          python -c "import torch, torchvision, lerobot, lance, lancedb; \
-            print('torch', torch.__version__); \
-            print('torchvision', torchvision.__version__); \
-            print('lerobot', getattr(lerobot, '__version__', '?')); \
-            print('lance', lance.__version__); \
-            print('lancedb', lancedb.__version__)"
-
-      - name: Run tests
-        run: pytest -v --tb=short
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check dist/*

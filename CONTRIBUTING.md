@@ -9,79 +9,41 @@ file a quick issue describing what you want before sending a large patch.
 git clone https://github.com/lancedb/lerobot-lancedb.git
 cd lerobot-lancedb
 python -m venv .venv && source .venv/bin/activate
-pip install -e '.[dev]'
+pip install --extra-index-url https://pypi.fury.io/lancedb/ -e '.[dev]'
 ```
 
-`.[dev]` brings in:
-
-- `pytest` + `pytest-timeout` (test runners)
-- `ruff` (lint)
-- `mkdocs` + `mkdocs-material` + `pymdown-extensions` (docs)
-
-## Run the tests
-
-```bash
-pytest -v
-```
-
-Expected: 17 passing, 0 failing. CI runs the same on every PR.
+The extra index is where lancedb publishes beta wheels (the pinned
+`lancedb>=0.37.1b0` is a beta at the time of writing).
 
 ## Lint
 
 ```bash
-ruff check .
-ruff format --check .
+ruff check src/
 ```
-
-## Build the docs locally
-
-```bash
-mkdocs serve
-# open http://127.0.0.1:8000/
-```
-
-`mkdocs build --strict` (no warnings allowed) is what the deploy workflow runs.
 
 ## Repo layout
 
 ```
 src/lerobot_lancedb/
-  dataset.py             # JPEG-per-frame reader (LeRobotLanceDataset)
-  lance_video_dataset.py # mp4-blob reader (LeRobotLanceVideoDataset)
-  writer.py              # both converters (convert_to_lance / convert_to_lance_video)
-  benchmark.py           # shared throughput-benchmark utilities
-  auto.py                # make_lerobot_dataset auto-detection
-  _spawn_compat.py       # mp.set_start_method("spawn") helper
-  scripts/               # CLI entry points (lerobot-convert-to-lance{,-video})
-
-examples/
-  conversion.py          # batch converter + the legacy GPU throughput benchmark
-  benchmark_formats.py   # the size/throughput/fidelity matrix used in docs
-  train_and_eval_lance.py
-  train_with_lance.py
-  aloha_loader_parity.py # ACT head-to-head between Lance and upstream
-
-docs/                    # MkDocs Material source (deployed to gh-pages by .github/workflows/docs.yml)
-tests/                   # pytest
+  convert.py           # lerobot-lance-convert: LeRobot v3.0 -> three-table Lance layout
+  doctor.py            # lerobot-lance-doctor: dataset defect auditor (5 read-only checks)
+  vendored_schema.py   # TEMPORARY vendored schema contract (see module docstring)
 ```
 
-## What landed in v0
+`vendored_schema.py` is a verbatim copy of the schema contract from
+lerobot's `lerobot.datasets.lancedb_dataset` (pending upstream PR). Do not
+change it independently — when the upstream PR merges, the whole module gets
+deleted and the converter imports the contract from lerobot directly.
 
-- Two storage layouts: per-frame JPEG (`LeRobotLanceDataset`) and per-file mp4 blob (`LeRobotLanceVideoDataset`).
-- Two CLIs: `lerobot-convert-to-lance` (with `--jpeg-quality` / `--jpeg-subsampling`) and `lerobot-convert-to-lance-video`.
-- Bit-exact pixel verification + training-accuracy parity tests (see [`examples/aloha_loader_parity.py`](examples/aloha_loader_parity.py)).
-- GPU NVJPEG decode for the JPEG layout (`decode_device="auto"`).
-- Cloud reads: `s3://`, `gs://`, `hf://datasets/...`, `hf://buckets/...`.
-- Spawn-mode worker safety (lancedb is fork-unsafe).
+## Testing changes
 
-## Likely next things
-
-- NVDEC for the video-blob layout (needs torchcodec built against the NVIDIA Video Codec SDK; not blocking).
-- Cloud-coherent sequential reads via `PermutationBuilder.shuffle(clump_size=...)` for big remote datasets.
-- More worked examples (Koch + SO-100 training scripts).
+There is no pytest suite right now; the acceptance gate is the smoke flow
+from the README quickstart: convert `lerobot/pusht`, open it with lerobot's
+`LanceDBDataset`, and compare items bit-exact against upstream
+`LeRobotDataset`. Run `lerobot-lance-doctor` on the source first — a defect
+the doctor flags is a source problem, not a converter bug.
 
 ## Code style
 
 - Type hints where useful, not religiously.
 - Docstrings on the public API; one-line summary + an explanation of why-not-just-what.
-- Tests for new readers / writers. Pixel-level verification against upstream for any new storage layout (see [`examples/benchmark_formats.py`](examples/benchmark_formats.py) for the pattern).
