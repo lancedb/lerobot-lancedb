@@ -136,24 +136,42 @@ def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None)
         ]
     )
     videos_table = db.create_table(VIDEOS_TABLE, schema=schema, mode="overwrite")
-    pending, pending_bytes = [], 0
-    for mp4 in video_files:
-        data = mp4.read_bytes()
-        pending.append(
-            {
-                "video_key": mp4.parts[-3],
-                "chunk_index": int(mp4.parent.name.split("-")[1]),
-                "file_index": int(mp4.stem.split("-")[1]),
-                **build_video_byte_index(mp4),
-                VIDEO_BLOB_COLUMN: data,
-            }
-        )
-        pending_bytes += len(data)
-        if pending_bytes >= VIDEO_BATCH_BYTES:
-            videos_table.add(pending)
-            pending, pending_bytes = [], 0
-    if pending:
-        videos_table.add(pending)
+    # Build streamed batches with the blob column as its STORAGE type
+    # (large_binary): pyarrow can't construct the blob-v2 extension array from raw
+    # bytes, but lance encodes incoming large_binary into the managed blob column
+    # on write (matched by name), same as the list-of-dicts add path did.
+    storage_schema = pa.schema(
+        [pa.field(VIDEO_BLOB_COLUMN, pa.large_binary()) if f.name == VIDEO_BLOB_COLUMN else f for f in schema]
+    )
+
+    def video_batches():
+        # Yield ~VIDEO_BATCH_BYTES record batches lazily so peak producer memory
+        # stays bounded, but stream them through ONE videos_table.add() below.
+        # Lance keeps a single writer open across the batches, so the whole videos
+        # table is one commit with Lance-sized fragments -- instead of one commit
+        # (a new version + fragments) per 512 MB, which fragments the dataset and
+        # multiplies manifest/scan/object-open work for every training worker.
+        pending, pending_bytes = [], 0
+        for mp4 in video_files:
+            data = mp4.read_bytes()
+            pending.append(
+                {
+                    "video_key": mp4.parts[-3],
+                    "chunk_index": int(mp4.parent.name.split("-")[1]),
+                    "file_index": int(mp4.stem.split("-")[1]),
+                    **build_video_byte_index(mp4),
+                    VIDEO_BLOB_COLUMN: data,
+                }
+            )
+            pending_bytes += len(data)
+            if pending_bytes >= VIDEO_BATCH_BYTES:
+                yield pa.RecordBatch.from_pylist(pending, schema=storage_schema)
+                pending, pending_bytes = [], 0
+        if pending:
+            yield pa.RecordBatch.from_pylist(pending, schema=storage_schema)
+
+    if video_files:
+        videos_table.add(pa.RecordBatchReader.from_batches(storage_schema, video_batches()))
     print(f"  {videos_table.count_rows()} rows")
 
     # Scalar indexes: not used by the training loader (it reads by _rowid),
