@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import av
+
 FRAMES_TABLE = "frames"
 VIDEOS_TABLE = "videos"
 META_TABLE = "meta"
@@ -73,8 +75,6 @@ def build_video_byte_index(path: str | Path) -> dict:
     matching the upstream reader's timestamp-to-index conversion. The moov
     fields are meaningful for mp4 only; see ``VIDEO_INDEX_COLUMNS``.
     """
-    import av
-
     path = Path(path)
     file_size = path.stat().st_size
     kf_entries = []
