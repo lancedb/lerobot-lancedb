@@ -29,6 +29,7 @@ from pathlib import Path
 
 import lancedb
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from lerobot.datasets.language import LANGUAGE_COLUMNS
 
@@ -61,6 +62,66 @@ def _storage_type(dtype: pa.DataType) -> pa.DataType:
     if pa.types.is_struct(dtype):
         return pa.struct([field.with_type(_storage_type(field.type)) for field in dtype])
     return dtype
+
+
+def _frames_reader(files: list[Path]) -> pa.RecordBatchReader:
+    """Stream the frames table from LeRobot ``data/`` parquet files, in index order.
+
+    Yields ~one record batch at a time (bounded memory) instead of concatenating
+    every file into one in-memory table, and applies the Lance column transforms
+    per batch: dotted keys -> underscores, fixed-width vector features (list) ->
+    fixed-size list, language columns (list<struct>) keep their nested layout with
+    extension types stripped.
+
+    Row order is load-bearing for the loader (row N == absolute frame N), so the
+    ``index`` column is verified to stay monotonically non-decreasing across the
+    whole stream; a dataset whose ``data/`` files are not index-sorted fails loudly
+    here rather than silently producing a mis-ordered table. (LeRobot v3.0 writes
+    ``data/`` in ascending index order, so this never triggers for valid datasets.)
+    """
+    schema0 = pq.read_schema(files[0])
+    out_fields, plan = [], []
+    for field in schema0:
+        if field.name in LANGUAGE_COLUMNS:
+            target = _storage_type(field.type)
+            plan.append((field.name, "lang", target))
+            out_fields.append(pa.field(to_lance_column(field.name), target))
+        elif pa.types.is_list(field.type) or pa.types.is_large_list(field.type):
+            width = len(pq.read_table(files[0], columns=[field.name]).column(field.name)[0])
+            out_type = pa.list_(field.type.value_type, width)
+            plan.append((field.name, "fsl", width))
+            out_fields.append(pa.field(to_lance_column(field.name), out_type))
+        else:
+            plan.append((field.name, "asis", None))
+            out_fields.append(pa.field(to_lance_column(field.name), field.type))
+    out_schema = pa.schema(out_fields)
+
+    def batches():
+        last = None
+        for f in files:
+            for batch in pq.ParquetFile(f).iter_batches():
+                if batch.num_rows == 0:
+                    continue
+                idx = batch.column("index")
+                diffs = pc.subtract(idx.slice(1), idx.slice(0, len(idx) - 1)) if len(idx) > 1 else None
+                lo, hi = idx[0].as_py(), idx[-1].as_py()
+                if (last is not None and lo <= last) or (diffs is not None and pc.min(diffs).as_py() < 0):
+                    raise ValueError(
+                        f"frames are not index-sorted at {f} (index {lo}..{hi} after {last}); "
+                        "the streaming converter requires index-ordered data/ files"
+                    )
+                last = hi
+                cols = []
+                for name, kind, arg in plan:
+                    col = batch.column(name)
+                    if kind == "lang" and col.type != arg:
+                        col = col.cast(arg)
+                    elif kind == "fsl":
+                        col = pa.FixedSizeListArray.from_arrays(col.flatten(), arg)
+                    cols.append(col)
+                yield pa.RecordBatch.from_arrays(cols, schema=out_schema)
+
+    return pa.RecordBatchReader.from_batches(out_schema, batches())
 
 
 def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None) -> None:
@@ -103,22 +164,8 @@ def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None)
 
     print("building frames table ...")
     files = sorted((src_root / "data").rglob("*.parquet"))
-    table = pa.concat_tables([pq.read_table(f) for f in files]).sort_by("index")
-    fields, arrays = [], []
-    for field in table.schema:
-        column = table.column(field.name).combine_chunks()
-        if field.name in LANGUAGE_COLUMNS:
-            # Variable-length list<struct> message rows (lerobot#3467): keep the
-            # nested layout, only stripping extension types lance can't store.
-            target = _storage_type(column.type)
-            if target != column.type:
-                column = column.cast(target)
-        elif pa.types.is_list(field.type) or pa.types.is_large_list(field.type):
-            column = pa.FixedSizeListArray.from_arrays(column.flatten(), len(column[0]))
-        arrays.append(column)
-        fields.append(pa.field(to_lance_column(field.name), column.type))
-    db.create_table(FRAMES_TABLE, pa.Table.from_arrays(arrays, schema=pa.schema(fields)), mode="overwrite")
-    print(f"  {table.num_rows} rows")
+    db.create_table(FRAMES_TABLE, _frames_reader(files), mode="overwrite")
+    print(f"  {db.open_table(FRAMES_TABLE).count_rows()} rows")
 
     video_files = sorted((src_root / "videos").rglob("*.mp4")) if (src_root / "videos").is_dir() else []
     print(f"building videos table from {len(video_files)} files ...")
