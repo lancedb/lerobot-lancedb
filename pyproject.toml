@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lerobot-lancedb"
-version = "0.3.0"
-description = "Companion tooling for lerobot's native Lance support: dataset converter (LeRobot v3.0 -> Lance layout) and dataset doctor."
+version = "0.4.0"
+description = "Companion tooling for lerobot's native Lance support: dataset converter (LeRobot v3.0 -> Lance layout), dataset doctor, and the LanceDBDataset training loader."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
@@ -26,9 +26,11 @@ classifiers = [
 keywords = ["lerobot", "lancedb", "lance", "robotics", "datasets", "converter"]
 
 dependencies = [
-    # Floor set by the converter/doctor imports: lerobot.datasets.language
-    # (LANGUAGE_COLUMNS) and lerobot.datasets.dataset_metadata both ship in
-    # 0.6.0 on PyPI.
+    # Floor set by the converter/doctor/reader imports (lerobot.datasets.language,
+    # dataset_metadata, depth_utils, feature_utils, video_utils, configs.video,
+    # all in 0.6.0 on PyPI). lerobot also supplies the reader's heavy deps
+    # (torch, torchcodec, numpy, huggingface_hub), so they're pinned there, not
+    # here, to avoid version conflicts.
     "lerobot>=0.6.0",
     # fetch_blob_ranges + blob v2 columns; betas are published on fury, not
     # PyPI — see the README install note.
@@ -61,6 +63,9 @@ where = ["src"]
 [tool.ruff]
 target-version = "py310"
 line-length = 110
+# reader.py is a verbatim vendored copy of lerobot's loader (deleted once the
+# loader lands upstream); don't lint it so it stays diff-able against upstream.
+extend-exclude = ["src/lerobot_lancedb/reader.py"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "UP", "B", "PLC0415"]
@@ -71,4 +76,3 @@ ignore = ["E501"]
 # at call time on purpose, so CLI --help stays fast.
 "src/lerobot_lancedb/convert.py" = ["PLC0415"]
 "src/lerobot_lancedb/doctor.py" = ["PLC0415"]
-"src/lerobot_lancedb/vendored_schema.py" = ["PLC0415"]

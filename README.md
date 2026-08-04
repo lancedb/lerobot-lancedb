@@ -1,31 +1,40 @@
 # lerobot-lancedb
 
-Companion tooling for [LeRobot](https://github.com/huggingface/lerobot)'s native Lance dataset support. Two tools:
+Convert a [LeRobot](https://github.com/huggingface/lerobot) dataset to a Lance
+layout once, then train from it - local disk or object storage - faster than
+upstream and without downloading the whole dataset first.
 
-- **`lerobot-lance-convert`** — converts a LeRobot v3.0 dataset (local dir or Hub repo id) into the three-table Lance layout that lerobot's `LanceDBDataset` reads.
-- **`lerobot-lance-doctor`** — audits an upstream-format dataset for silent defects before you convert or train on it. Every large public dataset we converted failed at least one check.
+Three pieces:
 
-The **loader is not in this repo**. It lives in lerobot core as `lerobot.datasets.lancedb_dataset.LanceDBDataset` (upstream PR pending; development happened on [AyushExel/lerobot#1](https://github.com/AyushExel/lerobot/pull/1)). This repo only produces and audits the data that loader consumes.
+- **`lerobot-lance-convert`** - turns a LeRobot v3.0 dataset (local dir or Hub id)
+  into a three-table Lance layout.
+- **`lerobot-lance-doctor`** - audits an upstream-format dataset for silent
+  defects before you convert or train. Every large public dataset we converted
+  failed at least one check.
+- **`LanceDBDataset`** - the map-style training loader for the Lance layout, so
+  the round trip works from this one package.
 
-## The layout
+## Why convert
 
-The converter writes three Lance tables next to a verbatim copy of the standard `meta/` directory:
+The Lance layout is map-style random access over object storage: a training
+worker fetches the exact byte ranges one batch needs, so you get a true global
+shuffle straight from S3 without downloading the dataset and without holding a
+big reservoir buffer in RAM. Upstream's only remote mode is an iterable streamer
+(reservoir shuffle, one worker per shard, OOMs on large frames).
 
-```
-<out>/
-  meta/             # byte-identical LeRobot v3.0 metadata
-  frames.lance      # one row per frame: all tabular features (dots -> underscores in names)
-  videos.lance      # one row per source mp4: whole file in a blob v2 column + byte-index columns
-  meta.lance        # one row per meta/ file (path, bytes): the metadata transport for remote roots
-```
+Batch 32, 8 workers, steady-state samples/s:
 
-**`frames.lance`** holds every tabular feature, one row per frame, sorted by frame index. Row position equals absolute frame index, so the loader needs no index structure at all: a batch of frame indices is one batched point-read. Fixed-size numeric vectors are stored as fixed-size lists; language columns (lerobot#3467) keep their nested `list<struct>` layout with Arrow extension types stripped to their storage types.
+| dataset | lance local | lance S3 | upstream local | upstream Hub stream |
+|---|---:|---:|---:|---:|
+| pusht | 4,160 | 2,508 | 2,142 | 430 |
+| koch | 189 | 182 | 120 | 11.7 |
+| berkeley | 108 | 92 | 61 | 6.1 |
+| droid (386 GB) | 227 | 136 | 132 | **OOM** |
 
-**`videos.lance`** holds each source mp4 verbatim in a Lance blob v2 column, plus byte-index columns (`file_size`, `moov_offset`, `moov_size`, `kf_indices`, `kf_positions`) computed at conversion time. These let the loader translate a frame window into keyframe-aligned byte ranges and fetch a whole batch's video bytes in one parallel `fetch_blob_ranges` call: an 8-frame window costs ~100 KB of transfer instead of the whole file.
-
-**`meta.lance`** exists because `meta/` used to be the one part of a dataset the tables didn't carry, so remote roots (S3, GCS, HF) needed bespoke side-channels to fetch it. Now the loader materializes `meta/` byte-identical from this table through the same Lance connection it already has. The table is the transport; the `meta/` directory on disk stays the source of truth for every consumer, and metadata is not always small enough to smuggle in elsewhere (droid's per-episode stats are 566 MB).
-
-The converter also builds scalar indexes (`episode_index`, `task_index`, `video_key`). The training loader doesn't use them, but they make ad-hoc SQL over your dataset fast.
+The column that matters is **lance S3 vs upstream Hub stream**: same remote data,
+lance is 6-15x faster and simply runs where the streamer exhausts RAM. Lance from
+local disk matches or beats upstream local too, so converting doesn't cost you
+anything on the machine you already have.
 
 ## Install
 
@@ -33,38 +42,99 @@ The converter also builds scalar indexes (`episode_index`, `task_index`, `video_
 pip install --extra-index-url https://pypi.fury.io/lancedb/ lerobot-lancedb
 ```
 
-The extra index is needed because the required `lancedb>=0.37.1b0` is a beta: lancedb publishes beta wheels on fury.io, not PyPI. Version floors that matter:
+The extra index is needed because `lancedb>=0.37.1b0` (blob v2 + `fetch_blob_ranges`,
+what makes the remote reads fast) is a beta, published on fury.io, not PyPI yet.
 
 | dependency | floor | why |
 |---|---|---|
-| `lerobot` | `>=0.6.0` | `lerobot.datasets.language` and `lerobot.datasets.dataset_metadata` imports |
-| `lancedb` | `>=0.37.1b0` | blob v2 columns + `fetch_blob_ranges` (what makes remote training reads fast) |
+| `lerobot` | `>=0.6.0` | metadata, feature, depth and video utilities the converter and loader reuse |
+| `lancedb` | `>=0.37.1b0` | blob v2 columns + `fetch_blob_ranges` |
 | `av` | `>=12` | byte-index construction and container inspection |
 
-## Quickstart
+`lerobot` also supplies the loader's heavy deps (torch, torchcodec, numpy), so
+they're pinned there.
 
-Convert pusht (downloads from the Hub if not cached; pass `--root` instead to convert a dataset already on disk without touching the network):
+## Convert
 
 ```bash
+# from the Hub (downloads if not cached):
 lerobot-lance-convert --repo-id lerobot/pusht --out ./pusht-lance
+# or a dataset already on disk (nothing downloaded):
+lerobot-lance-convert --root /path/to/dataset --out ./my-lance
 ```
 
-Load it with lerobot's native loader — one line, and the items are bit-exact with `LeRobotDataset`'s:
+Then push `./pusht-lance/` to object storage (`aws s3 cp --recursive`, etc.) and
+point training at the URI.
+
+## Load it back
 
 ```python
-from lerobot.datasets.lancedb_dataset import LanceDBDataset
+from lerobot_lancedb import LanceDBDataset, lance_mp_context
+from torch.utils.data import DataLoader
 
-ds = LanceDBDataset("lerobot/pusht", root="./pusht-lance")
-item = ds[0]  # same keys, same tensors, same pixels as LeRobotDataset
+ds = LanceDBDataset(root="./pusht-lance")              # or "s3://bucket/pusht-lance"
+item = ds[0]                                           # same keys/tensors as LeRobotDataset
+
+loader = DataLoader(ds, batch_size=32, num_workers=8,  # pair with EpisodeAwareSampler
+                    multiprocessing_context=lance_mp_context())
 ```
 
-`root` can also be `s3://...`, `gs://...`, or an `hf://` URI; the loader does ranged reads, so nothing downloads up front. Training needs zero changes: `lerobot-train` auto-detects the layout.
+It is a map-style `torch.utils.data.Dataset` returning items bit-exact with
+`LeRobotDataset`. `root` may be a local dir or an `s3://` / `gs://` / `hf://` URI
+(ranged reads, nothing downloads up front).
+
+> **Two things to know.** (1) `LanceDBDataset` here is a **vendored copy** of
+> lerobot's loader (the open reader PR), included so this package works end to end
+> against released lerobot. Once the loader lands in lerobot core this re-exports
+> `lerobot.datasets.lancedb_dataset.LanceDBDataset` and the copy is deleted; your
+> import keeps working either way. (2) The `lerobot-train` CLI auto-detecting a
+> Lance root is part of the lerobot reader PR (in `make_dataset`), so training
+> straight off `--dataset.root ...-lance` needs that PR merged; until then, build
+> the `DataLoader` yourself as above.
+
+## The layout
+
+Three Lance tables next to a verbatim copy of the standard `meta/` directory:
+
+```
+<out>/
+  meta/             # byte-identical LeRobot v3.0 metadata
+  frames.lance      # one row per frame: tabular features (dots -> underscores)
+  videos.lance      # one row per source mp4: bytes in a blob v2 column + byte index
+  meta.lance        # one row per meta/ file (path, bytes): metadata transport for remote roots
+```
+
+- **`frames.lance`** - every tabular feature, one row per frame, sorted by index.
+  Row N is frame N, so a batch of indices is one point-read, no index structure
+  needed. Numeric vectors become fixed-size lists; language columns
+  (lerobot#3467) keep their nested `list<struct>` with extension types stripped.
+- **`videos.lance`** - each mp4 verbatim in a blob v2 column, plus byte-index
+  columns (`file_size`, `moov_offset`, `moov_size`, `kf_indices`, `kf_positions`).
+  The loader turns a frame window into a keyframe-aligned byte range and fetches a
+  whole batch's video bytes in one `fetch_blob_ranges`: an 8-frame window costs
+  ~100 KB of transfer, not the whole file.
+- **`meta.lance`** - the `meta/` files as `(path, bytes)`, so a remote root can
+  materialize `meta/` through the same Lance connection instead of a side channel
+  (droid's per-episode stats alone are 566 MB).
+
+Both large tables are written as a single streaming commit (bounded memory, no
+per-512 MB fragmentation), and scalar indexes (`episode_index`, `task_index`,
+`video_key`) are built for ad-hoc SQL - the training loader reads by row id and
+doesn't need them.
 
 ## Dataset doctor
 
-Silent defects in public datasets are common, and they surface as confusing failures at convert or train time (or worse, don't surface at all). `lerobot-lance-doctor` runs five read-only checks against an upstream-format dataset: metadata loads, episode ranges tile `[0, total_frames)`, every referenced parquet exists with the right total row count and no orphans, every referenced video exists non-empty and readable with no orphans, and every video actually contains the frames the metadata implies it should (container metadata only, no decoding).
+Silent defects in public datasets are common, and they surface as confusing
+failures at convert or train time (or worse, don't surface at all).
+`lerobot-lance-doctor` runs five read-only checks against an upstream-format
+dataset: metadata loads, episode ranges tile `[0, total_frames)`, every
+referenced parquet exists with the right total row count and no orphans, every
+referenced video exists non-empty and readable with no orphans, and every video
+actually contains the frames the metadata implies it should (container metadata
+only, no decoding).
 
-Real example: `lerobot/berkeley_autolab_ur5` on the Hub ships aggregated videos that are short a tail of frames relative to what its own metadata implies. The doctor catches it as a SUPPLY failure:
+Real example: `lerobot/berkeley_autolab_ur5` ships aggregated videos short a tail
+of frames relative to what its own metadata implies. The doctor catches it:
 
 ```
 $ lerobot-lance-doctor --root ~/.cache/.../lerobot/berkeley_autolab_ur5 --repo-id lerobot/berkeley_autolab_ur5
@@ -74,19 +144,25 @@ $ lerobot-lance-doctor --root ~/.cache/.../lerobot/berkeley_autolab_ur5 --repo-i
 [ ok ] VIDEOS: referenced, non-empty, readable, no orphans
 [FAIL] SUPPLY: every video holds the frames meta implies
          videos/observation.images.image/chunk-000/file-000.mp4: container declares 30091 frames, episodes imply 30175 (short by 84)
-         videos/observation.images.image/chunk-000/file-001.mp4: container declares 30093 frames, episodes imply 30191 (short by 98)
-         videos/observation.images.image_with_depth/chunk-000/file-000.mp4: container declares 3839 frames, episodes imply 3953 (short by 114)
-         ... and 25 more
+         ... and 27 more
 
 1 of 5 checks failed
 ```
 
-The exit code is the number of failed checks, so it drops straight into CI. Other defects we've hit in the wild and now check for: droid 1.0.1 has 44% orphan parquet rows plus orphan videos (it loads correctly only by filename-sort luck), and agibot shipped zero-byte videos inside otherwise-complete episodes.
+The exit code is the number of failed checks, so it drops straight into CI. Other
+defects we've hit and now check for: droid 1.0.1 has 44% orphan parquet rows plus
+orphan videos (it loads correctly only by filename-sort luck), and agibot shipped
+zero-byte videos inside otherwise-complete episodes.
 
 ## Note on the old plugin
 
-Versions of this package before 0.3.0 were a different thing: a standalone loader plugin (`LeRobotLanceDataset`, `LeRobotLanceVideoDataset`) with its own storage layouts. That implementation is superseded by the native loader in lerobot core, and 0.3.0 removes it. `pip install lerobot-lancedb` keeps working; if you depend on the old loader classes, pin `lerobot-lancedb<0.3`, and plan to move to `LanceDBDataset` in lerobot once the upstream PR merges — datasets converted with the old plugin's converters are not compatible with the native loader, so re-convert with `lerobot-lance-convert`.
+Versions before 0.3.0 were a different thing: a standalone loader plugin
+(`LeRobotLanceDataset`, `LeRobotLanceVideoDataset`) with its own storage layouts,
+superseded by the native loader. If you depend on those classes, pin
+`lerobot-lancedb<0.3` and plan to move to `LanceDBDataset` - datasets converted
+with the old plugin are not compatible with the native loader, so re-convert with
+`lerobot-lance-convert`.
 
 ## License
 
-Apache 2.0.
+Apache-2.0.

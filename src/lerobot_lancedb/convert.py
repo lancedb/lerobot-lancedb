@@ -33,10 +33,10 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from lerobot.datasets.language import LANGUAGE_COLUMNS
 
-# Temporary vendored copy of the schema contract; switch to
-# `from lerobot.datasets.lancedb_dataset import ...` once the upstream
-# lerobot PR merges.
-from .vendored_schema import (
+# Schema contract comes from the (temporarily vendored) reader, so the writer and
+# reader can't disagree. Once the loader lands upstream, reader.py is deleted and
+# this imports from `lerobot.datasets.lancedb_dataset` instead.
+from .reader import (
     FRAMES_TABLE,
     META_TABLE,
     VIDEO_BLOB_COLUMN,
