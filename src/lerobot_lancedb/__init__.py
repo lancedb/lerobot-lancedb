@@ -42,7 +42,7 @@ from .reader import (
     to_lance_column,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "LanceDBDataset",
