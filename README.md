@@ -22,19 +22,25 @@ shuffle straight from S3 without downloading the dataset and without holding a
 big reservoir buffer in RAM. Upstream's only remote mode is an iterable streamer
 (reservoir shuffle, one worker per shard, OOMs on large frames).
 
-Batch 32, 8 workers, steady-state samples/s:
+Batch 32, 8 workers, steady-state samples/s (global shuffle for lance; upstream's
+streamer only does its windowed reservoir shuffle):
 
 | dataset | lance local | lance S3 | upstream local | upstream Hub stream |
 |---|---:|---:|---:|---:|
 | pusht | 4,160 | 2,508 | 2,142 | 430 |
+| aloha | 113 | 107 | 109 | 9.7 (1-worker cap) |
 | koch | 189 | 182 | 120 | 11.7 |
+| soarm | 79 | 74 | 69 | crashes |
 | berkeley | 108 | 92 | 61 | 6.1 |
 | droid (386 GB) | 227 | 136 | 132 | **OOM** |
 
 The column that matters is **lance S3 vs upstream Hub stream**: same remote data,
-lance is 6-15x faster and simply runs where the streamer exhausts RAM. Lance from
-local disk matches or beats upstream local too, so converting doesn't cost you
-anything on the machine you already have.
+lance is 6-15x faster and simply runs where the streamer exhausts RAM or a decode
+worker crashes. Lance from local disk matches or beats upstream local too, so
+converting doesn't cost you anything on the machine you already have. A
+same-bucket, same-access apples-to-apples comparison (only the loader/format
+differs) and the full methodology are in the [converter
+walkthrough](https://github.com/lancedb/lerobot-lancedb/blob/main/docs/walkthrough.md).
 
 ## Install
 
