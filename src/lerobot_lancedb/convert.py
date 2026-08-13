@@ -11,7 +11,7 @@
 
 Layout produced:
     <out>/
-      meta/         # copied verbatim from the source dataset
+      meta/         # copied from the source dataset + storage_format stamped in info.json
       frames.lance  # one row per frame, tabular features (dots -> underscores)
       videos.lance  # one row per source mp4, bytes verbatim in a blob v2 column
       meta.lance    # one row per meta/ file (path, bytes) — metadata transport for remote roots
@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 from pathlib import Path
 
@@ -124,6 +125,19 @@ def _frames_reader(files: list[Path]) -> pa.RecordBatchReader:
     return pa.RecordBatchReader.from_batches(out_schema, batches())
 
 
+def _stamp_storage_format(meta_dir: Path) -> None:
+    """Declare the Lance storage format in ``meta/info.json``.
+
+    Readers select the storage backend from this field; layout detection is only
+    a fallback for datasets converted before the field existed. Idempotent.
+    """
+    info_file = meta_dir / "info.json"
+    info = json.loads(info_file.read_text())
+    if info.get("storage_format") != "lance":
+        info["storage_format"] = "lance"
+        info_file.write_text(json.dumps(info, indent=4))
+
+
 def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None) -> None:
     """Convert one LeRobot v3.0 dataset to the three-table Lance layout.
 
@@ -146,16 +160,19 @@ def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None)
     out_dir.mkdir(parents=True, exist_ok=True)
     if not (out_dir / "meta").exists():
         shutil.copytree(src_root / "meta", out_dir / "meta")
+    _stamp_storage_format(out_dir / "meta")
 
     db = lancedb.connect(str(out_dir))
 
     print("building meta table ...")
+    # Read from out_dir/meta (the stamped copy) so the meta table — what remote
+    # roots materialize meta/ from — carries storage_format too.
     meta_schema = pa.schema([pa.field("path", pa.string()), pa.field("data", pa.large_binary())])
-    meta_files = sorted(f for f in (src_root / "meta").rglob("*") if f.is_file())
+    meta_files = sorted(f for f in (out_dir / "meta").rglob("*") if f.is_file())
     db.create_table(
         META_TABLE,
         pa.Table.from_pylist(
-            [{"path": str(f.relative_to(src_root / "meta")), "data": f.read_bytes()} for f in meta_files],
+            [{"path": str(f.relative_to(out_dir / "meta")), "data": f.read_bytes()} for f in meta_files],
             schema=meta_schema,
         ),
         mode="overwrite",
