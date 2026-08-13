@@ -40,6 +40,11 @@ from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.depth_utils import dequantize_depth
 from lerobot.datasets.feature_utils import check_delta_timestamps, get_delta_indices
 from lerobot.utils.constants import HF_LEROBOT_HOME
+
+try:
+    from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
+except ImportError:  # older lerobot without the hub snapshot cache constant
+    HF_LEROBOT_HUB_CACHE = HF_LEROBOT_HOME / "hub"
 from lerobot.utils.import_utils import is_package_available, require_package
 
 # VENDORED COPY of lerobot's LanceDBDataset (the loader PR). Kept here temporarily
@@ -312,24 +317,62 @@ def lance_mp_context() -> str:
     return "forkserver" if "forkserver" in multiprocessing.get_all_start_methods() else "spawn"
 
 
+def _storage_format_from_info(info_file: Path) -> str | None:
+    """``storage_format`` declared in a ``meta/info.json``, or None (absent/unreadable)."""
+    try:
+        return json.loads(info_file.read_text()).get("storage_format")
+    except (OSError, ValueError):
+        return None
+
+
 @lru_cache(maxsize=32)
 def is_lance_dataset(
     repo_id: str | None = None, root: str | Path | None = None, revision: str | None = None
 ) -> bool:
+    """True if the dataset's storage format is Lance.
+
+    Resolution order: the ``storage_format`` field in LeRobot metadata decides when
+    present; layout detection is only a fallback for datasets converted before the
+    field existed. Datasets without either continue to the Parquet/MP4 loader.
+    """
     if root is None and repo_id is None:
         return False
     if root is not None and _is_remote_uri(root):
+        # Object-store URIs are read in place; only the Lance reader serves them.
         return True
     local_root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+    fmt = _storage_format_from_info(local_root / "meta" / "info.json")
+    if fmt is not None:
+        return fmt == "lance"
     if (local_root / f"{FRAMES_TABLE}.lance").exists():
         return True
+    if (local_root / "meta" / "info.json").exists() and (local_root / "data").exists():
+        # A complete local parquet/MP4 layout: definitively not Lance, skip the Hub
+        # lookups below. (A Lance dataset's local cache holds `meta/` but never `data/`.)
+        return False
     if repo_id is None:
         return False
+    # No decisive local copy: read the Hub metadata. Every loader needs info.json
+    # anyway and this lands in the same cache lerobot's metadata loader uses, so
+    # the Parquet path pays no extra request.
     try:
+        info_file = huggingface_hub.hf_hub_download(
+            repo_id,
+            "meta/info.json",
+            repo_type="dataset",
+            revision=revision,
+            cache_dir=HF_LEROBOT_HUB_CACHE,
+        )
+        fmt = _storage_format_from_info(Path(info_file))
+    except Exception:
+        fmt = None
+    if fmt is not None:
+        return fmt == "lance"
+    try:  # legacy Lance datasets (converted before `storage_format`): layout probe
         paths = huggingface_hub.HfApi().get_paths_info(
             repo_id, [f"{FRAMES_TABLE}.lance"], repo_type="dataset", revision=revision
         )
-    except Exception:   # fall back to the parquet loader,
+    except Exception:  # fall back to the parquet loader
         return False
     return len(paths) > 0
 

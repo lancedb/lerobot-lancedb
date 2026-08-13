@@ -100,7 +100,10 @@ It is a map-style `torch.utils.data.Dataset` returning items bit-exact with
 
 ## The layout
 
-Three Lance tables next to a verbatim copy of the standard `meta/` directory:
+Three Lance tables next to a copy of the standard `meta/` directory. The converter
+stamps `"storage_format": "lance"` into `meta/info.json` (and into the meta table),
+so readers can pick the storage backend from LeRobot metadata alone; everything
+else in `meta/` is copied verbatim:
 
 ```
 <out>/
