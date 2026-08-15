@@ -7,14 +7,18 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Convert a LeRobot v3.0 dataset to the Lance layout read by lerobot's LanceDBDataset.
+"""Convert a LeRobot v2.0 / v2.1 / v3.0 dataset to the Lance layout read by LanceDBDataset.
 
 Layout produced:
     <out>/
-      meta/         # copied from the source dataset + storage_format stamped in info.json
+      meta/         # v3.0 metadata + storage_format stamped in info.json
       frames.lance  # one row per frame, tabular features (dots -> underscores)
       videos.lance  # one row per source mp4, bytes verbatim in a blob v2 column
       meta.lance    # one row per meta/ file (path, bytes) — metadata transport for remote roots
+
+v2.0 / v2.1 sources are accepted: per-episode parquet/mp4 files are ingested as-is
+(no re-chunk, no re-encode) and ``meta/`` is rewritten to v3.0 so the loader can
+open the result. v3.0 ``meta/`` is copied verbatim.
 
 Usage:
     lerobot-lance-convert --repo-id lerobot/pusht --out ./pusht-lance
@@ -37,6 +41,13 @@ from lerobot.datasets.language import LANGUAGE_COLUMNS
 # Schema contract comes from the (temporarily vendored) reader, so the writer and
 # reader can't disagree. Once the loader lands upstream, reader.py is deleted and
 # this imports from `lerobot.datasets.lancedb_dataset` instead.
+from .legacy import (
+    codebase_version,
+    data_parquet_files,
+    is_v2,
+    parse_video_locator,
+    write_v3_meta_from_v2,
+)
 from .reader import (
     FRAMES_TABLE,
     META_TABLE,
@@ -77,8 +88,9 @@ def _frames_reader(files: list[Path]) -> pa.RecordBatchReader:
     Row order is load-bearing for the loader (row N == absolute frame N), so the
     ``index`` column is verified to stay monotonically non-decreasing across the
     whole stream; a dataset whose ``data/`` files are not index-sorted fails loudly
-    here rather than silently producing a mis-ordered table. (LeRobot v3.0 writes
-    ``data/`` in ascending index order, so this never triggers for valid datasets.)
+    here rather than silently producing a mis-ordered table. (LeRobot v2.x and v3.0
+    both write ``data/`` in ascending index order when files are read in episode /
+    file order, so this never triggers for valid datasets.)
     """
     schema0 = pq.read_schema(files[0])
     out_fields, plan = [], []
@@ -135,31 +147,63 @@ def _stamp_storage_format(meta_dir: Path) -> None:
     info = json.loads(info_file.read_text())
     if info.get("storage_format") != "lance":
         info["storage_format"] = "lance"
-        info_file.write_text(json.dumps(info, indent=4))
+        info_file.write_text(json.dumps(info, indent=4) + "\n")
 
 
-def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None) -> None:
-    """Convert one LeRobot v3.0 dataset to the three-table Lance layout.
+def _resolve_source_root(repo_id: str | None, root: Path | None) -> Path:
+    """Local dataset root: ``--root`` as-is, or a Hub snapshot via ``--repo-id``.
 
-    Pass ``root`` to convert a dataset already on disk (nothing is
-    downloaded), or ``repo_id`` alone to download from the Hub first
-    (into ``$HF_LEROBOT_HOME``, like any other lerobot tool).
+    Current lerobot refuses to *load* v2.x datasets, but the files are still
+    convertible. If ``LeRobotDataset`` fails (typical for v2.0 / v2.1 Hub
+    repos), fall back to ``snapshot_download`` and convert from the files.
     """
     if root is not None:
         src_root = Path(root)
         if not (src_root / "meta").is_dir():
             raise FileNotFoundError(f"{src_root} does not look like a LeRobot dataset (no meta/ dir)")
-    elif repo_id is not None:
+        return src_root
+    if repo_id is None:
+        raise ValueError("pass --repo-id or --root")
+    try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-        ds = LeRobotDataset(repo_id)  # downloads to $HF_LEROBOT_HOME if needed
-        src_root = Path(ds.root)
-    else:
-        raise ValueError("pass --repo-id or --root")
+        return Path(LeRobotDataset(repo_id).root)  # downloads to $HF_LEROBOT_HOME if needed
+    except Exception as err:
+        print(
+            f"could not load {repo_id} as LeRobotDataset ({err}); "
+            "downloading snapshot to convert from files"
+        )
+        from huggingface_hub import snapshot_download
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+
+        dest = HF_LEROBOT_HOME / repo_id
+        snapshot_download(repo_id=repo_id, repo_type="dataset", local_dir=str(dest))
+        return Path(dest)
+
+
+def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None) -> None:
+    """Convert one LeRobot v2.0 / v2.1 / v3.0 dataset to the three-table Lance layout.
+
+    Pass ``root`` to convert a dataset already on disk (nothing is
+    downloaded), or ``repo_id`` alone to download from the Hub first
+    (into ``$HF_LEROBOT_HOME``, like any other lerobot tool).
+    """
+    src_root = _resolve_source_root(repo_id, root)
+    version = codebase_version(src_root)
+    if not (is_v2(version) or version.startswith("v3.")):
+        raise ValueError(
+            f"unsupported LeRobot codebase_version {version!r} in {src_root / 'meta' / 'info.json'}; "
+            "lerobot-lance-convert accepts v2.0, v2.1, and v3.x"
+        )
+    print(f"source: {src_root} ({version})")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     if not (out_dir / "meta").exists():
-        shutil.copytree(src_root / "meta", out_dir / "meta")
+        if is_v2(version):
+            print(f"normalizing {version} metadata to v3.0 ...")
+            write_v3_meta_from_v2(src_root, out_dir / "meta")
+        else:
+            shutil.copytree(src_root / "meta", out_dir / "meta")
     _stamp_storage_format(out_dir / "meta")
 
     db = lancedb.connect(str(out_dir))
@@ -180,7 +224,7 @@ def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None)
     print(f"  {len(meta_files)} files")
 
     print("building frames table ...")
-    files = sorted((src_root / "data").rglob("*.parquet"))
+    files = data_parquet_files(src_root)
     db.create_table(FRAMES_TABLE, _frames_reader(files), mode="overwrite")
     print(f"  {db.open_table(FRAMES_TABLE).count_rows()} rows")
 
@@ -216,13 +260,15 @@ def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None)
         # (a new version + fragments) per 512 MB, which fragments the dataset and
         # multiplies manifest/scan/object-open work for every training worker.
         pending, pending_bytes = [], 0
+        videos_root = src_root / "videos"
         for mp4 in video_files:
+            video_key, chunk_index, file_index = parse_video_locator(mp4, videos_root)
             data = mp4.read_bytes()
             pending.append(
                 {
-                    "video_key": mp4.parts[-3],
-                    "chunk_index": int(mp4.parent.name.split("-")[1]),
-                    "file_index": int(mp4.stem.split("-")[1]),
+                    "video_key": video_key,
+                    "chunk_index": chunk_index,
+                    "file_index": file_index,
                     **build_video_byte_index(mp4),
                     VIDEO_BLOB_COLUMN: data,
                 }

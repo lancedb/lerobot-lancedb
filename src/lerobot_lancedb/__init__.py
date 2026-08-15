@@ -12,7 +12,7 @@
 This package ships:
 
 - ``lerobot-lance-convert`` (:mod:`lerobot_lancedb.convert`) — converts a
-  LeRobot v3.0 dataset to the three-table Lance layout.
+  LeRobot v2.0, v2.1, or v3.0 dataset to the three-table Lance layout.
 - ``lerobot-lance-doctor`` (:mod:`lerobot_lancedb.doctor`) — audits an
   upstream-format dataset for silent defects before you convert or train.
 - :class:`LanceDBDataset` — the map-style training loader for the Lance layout.
