@@ -4,7 +4,10 @@ This follows one dataset through `lerobot-lance-convert`, showing what each step
 reads and writes. The source is a standard LeRobot v3.0 dataset - the same
 illustrative one the loader walkthrough uses: 100 episodes of 150 frames (15,000
 total), 30 fps, one camera (`observation.images.top`), a 14-dim
-`observation.state` and 14-dim `action`. The output is the three-table Lance
+`observation.state` and 14-dim `action`. v2.0 / v2.1 sources (one parquet and
+one mp4 per episode, jsonl metadata) go through the same pipeline after
+`meta/` is rewritten to v3.0; the tabular frames and video bytes are not
+re-chunked or re-encoded. The output is the three-table Lance
 layout that `LanceDBDataset` reads (the companion loader PR). Values below are
 illustrative; the CLI examples are exact.
 
@@ -183,6 +186,8 @@ would have been silently "fixed" by the old sort now gets a clear error.
 
 One row per source mp4. In LeRobot v3.0 episodes share video files, so this is far
 fewer rows than the frames table (one row is many episodes' worth of frames).
+v2.0 / v2.1 sources keep one mp4 per episode, so the videos table has one row per
+episode per camera; `from_timestamp` in the rewritten metadata is 0.
 
 ```python
 schema = pa.schema([

@@ -6,8 +6,11 @@ upstream and without downloading the whole dataset first.
 
 Three pieces:
 
-- **`lerobot-lance-convert`** - turns a LeRobot v3.0 dataset (local dir or Hub id)
-  into a three-table Lance layout.
+- **`lerobot-lance-convert`** - turns a LeRobot v2.0, v2.1, or v3.0 dataset
+  (local dir or Hub id) into a three-table Lance layout. v2.x sources keep
+  their per-episode parquet/mp4 files as-is; `meta/` is rewritten to v3.0 so
+  the loader can read the result. You do not need to run lerobot's
+  `convert_dataset_v21_to_v30` first.
 - **`lerobot-lance-doctor`** - audits an upstream-format dataset for silent
   defects before you convert or train. Every large public dataset we converted
   failed at least one check.
@@ -102,12 +105,13 @@ It is a map-style `torch.utils.data.Dataset` returning items bit-exact with
 
 Three Lance tables next to a copy of the standard `meta/` directory. The converter
 stamps `"storage_format": "lance"` into `meta/info.json` (and into the meta table),
-so readers can pick the storage backend from LeRobot metadata alone; everything
-else in `meta/` is copied verbatim:
+so readers can pick the storage backend from LeRobot metadata alone. v3.0 `meta/`
+is copied verbatim; v2.0 / v2.1 jsonl metadata is rewritten to the v3.0 parquet
+layout the loader expects (episode locators, `tasks.parquet`, `stats.json`):
 
 ```
 <out>/
-  meta/             # byte-identical LeRobot v3.0 metadata
+  meta/             # LeRobot v3.0 metadata (copied from a v3 source, or rewritten from v2.x)
   frames.lance      # one row per frame: tabular features (dots -> underscores)
   videos.lance      # one row per source mp4: bytes in a blob v2 column + byte index
   meta.lance        # one row per meta/ file (path, bytes): metadata transport for remote roots
@@ -136,7 +140,7 @@ doesn't need them.
 Silent defects in public datasets are common, and they surface as confusing
 failures at convert or train time (or worse, don't surface at all).
 `lerobot-lance-doctor` runs five read-only checks against an upstream-format
-dataset: metadata loads, episode ranges tile `[0, total_frames)`, every
+v2.0, v2.1, or v3.0 dataset: metadata loads, episode ranges tile `[0, total_frames)`, every
 referenced parquet exists with the right total row count and no orphans, every
 referenced video exists non-empty and readable with no orphans, and every video
 actually contains the frames the metadata implies it should (container metadata

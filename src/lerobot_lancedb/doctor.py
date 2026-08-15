@@ -7,7 +7,7 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""lerobot-lance-doctor: audit a LeRobot v3.0 dataset (upstream format) for silent defects.
+"""lerobot-lance-doctor: audit a LeRobot v2.0 / v2.1 / v3.0 dataset for silent defects.
 
 Every large public dataset we converted shipped at least one of these:
   droid     44% orphan parquet rows + orphan videos (works by filename-sort luck)
@@ -46,7 +46,8 @@ def main() -> int:
 
     import av
     import pyarrow.parquet as pq
-    from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+
+    from .legacy import load_source_audit
 
     failures = 0
 
@@ -64,20 +65,23 @@ def main() -> int:
 
     # 1 META
     try:
-        meta = LeRobotDatasetMetadata(args.repo_id or str(args.root), root=args.root)
+        src = load_source_audit(args.root, repo_id=args.repo_id)
     except Exception as err:
         print(f"[{FAIL}] META: metadata failed to load: {err}")
         return 1
-    print(f"[{OK}] META: {meta.total_episodes} episodes, {meta.total_frames} frames, fps {meta.fps}")
+    print(
+        f"[{OK}] META: {src.version}, {src.total_episodes} episodes, "
+        f"{src.total_frames} frames, fps {src.fps}"
+    )
+
+    starts, ends = src.starts, src.ends
 
     # 2 BOUNDARIES
-    starts = [int(x) for x in meta.episodes["dataset_from_index"]]
-    ends = [int(x) for x in meta.episodes["dataset_to_index"]]
     problems = []
     if starts and starts[0] != 0:
         problems.append(f"first episode starts at {starts[0]}, not 0")
-    if ends and ends[-1] != meta.total_frames:
-        problems.append(f"last episode ends at {ends[-1]}, meta declares {meta.total_frames}")
+    if ends and ends[-1] != src.total_frames:
+        problems.append(f"last episode ends at {ends[-1]}, meta declares {src.total_frames}")
     problems += [
         f"gap/overlap between episode {i} (ends {ends[i]}) and {i + 1} (starts {starts[i + 1]})"
         for i in range(len(starts) - 1)
@@ -86,16 +90,16 @@ def main() -> int:
     report("BOUNDARIES: episode ranges tile [0, total_frames)", problems)
 
     # 3 DATA
-    referenced_data = {args.root / meta.get_data_file_path(ep) for ep in range(meta.total_episodes)}
+    referenced_data = set(src.data_files)
     problems = [
-        f"missing referenced parquet: {p.relative_to(args.root)}"
+        f"missing referenced parquet: {p.relative_to(args.root) if p.is_relative_to(args.root) else p}"
         for p in sorted(referenced_data)
         if not p.exists()
     ]
     rows = sum(pq.read_metadata(p).num_rows for p in referenced_data if p.exists())
-    if rows != meta.total_frames:
-        problems.append(f"referenced parquets hold {rows} rows, meta declares {meta.total_frames}")
-    on_disk = set((args.root / "data").rglob("*.parquet"))
+    if rows != src.total_frames:
+        problems.append(f"referenced parquets hold {rows} rows, meta declares {src.total_frames}")
+    on_disk = set((args.root / "data").rglob("*.parquet")) if (args.root / "data").is_dir() else set()
     orphans = sorted(on_disk - referenced_data)
     if orphans:
         orphan_rows = sum(pq.read_metadata(p).num_rows for p in orphans)
@@ -108,30 +112,15 @@ def main() -> int:
     # 4 + 5 VIDEOS
     problems = []
     supply_problems = []
-    referenced_videos: dict[Path, float] = {}  # path -> max implied end timestamp
-    for key in meta.video_keys:
-        columns = meta.episodes.column_names
-        to_ts = (
-            meta.episodes[f"videos/{key}/to_timestamp"] if f"videos/{key}/to_timestamp" in columns else None
-        )
-        from_ts = meta.episodes[f"videos/{key}/from_timestamp"]
-        for ep in range(meta.total_episodes):
-            path = args.root / meta.get_video_file_path(ep, key)
-            end = (
-                float(to_ts[ep])
-                if to_ts is not None
-                else float(from_ts[ep]) + (ends[ep] - starts[ep]) / meta.fps
-            )
-            referenced_videos[path] = max(referenced_videos.get(path, 0.0), end)
-    for path, implied_end in sorted(referenced_videos.items()):
-        rel = path.relative_to(args.root)
+    for path, implied_end in sorted(src.video_end_ts.items()):
+        rel = path.relative_to(args.root) if path.is_relative_to(args.root) else path
         if not path.exists():
             problems.append(f"missing referenced video: {rel}")
             continue
         if path.stat().st_size == 0:
             problems.append(f"zero-byte video: {rel}")
             continue
-        implied_frames = round(implied_end * meta.fps)
+        implied_frames = round(implied_end * src.fps)
         try:
             with av.open(str(path)) as container:
                 declared = container.streams.video[0].frames
@@ -144,7 +133,7 @@ def main() -> int:
                 f"(short by {implied_frames - declared})"
             )
     on_disk_videos = set((args.root / "videos").rglob("*.mp4")) if (args.root / "videos").is_dir() else set()
-    orphan_videos = sorted(on_disk_videos - set(referenced_videos))
+    orphan_videos = sorted(on_disk_videos - set(src.video_end_ts))
     if orphan_videos:
         problems.append(f"{len(orphan_videos)} orphan video file(s) never referenced by meta")
     report("VIDEOS: referenced, non-empty, readable, no orphans", problems)

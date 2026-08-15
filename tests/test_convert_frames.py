@@ -38,6 +38,19 @@ def test_frames_reader_streams_in_order(tmp_path):
     assert pa.types.is_fixed_size_list(field.type) and field.type.list_size == 4
 
 
+def test_frames_reader_v2_episode_filenames(tmp_path):
+    from lerobot_lancedb.legacy import data_parquet_files
+
+    d0 = tmp_path / "data" / "chunk-000"
+    d0.mkdir(parents=True)
+    _write(d0 / "episode_000000.parquet", 0, 10)
+    _write(d0 / "episode_000001.parquet", 10, 5)
+
+    tbl = _frames_reader(data_parquet_files(tmp_path)).read_all()
+    assert tbl.num_rows == 15
+    assert tbl.column("index").to_pylist() == list(range(15))
+
+
 def test_frames_reader_rejects_unsorted(tmp_path):
     f0, f1 = tmp_path / "file-000.parquet", tmp_path / "file-001.parquet"
     _write(f0, 0, 10)
