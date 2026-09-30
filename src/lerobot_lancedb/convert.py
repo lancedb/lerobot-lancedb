@@ -15,6 +15,7 @@ Layout produced:
       frames.lance  # one row per frame, tabular features (dots -> underscores)
       videos.lance  # one row per source mp4, bytes verbatim in a blob v2 column
       meta.lance    # one row per meta/ file (path, bytes) — metadata transport for remote roots
+      episodes.lance # one row per episode: frame ranges and the per-camera video file mapping
 
 Usage:
     lerobot-lance-convert --repo-id lerobot/pusht --out ./pusht-lance
@@ -47,6 +48,7 @@ from .reader import (
 )
 
 VIDEO_BATCH_BYTES = 512 * 1024 * 1024
+EPISODES_TABLE = "episodes"
 
 
 def _storage_type(dtype: pa.DataType) -> pa.DataType:
@@ -138,8 +140,23 @@ def _stamp_storage_format(meta_dir: Path) -> None:
         info_file.write_text(json.dumps(info, indent=4))
 
 
+def _episodes_table(meta_dir: Path) -> pa.Table:
+    """The meta/episodes parquet files as one table, without the per-episode stats.
+
+    Keeps episode_index, length, the frame range (dataset_from_index /
+    dataset_to_index), tasks, and for every camera the video file and time
+    offset (videos/<camera>/chunk_index, file_index, from_timestamp,
+    to_timestamp), so a frame can be located in videos.lance without LeRobot.
+    Column names follow frames.lance: dots become underscores.
+    """
+    files = sorted((meta_dir / "episodes").rglob("*.parquet"))
+    table = pa.concat_tables([pq.read_table(f) for f in files])
+    keep = [name for name in table.column_names if not name.startswith("stats/")]
+    return table.select(keep).rename_columns([to_lance_column(name) for name in keep])
+
+
 def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None) -> None:
-    """Convert one LeRobot v3.0 dataset to the three-table Lance layout.
+    """Convert one LeRobot v3.0 dataset to the four-table Lance layout.
 
     Pass ``root`` to convert a dataset already on disk (nothing is
     downloaded), or ``repo_id`` alone to download from the Hub first
@@ -178,6 +195,11 @@ def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None)
         mode="overwrite",
     )
     print(f"  {len(meta_files)} files")
+
+    print("building episodes table ...")
+    episodes_table = db.create_table(EPISODES_TABLE, _episodes_table(out_dir / "meta"), mode="overwrite")
+    episodes_table.create_scalar_index("episode_index")
+    print(f"  {episodes_table.count_rows()} rows")
 
     print("building frames table ...")
     files = sorted((src_root / "data").rglob("*.parquet"))

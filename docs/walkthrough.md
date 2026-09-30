@@ -82,7 +82,7 @@ meta/                                         meta/            # verbatim copy
   info.json  stats.json  tasks.parquet        meta.lance       # meta/ files as (path, bytes)
   episodes/chunk-000/file-000.parquet         frames.lance     # 1 row / frame, tabular only
 data/                                         videos.lance     # 1 row / mp4, bytes + byte index
-  chunk-000/file-000.parquet ...
+  chunk-000/file-000.parquet ...              episodes.lance   # 1 row / episode, frame range + video file map
 videos/
   observation.images.top/chunk-000/file-000.mp4 ...
 ```
