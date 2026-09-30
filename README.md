@@ -111,6 +111,7 @@ else in `meta/` is copied verbatim:
   frames.lance      # one row per frame: tabular features (dots -> underscores)
   videos.lance      # one row per source mp4: bytes in a blob v2 column + byte index
   meta.lance        # one row per meta/ file (path, bytes): metadata transport for remote roots
+  episodes.lance    # one row per episode: frame range + per-camera video file and time offset
 ```
 
 - **`frames.lance`** - every tabular feature, one row per frame, sorted by index.
@@ -125,6 +126,12 @@ else in `meta/` is copied verbatim:
 - **`meta.lance`** - the `meta/` files as `(path, bytes)`, so a remote root can
   materialize `meta/` through the same Lance connection instead of a side channel
   (droid's per-episode stats alone are 566 MB).
+- **`episodes.lance`** - one row per episode from `meta/episodes` without the
+  stats: `length`, the frame range (`dataset_from_index`, `dataset_to_index`),
+  `tasks`, and per camera the video file and time offset
+  (`videos/<camera>/chunk_index`, `file_index`, `from_timestamp`, `to_timestamp`),
+  so plain Lance clients can locate any frame's bytes without parsing the parquet
+  inside `meta.lance`. The loader does not read it.
 
 Both large tables are written as a single streaming commit (bounded memory, no
 per-512 MB fragmentation), and scalar indexes (`episode_index`, `task_index`,
