@@ -53,7 +53,8 @@ VIDEO_BATCH_BYTES = 512 * 1024 * 1024
 
 
 class DamagedSourceError(RuntimeError):
-    """The source dataset is damaged in a file its own metadata references.
+    """The source dataset is damaged where its own metadata references it, or the
+    audit that looks for that damage could not run.
 
     The converter copies parquet rows and mp4 files byte for byte, so a defect the
     doctor can see becomes a defect of the output; the resulting dataset converts
@@ -155,8 +156,10 @@ def _reject_damaged_source(src_root: Path, repo_id: str | None, allow_defects: b
 
     Only defects in data an episode references block: those bytes end up in the
     output, so ``berkeley_autolab_ur5``'s short aggregated videos would convert
-    silently and then crash the reader past the last real frame. Problems confined
-    to unreferenced files are not copied defects and stay the doctor's business.
+    silently and then crash the reader past the last real frame. Orphan parquet and
+    video findings do not block: they are not referenced data, and unreferenced
+    files remain the converter's own file enumeration, which still picks them up
+    (skipping them is a separate change).
 
     ``allow_defects`` keeps the old copy-anything behavior for datasets that are
     already published or under investigation, but says clearly what it lets through.
@@ -164,7 +167,7 @@ def _reject_damaged_source(src_root: Path, repo_id: str | None, allow_defects: b
     try:
         result = audit(src_root, repo_id=repo_id)
     except Exception as err:
-        raise DamagedSourceError(f"{src_root}: cannot read dataset metadata: {err}") from err
+        raise DamagedSourceError(f"{src_root}: the source audit failed: {err}") from err
 
     problems = result.blocking_problems
     if not problems:

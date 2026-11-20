@@ -50,9 +50,10 @@ class Problem:
 
     message: str
     #: Whether the defect is in data an episode references, so any copy of this
-    #: dataset carries it. False only for problems confined to files no episode
-    #: references: leaving those files out leaves the referenced data sound, so
-    #: they do not block a conversion.
+    #: dataset carries it. False for problems confined to files no episode
+    #: references: the gate only refuses defects it can attribute to referenced
+    #: data, while unreferenced files remain the converter's own file enumeration
+    #: (which still picks them up; skipping them is a separate change).
     blocks_conversion: bool
 
 
