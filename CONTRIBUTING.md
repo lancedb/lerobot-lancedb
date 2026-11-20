@@ -37,7 +37,7 @@ deleted and the converter imports the contract from lerobot directly.
 
 ## Testing changes
 
-There is no pytest suite right now; the acceptance gate is the smoke flow
+`python -m pytest tests` covers the converter internals; the acceptance gate is the smoke flow
 from the README quickstart: convert `lerobot/pusht`, open it with lerobot's
 `LanceDBDataset`, and compare items bit-exact against upstream
 `LeRobotDataset`. Run `lerobot-lance-doctor` on the source first — a defect

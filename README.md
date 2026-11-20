@@ -72,6 +72,12 @@ lerobot-lance-convert --root /path/to/dataset --out ./my-lance
 Then push `./pusht-lance/` to object storage (`aws s3 cp --recursive`, etc.) and
 point training at the URI.
 
+The conversion runs the doctor's checks on the source first and refuses a dataset
+that is damaged where its own metadata references it - short aggregated videos,
+missing or zero-byte files - because the converter copies those bytes verbatim and
+the output would fail at read time instead. `--allow-defects` converts anyway and
+prints every defect it lets through.
+
 ## Load it back
 
 ```python
