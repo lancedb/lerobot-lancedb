@@ -72,6 +72,11 @@ lerobot-lance-convert --root /path/to/dataset --out ./my-lance
 Then push `./pusht-lance/` to object storage (`aws s3 cp --recursive`, etc.) and
 point training at the URI.
 
+Only the data and video files `meta/episodes` references are converted. Stray
+files under `data/` and `videos/` are skipped with a warning that reports how
+many files and parquet rows were skipped; a referenced file that is missing
+fails the conversion instead of producing an incomplete dataset.
+
 ## Load it back
 
 ```python
