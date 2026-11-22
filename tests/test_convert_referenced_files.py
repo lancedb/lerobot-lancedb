@@ -10,7 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from lerobot_lancedb.convert import convert
+from lerobot_lancedb.convert import DamagedSourceError, convert
 
 VIDEO_KEY = "observation.images.top"
 
@@ -43,7 +43,7 @@ def _write_video(path: Path, frames: int = 6) -> None:
             container.mux(packet)
 
 
-def _write_dataset(root: Path) -> None:
+def _write_dataset(root: Path, video_frames: int = 10) -> None:
     (root / "meta" / "episodes" / "chunk-000").mkdir(parents=True)
     (root / "data" / "chunk-000").mkdir(parents=True)
     video_dir = root / "videos" / VIDEO_KEY / "chunk-000"
@@ -94,8 +94,8 @@ def _write_dataset(root: Path) -> None:
     # fail the converter's order check, which is the DROID failure.
     _write_data(root / "data" / "chunk-000" / "file-002.parquet", 5, 10, 2)
 
-    _write_video(video_dir / "file-000.mp4")
-    _write_video(video_dir / "file-001.mp4")
+    _write_video(video_dir / "file-000.mp4", video_frames)
+    _write_video(video_dir / "file-001.mp4", video_frames)
     # Never referenced, so the converter never opens it as a video.
     (video_dir / "file-002.mp4").write_bytes(b"not an mp4")
 
@@ -122,6 +122,38 @@ def test_convert_refuses_missing_referenced_file(tmp_path):
     root = tmp_path / "src"
     _write_dataset(root)
     (root / "data" / "chunk-000" / "file-001.parquet").unlink()
+    out = tmp_path / "out"
+
+    # The default doctor gate reports the missing file; --allow-defects gets past
+    # the gate but still cannot copy bytes that do not exist.
+    with pytest.raises(DamagedSourceError, match="missing referenced parquet"):
+        convert(out, root=root)
+    assert not out.exists()
 
     with pytest.raises(FileNotFoundError, match="referenced by meta/episodes are missing"):
-        convert(tmp_path / "out", root=root)
+        convert(out, root=root, allow_defects=True)
+    assert not out.exists()
+
+
+def test_allow_defects_keeps_orphans_out_of_the_output(tmp_path, capsys):
+    # The doctor gate blocks the short referenced videos, but allowing the defects
+    # must not turn the unreferenced shard and video back into input.
+    root = tmp_path / "src"
+    _write_dataset(root, video_frames=6)
+    out = tmp_path / "out"
+
+    with pytest.raises(DamagedSourceError, match="short by 4"):
+        convert(out, root=root)
+    assert not out.exists()
+
+    convert(out, root=root, allow_defects=True)
+
+    captured = capsys.readouterr()
+    assert "--allow-defects" in captured.err
+    assert "short by 4" in captured.err
+    assert "skipping 1 orphan parquet file(s)" in captured.out
+    assert "skipping 1 orphan video file(s)" in captured.out
+
+    db = lancedb.connect(str(out))
+    assert db.open_table("frames").to_arrow().column("index").to_pylist() == list(range(20))
+    assert db.open_table("videos").to_arrow().column("file_index").to_pylist() == [0, 1]

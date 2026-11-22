@@ -72,10 +72,18 @@ lerobot-lance-convert --root /path/to/dataset --out ./my-lance
 Then push `./pusht-lance/` to object storage (`aws s3 cp --recursive`, etc.) and
 point training at the URI.
 
+The conversion runs the doctor's checks on the source first and refuses a dataset
+that is damaged where its own metadata references it - short aggregated videos,
+missing or zero-byte files - because the converter copies those bytes verbatim and
+the output would fail at read time instead. `--allow-defects` skips that gate and
+keeps the referenced damage, printing every defect it lets through; a referenced
+file that is missing still fails before output, with or without the flag, because
+there are no bytes to copy.
+
 Only the data and video files `meta/episodes` references are converted. Stray
 files under `data/` and `videos/` are skipped with a warning that reports how
-many files and parquet rows were skipped; a referenced file that is missing
-fails the conversion instead of producing an incomplete dataset.
+many files and parquet rows were skipped; unreferenced files are never copied,
+with or without `--allow-defects`.
 
 ## Load it back
 
