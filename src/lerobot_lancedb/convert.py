@@ -27,12 +27,14 @@ import argparse
 import json
 import shutil
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 import lancedb
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.language import LANGUAGE_COLUMNS
 
 from .doctor import audit
@@ -138,6 +140,80 @@ def _frames_reader(files: list[Path]) -> pa.RecordBatchReader:
     return pa.RecordBatchReader.from_batches(out_schema, batches())
 
 
+def _unique(paths: Iterable[Path]) -> list[Path]:
+    """De-duplicate paths while keeping first-seen order."""
+    return list(dict.fromkeys(paths))
+
+
+def _referenced_files(meta: LeRobotDatasetMetadata, root: Path) -> tuple[list[Path], list[Path]]:
+    """The data and video files ``meta/episodes`` references, in reading order.
+
+    This is the same reference model as the doctor's DATA and VIDEOS checks: the
+    files the metadata says the dataset contains. Public datasets can carry files
+    the metadata never points at (DROID 1.0.1 ships 70 unreferenced parquet
+    shards, out of index order); those are not part of the dataset, so the
+    converter must not read them. Data files keep episode order rather than path
+    order, so the frames reader still sees monotonically increasing indices.
+    """
+    episodes = range(meta.total_episodes)
+    data_files = _unique(root / meta.get_data_file_path(ep) for ep in episodes)
+    video_files = _unique(
+        root / meta.get_video_file_path(ep, key) for key in meta.video_keys for ep in episodes
+    )
+    return data_files, video_files
+
+
+def _check_referenced_files_exist(root: Path, data_files: list[Path], video_files: list[Path]) -> None:
+    """Fail before writing anything when a referenced file is missing.
+
+    Selecting by metadata means a missing file can no longer hide behind the
+    old directory glob; the source dataset is incomplete and must be fixed.
+    """
+    missing = [path for path in data_files + video_files if not path.exists()]
+    if not missing:
+        return
+    shown = ", ".join(str(path.relative_to(root)) for path in missing[:5])
+    more = f" and {len(missing) - 5} more" if len(missing) > 5 else ""
+    raise FileNotFoundError(
+        f"{len(missing)} file(s) referenced by meta/episodes are missing under {root}: "
+        f"{shown}{more}; the source dataset is incomplete"
+    )
+
+
+def _parquet_rows(files: list[Path]) -> tuple[int, int]:
+    """Row count from the parquet footers, plus files whose footer is unreadable."""
+    rows = 0
+    unreadable = 0
+    for path in files:
+        try:
+            rows += pq.read_metadata(path).num_rows
+        except Exception:  # A file we are skipping must not fail the conversion.
+            unreadable += 1
+    return rows, unreadable
+
+
+def _warn_orphans(root: Path, data_files: list[Path], video_files: list[Path]) -> None:
+    """Report on-disk files that ``meta/episodes`` never references; they are skipped."""
+    data_dir = root / "data"
+    on_disk_data = set(data_dir.rglob("*.parquet")) if data_dir.is_dir() else set()
+    orphan_data = sorted(on_disk_data - set(data_files))
+    if orphan_data:
+        rows, unreadable = _parquet_rows(orphan_data)
+        detail = f"{rows:,} rows" if not unreadable else f"{rows:,} rows, {unreadable} unreadable"
+        print(
+            f"warning: skipping {len(orphan_data)} orphan parquet file(s) "
+            f"not referenced by meta/episodes ({detail})"
+        )
+    video_dir = root / "videos"
+    on_disk_videos = set(video_dir.rglob("*.mp4")) if video_dir.is_dir() else set()
+    orphan_videos = sorted(on_disk_videos - set(video_files))
+    if orphan_videos:
+        print(
+            f"warning: skipping {len(orphan_videos)} orphan video file(s) "
+            "not referenced by meta/episodes"
+        )
+
+
 def _stamp_storage_format(meta_dir: Path) -> None:
     """Declare the Lance storage format in ``meta/info.json``.
 
@@ -157,9 +233,9 @@ def _reject_damaged_source(src_root: Path, repo_id: str | None, allow_defects: b
     Only defects in data an episode references block: those bytes end up in the
     output, so ``berkeley_autolab_ur5``'s short aggregated videos would convert
     silently and then crash the reader past the last real frame. Orphan parquet and
-    video findings do not block: they are not referenced data, and unreferenced
-    files remain the converter's own file enumeration, which still picks them up
-    (skipping them is a separate change).
+    video findings do not block: they are not referenced data, and the converter's
+    file selection skips them (see ``_referenced_files``), so they never reach the
+    output.
 
     ``allow_defects`` keeps the old copy-anything behavior for datasets that are
     already published or under investigation, but says clearly what it lets through.
@@ -217,6 +293,13 @@ def convert(
 
     _reject_damaged_source(src_root, repo_id, allow_defects)
 
+    # Select files from meta/episodes before creating the output, so an
+    # incomplete source fails without leaving a half-built dataset behind.
+    meta = LeRobotDatasetMetadata(repo_id or str(src_root), root=src_root)
+    data_files, video_files = _referenced_files(meta, src_root)
+    _check_referenced_files_exist(src_root, data_files, video_files)
+    _warn_orphans(src_root, data_files, video_files)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     if not (out_dir / "meta").exists():
         shutil.copytree(src_root / "meta", out_dir / "meta")
@@ -240,11 +323,9 @@ def convert(
     print(f"  {len(meta_files)} files")
 
     print("building frames table ...")
-    files = sorted((src_root / "data").rglob("*.parquet"))
-    db.create_table(FRAMES_TABLE, _frames_reader(files), mode="overwrite")
+    db.create_table(FRAMES_TABLE, _frames_reader(data_files), mode="overwrite")
     print(f"  {db.open_table(FRAMES_TABLE).count_rows()} rows")
 
-    video_files = sorted((src_root / "videos").rglob("*.mp4")) if (src_root / "videos").is_dir() else []
     print(f"building videos table from {len(video_files)} files ...")
     schema = pa.schema(
         [

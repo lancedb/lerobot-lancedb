@@ -52,8 +52,8 @@ class Problem:
     #: Whether the defect is in data an episode references, so any copy of this
     #: dataset carries it. False for problems confined to files no episode
     #: references: the gate only refuses defects it can attribute to referenced
-    #: data, while unreferenced files remain the converter's own file enumeration
-    #: (which still picks them up; skipping them is a separate change).
+    #: data, and the converter selects from those references, so unreferenced
+    #: files are skipped rather than copied.
     blocks_conversion: bool
 
 
@@ -133,7 +133,7 @@ def audit(root: Path, repo_id: str | None = None) -> Audit:
         problems.append(
             Problem(
                 f"{len(orphans)} orphan parquet file(s) never referenced by meta "
-                f"({orphan_rows} rows; loaders that glob directories may read these)",
+                f"({orphan_rows} rows; upstream loaders that glob directories may read these)",
                 blocks_conversion=False,
             )
         )

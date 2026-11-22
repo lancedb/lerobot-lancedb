@@ -124,9 +124,18 @@ One row per frame, tabular features only (no pixels). Three things happen to the
 columns, then the whole thing is streamed to one commit.
 
 ```python
-files = sorted((src_root / "data").rglob("*.parquet"))      # index-ordered by layout
-db.create_table(FRAMES_TABLE, _frames_reader(files), mode="overwrite")
+data_files, video_files = _referenced_files(meta, src_root)  # only files meta/episodes points at
+db.create_table(FRAMES_TABLE, _frames_reader(data_files), mode="overwrite")
 ```
+
+**The file list comes from `meta/episodes`, not a `data/` glob.** Public
+datasets carry stray shards: DROID 1.0.1 ships 70 unreferenced parquet files
+(12.4M rows) whose frame indices are not where their filenames sort, so a
+filename-sorted glob reads them out of order and trips the check below. The
+converter skips them with a warning that counts the files and their rows (read
+from parquet footers, so an unreadable orphan cannot fail the conversion). The
+same applies to videos. A file that *is* referenced and missing fails the
+conversion before any output is written; only unreferenced files are skipped.
 
 **Column transforms** (computed once from the first file's schema, applied per
 batch):
