@@ -28,17 +28,18 @@ keywords = ["lerobot", "lancedb", "lance", "robotics", "datasets", "converter"]
 dependencies = [
     # Floor set by the converter/doctor/reader imports (lerobot.datasets.language,
     # dataset_metadata, depth_utils, feature_utils, video_utils, configs.video,
-    # all in 0.6.0 on PyPI). lerobot also supplies the reader's heavy deps
-    # (torch, torchcodec, numpy, huggingface_hub), so they're pinned there, not
-    # here, to avoid version conflicts.
-    "lerobot>=0.6.0",
+    # all in 0.6.0 on PyPI). The [dataset] extra supplies datasets, av and
+    # torchcodec, which lerobot.datasets imports; base lerobot alone fails at
+    # import time. lerobot also supplies the reader's heavy deps (torch,
+    # numpy, huggingface_hub), so they're pinned there, not here, to avoid
+    # version conflicts.
+    "lerobot[dataset]>=0.6.0",
     # fetch_blob_ranges + blob v2 columns; betas are published on fury, not
     # PyPI — see the README install note.
     "lancedb>=0.37.1b0",
     "pyarrow>=17.0.0",
     # pyav: byte-index construction (converter) and container inspection
-    # (doctor). Listed explicitly because lerobot moved it behind the
-    # [dataset] extra in 0.6.
+    # (doctor). Declared directly because both import it themselves.
     "av>=12.0.0",
 ]
 
