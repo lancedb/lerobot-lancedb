@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import lancedb
@@ -33,6 +34,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from lerobot.datasets.language import LANGUAGE_COLUMNS
+
+from .doctor import audit
 
 # Schema contract comes from the (temporarily vendored) reader, so the writer and
 # reader can't disagree. Once the loader lands upstream, reader.py is deleted and
@@ -47,6 +50,16 @@ from .reader import (
 )
 
 VIDEO_BATCH_BYTES = 512 * 1024 * 1024
+
+
+class DamagedSourceError(RuntimeError):
+    """The source dataset is damaged where its own metadata references it, or the
+    audit that looks for that damage could not run.
+
+    The converter copies parquet rows and mp4 files byte for byte, so a defect the
+    doctor can see becomes a defect of the output; the resulting dataset converts
+    fine and then fails inside the video decoder at read time.
+    """
 
 
 def _storage_type(dtype: pa.DataType) -> pa.DataType:
@@ -138,12 +151,57 @@ def _stamp_storage_format(meta_dir: Path) -> None:
         info_file.write_text(json.dumps(info, indent=4))
 
 
-def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None) -> None:
+def _reject_damaged_source(src_root: Path, repo_id: str | None, allow_defects: bool) -> None:
+    """Run the doctor's checks and refuse a source whose referenced files are damaged.
+
+    Only defects in data an episode references block: those bytes end up in the
+    output, so ``berkeley_autolab_ur5``'s short aggregated videos would convert
+    silently and then crash the reader past the last real frame. Orphan parquet and
+    video findings do not block: they are not referenced data, and unreferenced
+    files remain the converter's own file enumeration, which still picks them up
+    (skipping them is a separate change).
+
+    ``allow_defects`` keeps the old copy-anything behavior for datasets that are
+    already published or under investigation, but says clearly what it lets through.
+    """
+    try:
+        result = audit(src_root, repo_id=repo_id)
+    except Exception as err:
+        raise DamagedSourceError(f"{src_root}: the source audit failed: {err}") from err
+
+    problems = result.blocking_problems
+    if not problems:
+        return
+    listed = [f"  - {problem.message}" for problem in problems[:10]]
+    if len(problems) > 10:
+        listed.append(f"  ... and {len(problems) - 10} more")
+    if allow_defects:
+        print(
+            "WARNING: --allow-defects: converting a damaged source dataset. The output keeps "
+            "these defects, and every read that needs the missing data fails:\n" + "\n".join(listed),
+            file=sys.stderr,
+        )
+        return
+    raise DamagedSourceError(
+        f"{src_root} is damaged in files its metadata references; refusing to convert it:\n"
+        + "\n".join(listed)
+        + "\nThe output would copy the damage. Run `lerobot-lance-doctor --root <dataset>` "
+        "for the full report, fix the source, or pass --allow-defects to convert anyway."
+    )
+
+
+def convert(
+    out_dir: Path, repo_id: str | None = None, root: Path | None = None, allow_defects: bool = False
+) -> None:
     """Convert one LeRobot v3.0 dataset to the three-table Lance layout.
 
     Pass ``root`` to convert a dataset already on disk (nothing is
     downloaded), or ``repo_id`` alone to download from the Hub first
     (into ``$HF_LEROBOT_HOME``, like any other lerobot tool).
+
+    The source is audited with the doctor's checks before anything is written, so
+    a dataset that is damaged where episodes reference it fails here instead of
+    producing an unreadable output; ``allow_defects`` overrides that refusal.
     """
     if root is not None:
         src_root = Path(root)
@@ -156,6 +214,8 @@ def convert(out_dir: Path, repo_id: str | None = None, root: Path | None = None)
         src_root = Path(ds.root)
     else:
         raise ValueError("pass --repo-id or --root")
+
+    _reject_damaged_source(src_root, repo_id, allow_defects)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     if not (out_dir / "meta").exists():
@@ -261,10 +321,21 @@ def main() -> None:
         "--root", default=None, type=Path, help="local LeRobot dataset dir (nothing is downloaded)"
     )
     parser.add_argument("--out", required=True, type=Path, help="output directory for the Lance layout")
+    parser.add_argument(
+        "--allow-defects",
+        action="store_true",
+        help=(
+            "convert even when the doctor finds defects in files episodes reference; "
+            "the output keeps them"
+        ),
+    )
     args = parser.parse_args()
     if args.repo_id is None and args.root is None:
         parser.error("pass --repo-id and/or --root")
-    convert(args.out, repo_id=args.repo_id, root=args.root)
+    try:
+        convert(args.out, repo_id=args.repo_id, root=args.root, allow_defects=args.allow_defects)
+    except DamagedSourceError as err:
+        parser.exit(1, f"\n{err}\n")
 
 
 if __name__ == "__main__":
