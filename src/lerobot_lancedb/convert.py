@@ -13,11 +13,15 @@ Layout produced:
     <out>/
       meta/         # copied from the source dataset + storage_format stamped in info.json
       frames.lance  # one row per frame, tabular features (dots -> underscores)
-      videos.lance  # one row per source mp4, bytes verbatim in a blob v2 column
+      videos.lance  # one row per source mp4: External Blob v2 URI or managed blob + byte index
       meta.lance    # one row per meta/ file (path, bytes) — metadata transport for remote roots
 
 Usage:
-    lerobot-lance-convert --repo-id lerobot/pusht --out ./pusht-lance
+    # Zero-copy from S3 or Hugging Face Hub (0 bytes of MP4 downloaded or copied):
+    lerobot-lance-convert --root s3://bucket/droid --out s3://bucket/droid-lance
+    lerobot-lance-convert --repo-id lerobot/droid_1.0.1 --out ./droid-lance
+
+    # Local dataset (copies MP4s by default; pass --video-mode external to reference in place):
     lerobot-lance-convert --root /path/to/local/dataset --out ./pusht-lance
 """
 
@@ -27,8 +31,13 @@ import argparse
 import json
 import shutil
 import sys
+import tempfile
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+from urllib.parse import quote
 
 import lancedb
 import pyarrow as pa
@@ -37,7 +46,9 @@ import pyarrow.parquet as pq
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.language import LANGUAGE_COLUMNS
 
+from ._source import DEFAULT_IO_WORKERS, LocalSource, _file_uri_to_path, is_remote_uri, open_source
 from .doctor import audit
+from .mp4_index import DEFAULT_HEADER_PROBE_BYTES, ProbedMp4, probe_mp4_byte_index
 
 # Schema contract comes from the (temporarily vendored) reader, so the writer and
 # reader can't disagree. Once the loader lands upstream, reader.py is deleted and
@@ -52,15 +63,27 @@ from .reader import (
 )
 
 VIDEO_BATCH_BYTES = 512 * 1024 * 1024
+EXTERNAL_VIDEO_BATCH_BYTES = 64 * 1024 * 1024
+VideoMode = Literal["auto", "external", "copy"]
+
+
+@dataclass(frozen=True)
+class _VideoRef:
+    """One unique video file referenced by ``meta/episodes``."""
+
+    video_key: str
+    chunk_index: int
+    file_index: int
+    rel_path: str
 
 
 class DamagedSourceError(RuntimeError):
     """The source dataset is damaged where its own metadata references it, or the
     audit that looks for that damage could not run.
 
-    The converter copies parquet rows and mp4 files byte for byte, so a defect the
-    doctor can see becomes a defect of the output; the resulting dataset converts
-    fine and then fails inside the video decoder at read time.
+    The converter copies or references parquet rows and mp4 files verbatim, so a
+    defect the doctor can see becomes a defect of the output; the resulting
+    dataset converts fine and then fails inside the video decoder at read time.
     """
 
 
@@ -145,30 +168,80 @@ def _unique(paths: Iterable[Path]) -> list[Path]:
     return list(dict.fromkeys(paths))
 
 
-def _referenced_files(meta: LeRobotDatasetMetadata, root: Path) -> tuple[list[Path], list[Path]]:
-    """The data and video files ``meta/episodes`` references, in reading order.
+def _referenced_rel_paths(
+    meta: LeRobotDatasetMetadata,
+) -> tuple[list[str], list[_VideoRef], dict[str, float]]:
+    """Derive referenced data/ and video/ relative paths plus max implied video end timestamps.
 
-    This is the same reference model as the doctor's DATA and VIDEOS checks: the
-    files the metadata says the dataset contains. Public datasets can carry files
-    the metadata never points at (DROID 1.0.1 ships 70 unreferenced parquet
-    shards, out of index order); those are not part of the dataset, so the
-    converter must not read them. Data files keep episode order rather than path
-    order, so the frames reader still sees monotonically increasing indices.
+    Reads only the integer chunk/file columns from ``meta.episodes`` instead of
+    indexing full episode rows (which materializes every per-episode stats column
+    and takes >2 minutes on 95k-episode datasets like DROID).
     """
-    episodes = range(meta.total_episodes)
-    data_files = _unique(root / meta.get_data_file_path(ep) for ep in episodes)
-    video_files = _unique(
-        root / meta.get_video_file_path(ep, key) for key in meta.video_keys for ep in episodes
-    )
+    episodes = meta.episodes
+    if episodes is None or len(episodes) == 0:
+        return [], [], {}
+
+    data_path_tmpl = meta.data_path
+    data_chunks = episodes["data/chunk_index"]
+    data_files_col = episodes["data/file_index"]
+    seen_data: dict[tuple[int, int], str] = {}
+    for chunk_idx, file_idx in zip(data_chunks, data_files_col, strict=True):
+        pair = (int(chunk_idx), int(file_idx))
+        if pair not in seen_data:
+            seen_data[pair] = data_path_tmpl.format(chunk_index=pair[0], file_index=pair[1])
+    data_rels = list(seen_data.values())
+
+    video_refs: list[_VideoRef] = []
+    implied_end: dict[str, float] = {}
+    if meta.video_keys:
+        video_path_tmpl = meta.video_path
+        if video_path_tmpl is None:
+            raise ValueError(f"Dataset '{meta.repo_id}' has video_keys but no video_path template.")
+        columns = set(episodes.column_names)
+        starts = episodes["dataset_from_index"]
+        ends = episodes["dataset_to_index"]
+        fps = meta.fps
+        for key in meta.video_keys:
+            v_chunks = episodes[f"videos/{key}/chunk_index"]
+            v_files = episodes[f"videos/{key}/file_index"]
+            to_col = episodes[f"videos/{key}/to_timestamp"] if f"videos/{key}/to_timestamp" in columns else None
+            from_col = episodes[f"videos/{key}/from_timestamp"]
+            seen_vid: dict[tuple[int, int], str] = {}
+            for ep_idx, (chunk_idx, file_idx) in enumerate(zip(v_chunks, v_files, strict=True)):
+                pair = (int(chunk_idx), int(file_idx))
+                rel = seen_vid.get(pair)
+                if rel is None:
+                    rel = video_path_tmpl.format(video_key=key, chunk_index=pair[0], file_index=pair[1])
+                    seen_vid[pair] = rel
+                    video_refs.append(
+                        _VideoRef(
+                            video_key=key,
+                            chunk_index=pair[0],
+                            file_index=pair[1],
+                            rel_path=rel,
+                        )
+                    )
+                end_ts = (
+                    float(to_col[ep_idx])
+                    if to_col is not None
+                    else float(from_col[ep_idx]) + (int(ends[ep_idx]) - int(starts[ep_idx])) / fps
+                )
+                if end_ts > implied_end.get(rel, 0.0):
+                    implied_end[rel] = end_ts
+
+    return data_rels, video_refs, implied_end
+
+
+def _referenced_files(meta: LeRobotDatasetMetadata, root: Path) -> tuple[list[Path], list[Path]]:
+    """The data and video files ``meta/episodes`` references, in reading order."""
+    data_rels, video_refs, _ = _referenced_rel_paths(meta)
+    data_files = _unique(root / rel for rel in data_rels)
+    video_files = _unique(root / ref.rel_path for ref in video_refs)
     return data_files, video_files
 
 
 def _check_referenced_files_exist(root: Path, data_files: list[Path], video_files: list[Path]) -> None:
-    """Fail before writing anything when a referenced file is missing.
-
-    Selecting by metadata means a missing file can no longer hide behind the
-    old directory glob; the source dataset is incomplete and must be fixed.
-    """
+    """Fail before writing anything when a referenced file is missing."""
     missing = [path for path in data_files + video_files if not path.exists()]
     if not missing:
         return
@@ -214,6 +287,30 @@ def _warn_orphans(root: Path, data_files: list[Path], video_files: list[Path]) -
         )
 
 
+def _warn_remote_orphans(
+    all_rel_paths: Iterable[str],
+    referenced_data: set[str],
+    referenced_videos: set[str],
+) -> None:
+    """Report remote source files that ``meta/episodes`` never references; they are skipped."""
+    orphan_data = sorted(
+        rel for rel in all_rel_paths if rel.startswith("data/") and rel.endswith(".parquet") and rel not in referenced_data
+    )
+    if orphan_data:
+        print(
+            f"warning: skipping {len(orphan_data)} orphan parquet file(s) "
+            "not referenced by meta/episodes"
+        )
+    orphan_videos = sorted(
+        rel for rel in all_rel_paths if rel.startswith("videos/") and rel.endswith(".mp4") and rel not in referenced_videos
+    )
+    if orphan_videos:
+        print(
+            f"warning: skipping {len(orphan_videos)} orphan video file(s) "
+            "not referenced by meta/episodes"
+        )
+
+
 def _stamp_storage_format(meta_dir: Path) -> None:
     """Declare the Lance storage format in ``meta/info.json``.
 
@@ -227,30 +324,12 @@ def _stamp_storage_format(meta_dir: Path) -> None:
         info_file.write_text(json.dumps(info, indent=4))
 
 
-def _reject_damaged_source(src_root: Path, repo_id: str | None, allow_defects: bool) -> None:
-    """Run the doctor's checks and refuse a source whose referenced files are damaged.
-
-    Only defects in data an episode references block: those bytes end up in the
-    output, so ``berkeley_autolab_ur5``'s short aggregated videos would convert
-    silently and then crash the reader past the last real frame. Orphan parquet and
-    video findings do not block: they are not referenced data, and the converter's
-    file selection skips them (see ``_referenced_files``), so they never reach the
-    output.
-
-    ``allow_defects`` keeps the old copy-anything behavior for datasets that are
-    already published or under investigation, but says clearly what it lets through.
-    """
-    try:
-        result = audit(src_root, repo_id=repo_id)
-    except Exception as err:
-        raise DamagedSourceError(f"{src_root}: the source audit failed: {err}") from err
-
-    problems = result.blocking_problems
-    if not problems:
+def _handle_blocking_defects(source_label: str, messages: list[str], allow_defects: bool) -> None:
+    if not messages:
         return
-    listed = [f"  - {problem.message}" for problem in problems[:10]]
-    if len(problems) > 10:
-        listed.append(f"  ... and {len(problems) - 10} more")
+    listed = [f"  - {msg}" for msg in messages[:10]]
+    if len(messages) > 10:
+        listed.append(f"  ... and {len(messages) - 10} more")
     if allow_defects:
         print(
             "WARNING: --allow-defects: converting a damaged source dataset. The output keeps "
@@ -259,28 +338,167 @@ def _reject_damaged_source(src_root: Path, repo_id: str | None, allow_defects: b
         )
         return
     raise DamagedSourceError(
-        f"{src_root} is damaged in files its metadata references; refusing to convert it:\n"
+        f"{source_label} is damaged in files its metadata references; refusing to convert it:\n"
         + "\n".join(listed)
-        + "\nThe output would copy the damage. Run `lerobot-lance-doctor --root <dataset>` "
-        "for the full report, fix the source, or pass --allow-defects to convert anyway."
+        + "\nRun `lerobot-lance-doctor --root <dataset>` for a local report, fix the source, "
+        "or pass --allow-defects to convert anyway."
     )
 
 
-def convert(
-    out_dir: Path, repo_id: str | None = None, root: Path | None = None, allow_defects: bool = False
+def _reject_damaged_source(src_root: Path, repo_id: str | None, allow_defects: bool) -> None:
+    """Run the doctor's checks and refuse a source whose referenced files are damaged."""
+    try:
+        result = audit(src_root, repo_id=repo_id)
+    except Exception as err:
+        raise DamagedSourceError(f"{src_root}: the source audit failed: {err}") from err
+
+    problems = result.blocking_problems
+    _handle_blocking_defects(str(src_root), [p.message for p in problems], allow_defects)
+
+
+def _check_episode_boundaries(meta: LeRobotDatasetMetadata) -> list[str]:
+    starts = [int(x) for x in meta.episodes["dataset_from_index"]]
+    ends = [int(x) for x in meta.episodes["dataset_to_index"]]
+    problems: list[str] = []
+    if starts and starts[0] != 0:
+        problems.append(f"first episode starts at {starts[0]}, not 0")
+    if ends and ends[-1] != meta.total_frames:
+        problems.append(f"last episode ends at {ends[-1]}, meta declares {meta.total_frames}")
+    for i in range(len(starts) - 1):
+        if starts[i + 1] != ends[i]:
+            problems.append(f"gap/overlap between episode {i} (ends {ends[i]}) and {i + 1} (starts {starts[i + 1]})")
+    return problems
+
+
+def _video_blob_field() -> pa.Field:
+    blob_field = lancedb.blob(VIDEO_BLOB_COLUMN)
+    metadata = dict(blob_field.metadata or {})
+    metadata[b"lancedb:logical_type"] = b"mp4"
+    return blob_field.with_metadata(metadata)
+
+
+def _videos_schema() -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("video_key", pa.string()),
+            pa.field("chunk_index", pa.int64()),
+            pa.field("file_index", pa.int64()),
+            pa.field("file_size", pa.int64()),
+            pa.field("moov_offset", pa.int64()),
+            pa.field("moov_size", pa.int64()),
+            pa.field("kf_indices", pa.list_(pa.int64())),
+            pa.field("kf_positions", pa.list_(pa.int64())),
+            _video_blob_field(),
+        ]
+    )
+
+
+def _resolve_video_mode(
+    video_mode: VideoMode,
+    repo_id: str | None,
+    root: Path | str | None,
+    video_base_uri: str | None = None,
+) -> Literal["external", "copy"]:
+    if video_mode not in ("auto", "external", "copy"):
+        raise ValueError(f"Invalid video_mode={video_mode!r}: expected 'auto', 'external', or 'copy'")
+    if video_mode == "copy" and video_base_uri is not None:
+        raise ValueError("video_base_uri is only valid with video_mode='external' (or 'auto')")
+    if video_mode == "auto":
+        if video_base_uri is not None:
+            return "external"
+        if root is not None and not is_remote_uri(root) and not str(root).startswith("file://"):
+            return "copy"
+        return "external"
+    if video_mode == "copy" and root is not None and is_remote_uri(root):
+        raise ValueError(
+            f"video_mode='copy' requires a local --root directory, got remote URI {str(root)!r}; "
+            "use --video-mode external to convert remote datasets in place"
+        )
+    return video_mode
+
+
+def _connect_output(out_target: Path | str, storage_options: dict[str, str] | None):
+    uri = str(out_target)
+    if storage_options:
+        return lancedb.connect(uri, storage_options=dict(storage_options))
+    return lancedb.connect(uri)
+
+
+def _local_path(target: Path | str) -> Path:
+    raw = str(target)
+    return _file_uri_to_path(raw) if raw.startswith("file://") else Path(target)
+
+
+def _prepare_output_meta(src_meta_dir: Path, out_target: Path | str, staging_dir: Path) -> Path:
+    """Copy and stamp ``meta/`` into local ``out_target/meta`` or a temp dir for remote outputs."""
+    if is_remote_uri(out_target):
+        meta_dir = staging_dir / "_stamped_meta"
+        if meta_dir.exists():
+            shutil.rmtree(meta_dir)
+        shutil.copytree(src_meta_dir, meta_dir)
+        _stamp_storage_format(meta_dir)
+        return meta_dir
+
+    out_path = _local_path(out_target)
+    out_path.mkdir(parents=True, exist_ok=True)
+    meta_dir = out_path / "meta"
+    if not meta_dir.exists():
+        shutil.copytree(src_meta_dir, meta_dir)
+    _stamp_storage_format(meta_dir)
+    return meta_dir
+
+
+def _write_meta_and_frames(db, meta_dir: Path, data_files: list[Path]) -> None:
+    print("building meta table ...")
+    meta_schema = pa.schema([pa.field("path", pa.string()), pa.field("data", pa.large_binary())])
+    meta_files = sorted(f for f in meta_dir.rglob("*") if f.is_file())
+    db.create_table(
+        META_TABLE,
+        pa.Table.from_pylist(
+            [{"path": f.relative_to(meta_dir).as_posix(), "data": f.read_bytes()} for f in meta_files],
+            schema=meta_schema,
+        ),
+        mode="overwrite",
+    )
+    print(f"  {len(meta_files)} files")
+
+    print("building frames table ...")
+    db.create_table(FRAMES_TABLE, _frames_reader(data_files), mode="overwrite")
+    print(f"  {db.open_table(FRAMES_TABLE).count_rows()} rows")
+
+
+def _create_scalar_indexes(db, has_videos: bool) -> None:
+    # Scalar indexes: not used by the training loader (it reads by _rowid),
+    # but they make user-side SQL fast (episode/task filtering, exploration).
+    frames_table = db.open_table(FRAMES_TABLE)
+    frames_table.create_scalar_index("episode_index")
+    frames_table.create_scalar_index("task_index", index_type="BITMAP")
+    if has_videos:
+        videos_table = db.open_table(VIDEOS_TABLE)
+        videos_table.create_scalar_index("video_key", index_type="BITMAP")
+
+
+def _print_done(out_target: Path | str, extra: str = "") -> None:
+    suffix = f" ({extra})" if extra else ""
+    if is_remote_uri(out_target):
+        print(f"done: {out_target}{suffix}")
+        return
+    out_path = _local_path(out_target)
+    total = sum(f.stat().st_size for f in out_path.rglob("*") if f.is_file())
+    detail = f"{total / 1e6:.1f} MB" + (f", {extra}" if extra else "")
+    print(f"done: {out_path} ({detail})")
+
+
+def _convert_copy(
+    out_target: Path | str,
+    *,
+    repo_id: str | None,
+    root: Path | str | None,
+    allow_defects: bool,
+    storage_options: dict[str, str] | None,
 ) -> None:
-    """Convert one LeRobot v3.0 dataset to the three-table Lance layout.
-
-    Pass ``root`` to convert a dataset already on disk (nothing is
-    downloaded), or ``repo_id`` alone to download from the Hub first
-    (into ``$HF_LEROBOT_HOME``, like any other lerobot tool).
-
-    The source is audited with the doctor's checks before anything is written, so
-    a dataset that is damaged where episodes reference it fails here instead of
-    producing an unreadable output; ``allow_defects`` overrides that refusal.
-    """
     if root is not None:
-        src_root = Path(root)
+        src_root = _local_path(root)
         if not (src_root / "meta").is_dir():
             raise FileNotFoundError(f"{src_root} does not look like a LeRobot dataset (no meta/ dir)")
     elif repo_id is not None:
@@ -300,95 +518,345 @@ def convert(
     _check_referenced_files_exist(src_root, data_files, video_files)
     _warn_orphans(src_root, data_files, video_files)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if not (out_dir / "meta").exists():
-        shutil.copytree(src_root / "meta", out_dir / "meta")
-    _stamp_storage_format(out_dir / "meta")
+    with tempfile.TemporaryDirectory(prefix="lerobot-lance-convert-") as tmp:
+        meta_dir = _prepare_output_meta(src_root / "meta", out_target, Path(tmp))
+        db = _connect_output(out_target, storage_options)
+        _write_meta_and_frames(db, meta_dir, data_files)
 
-    db = lancedb.connect(str(out_dir))
+        print(f"building videos table from {len(video_files)} files (managed copy) ...")
+        schema = _videos_schema()
+        db.drop_table(VIDEOS_TABLE, ignore_missing=True)
+        videos_table = db.create_table(VIDEOS_TABLE, schema=schema, mode="create")
+        # Build streamed batches with the blob column as its STORAGE type
+        # (large_binary): pyarrow can't construct the blob-v2 extension array from
+        # raw bytes, but lance encodes incoming large_binary into the managed blob
+        # column on write (matched by name).
+        storage_schema = pa.schema(
+            [pa.field(VIDEO_BLOB_COLUMN, pa.large_binary()) if f.name == VIDEO_BLOB_COLUMN else f for f in schema]
+        )
 
-    print("building meta table ...")
-    # Read from out_dir/meta (the stamped copy) so the meta table — what remote
-    # roots materialize meta/ from — carries storage_format too.
-    meta_schema = pa.schema([pa.field("path", pa.string()), pa.field("data", pa.large_binary())])
-    meta_files = sorted(f for f in (out_dir / "meta").rglob("*") if f.is_file())
-    db.create_table(
-        META_TABLE,
-        pa.Table.from_pylist(
-            [{"path": str(f.relative_to(out_dir / "meta")), "data": f.read_bytes()} for f in meta_files],
-            schema=meta_schema,
-        ),
-        mode="overwrite",
-    )
-    print(f"  {len(meta_files)} files")
-
-    print("building frames table ...")
-    db.create_table(FRAMES_TABLE, _frames_reader(data_files), mode="overwrite")
-    print(f"  {db.open_table(FRAMES_TABLE).count_rows()} rows")
-
-    print(f"building videos table from {len(video_files)} files ...")
-    schema = pa.schema(
-        [
-            pa.field("video_key", pa.string()),
-            pa.field("chunk_index", pa.int64()),
-            pa.field("file_index", pa.int64()),
-            pa.field("file_size", pa.int64()),
-            pa.field("moov_offset", pa.int64()),
-            pa.field("moov_size", pa.int64()),
-            pa.field("kf_indices", pa.list_(pa.int64())),
-            pa.field("kf_positions", pa.list_(pa.int64())),
-            lancedb.blob(VIDEO_BLOB_COLUMN),
-        ]
-    )
-    videos_table = db.create_table(VIDEOS_TABLE, schema=schema, mode="overwrite")
-    # Build streamed batches with the blob column as its STORAGE type
-    # (large_binary): pyarrow can't construct the blob-v2 extension array from raw
-    # bytes, but lance encodes incoming large_binary into the managed blob column
-    # on write (matched by name), same as the list-of-dicts add path did.
-    storage_schema = pa.schema(
-        [pa.field(VIDEO_BLOB_COLUMN, pa.large_binary()) if f.name == VIDEO_BLOB_COLUMN else f for f in schema]
-    )
-
-    def video_batches():
-        # Yield ~VIDEO_BATCH_BYTES record batches lazily so peak producer memory
-        # stays bounded, but stream them through ONE videos_table.add() below.
-        # Lance keeps a single writer open across the batches, so the whole videos
-        # table is one commit with Lance-sized fragments -- instead of one commit
-        # (a new version + fragments) per 512 MB, which fragments the dataset and
-        # multiplies manifest/scan/object-open work for every training worker.
-        pending, pending_bytes = [], 0
-        for mp4 in video_files:
-            data = mp4.read_bytes()
-            pending.append(
-                {
-                    "video_key": mp4.parts[-3],
-                    "chunk_index": int(mp4.parent.name.split("-")[1]),
-                    "file_index": int(mp4.stem.split("-")[1]),
-                    **build_video_byte_index(mp4),
-                    VIDEO_BLOB_COLUMN: data,
-                }
-            )
-            pending_bytes += len(data)
-            if pending_bytes >= VIDEO_BATCH_BYTES:
+        def video_batches():
+            pending, pending_bytes = [], 0
+            for mp4 in video_files:
+                data = mp4.read_bytes()
+                pending.append(
+                    {
+                        "video_key": mp4.parts[-3],
+                        "chunk_index": int(mp4.parent.name.split("-")[1]),
+                        "file_index": int(mp4.stem.split("-")[1]),
+                        **build_video_byte_index(mp4),
+                        VIDEO_BLOB_COLUMN: data,
+                    }
+                )
+                pending_bytes += len(data)
+                if pending_bytes >= VIDEO_BATCH_BYTES:
+                    yield pa.RecordBatch.from_pylist(pending, schema=storage_schema)
+                    pending, pending_bytes = [], 0
+            if pending:
                 yield pa.RecordBatch.from_pylist(pending, schema=storage_schema)
-                pending, pending_bytes = [], 0
-        if pending:
-            yield pa.RecordBatch.from_pylist(pending, schema=storage_schema)
 
-    if video_files:
-        videos_table.add(pa.RecordBatchReader.from_batches(storage_schema, video_batches()))
-    print(f"  {videos_table.count_rows()} rows")
+        if video_files:
+            videos_table.add(pa.RecordBatchReader.from_batches(storage_schema, video_batches()))
+        print(f"  {videos_table.count_rows()} rows")
 
-    # Scalar indexes: not used by the training loader (it reads by _rowid),
-    # but they make user-side SQL fast (episode/task filtering, exploration).
-    frames_table = db.open_table(FRAMES_TABLE)
-    frames_table.create_scalar_index("episode_index")
-    frames_table.create_scalar_index("task_index", index_type="BITMAP")
-    if video_files:
-        videos_table.create_scalar_index("video_key", index_type="BITMAP")
+        _create_scalar_indexes(db, has_videos=bool(video_files))
+        _print_done(out_target)
 
-    total = sum(f.stat().st_size for f in out_dir.rglob("*") if f.is_file())
-    print(f"done: {out_dir} ({total / 1e6:.1f} MB)")
+
+def _external_video_uri(base_uri: str, rel_path: str) -> str:
+    clean_base = base_uri.rstrip("/")
+    if clean_base.endswith("/videos") and rel_path.startswith("videos/"):
+        sub_rel = rel_path[len("videos/") :]
+    else:
+        sub_rel = rel_path.lstrip("/")
+    if clean_base.startswith("file://"):
+        sub_rel = quote(sub_rel, safe="/")
+    return f"{clean_base}/{sub_rel}"
+
+
+def _convert_external(
+    out_target: Path | str,
+    *,
+    repo_id: str | None,
+    root: Path | str | None,
+    allow_defects: bool,
+    video_base_uri: str | None,
+    revision: str | None,
+    storage_options: dict[str, str] | None,
+    source_storage_options: dict[str, str] | None,
+    video_workers: int,
+    header_probe_bytes: int,
+) -> None:
+    src_opts = source_storage_options if source_storage_options is not None else storage_options
+    with (
+        open_source(
+            repo_id=repo_id,
+            root=root,
+            revision=revision,
+            storage_options=src_opts,
+            max_workers=video_workers,
+        ) as source,
+        tempfile.TemporaryDirectory(prefix="lerobot-lance-convert-") as tmp,
+    ):
+        staging = Path(tmp)
+        source_files = source.list_files()
+        meta_root = source.materialize_meta(staging)
+        meta = LeRobotDatasetMetadata(repo_id or source.root_label, root=meta_root)
+        data_rels, video_refs, implied_end = _referenced_rel_paths(meta)
+        video_rels = [ref.rel_path for ref in video_refs]
+
+        # Run BOUNDARIES, DATA, VIDEOS, and SUPPLY checks before writing any output,
+        # without downloading MP4 payloads.
+        blocking: list[str] = _check_episode_boundaries(meta)
+
+        missing_data = [rel for rel in data_rels if rel not in source_files]
+        for rel in missing_data:
+            blocking.append(f"missing referenced parquet: {rel}")
+
+        data_paths: list[Path] = []
+        if not missing_data and data_rels:
+            data_paths = source.materialize_data(data_rels, staging)
+            parquet_rows = sum(pq.read_metadata(p).num_rows for p in data_paths)
+            if parquet_rows != meta.total_frames:
+                blocking.append(
+                    f"referenced parquets hold {parquet_rows} rows, meta declares {meta.total_frames}"
+                )
+
+        missing_videos = [rel for rel in video_rels if rel not in source_files]
+        zero_videos = [rel for rel in video_rels if rel in source_files and source_files[rel].size == 0]
+        for rel in missing_videos:
+            blocking.append(f"missing referenced video: {rel}")
+        for rel in zero_videos:
+            blocking.append(f"zero-byte video: {rel}")
+
+        probe_targets = [rel for rel in video_rels if rel in source_files and source_files[rel].size > 0]
+        probed: dict[str, ProbedMp4] = {}
+        probe_errors: dict[str, Exception] = {}
+
+        if probe_targets:
+            print(f"probing {len(probe_targets)} video(s) via range reads ...")
+
+            def _probe_one(rel: str) -> tuple[str, ProbedMp4]:
+                res = probe_mp4_byte_index(
+                    rel,
+                    source.read_range,
+                    file_size=source_files[rel].size,
+                    header_probe_bytes=header_probe_bytes,
+                )
+                return rel, res
+
+            with ThreadPoolExecutor(max_workers=max(1, video_workers)) as pool:
+                futs = {pool.submit(_probe_one, rel): rel for rel in probe_targets}
+                for fut in as_completed(futs):
+                    rel = futs[fut]
+                    try:
+                        _, res = fut.result()
+                        probed[rel] = res
+                    except Exception as err:
+                        probe_errors[rel] = err
+                        blocking.append(f"unreadable video {rel}: {err}")
+
+            for rel in probe_targets:
+                res = probed.get(rel)
+                if res is None:
+                    continue
+                implied_frames = round(implied_end[rel] * meta.fps)
+                if res.sample_count < implied_frames:
+                    blocking.append(
+                        f"{rel}: container declares {res.sample_count} frames, episodes imply "
+                        f"{implied_frames} (short by {implied_frames - res.sample_count})"
+                    )
+
+        _handle_blocking_defects(source.root_label, blocking, allow_defects)
+
+        missing_all = missing_data + missing_videos
+        if missing_all:
+            shown = ", ".join(missing_all[:5])
+            more = f" and {len(missing_all) - 5} more" if len(missing_all) > 5 else ""
+            raise FileNotFoundError(
+                f"{len(missing_all)} file(s) referenced by meta/episodes are missing under "
+                f"{source.root_label}: {shown}{more}; the source dataset is incomplete"
+            )
+        if zero_videos or probe_errors:
+            first_rel = zero_videos[0] if zero_videos else next(iter(probe_errors))
+            if first_rel in probe_errors:
+                raise probe_errors[first_rel]
+            raise ValueError(f"Cannot index zero-byte video {first_rel!r}")
+
+        if isinstance(source, LocalSource):
+            _warn_orphans(source.root, data_paths, [source.root / r for r in video_rels])
+        else:
+            _warn_remote_orphans(source_files.keys(), set(data_rels), set(video_rels))
+
+        meta_dir = _prepare_output_meta(meta_root / "meta", out_target, staging)
+        db = _connect_output(out_target, storage_options)
+        _write_meta_and_frames(db, meta_dir, data_paths)
+
+        schema = _videos_schema()
+        db.drop_table(VIDEOS_TABLE, ignore_missing=True)
+
+        if video_refs:
+            resolved_base_uri = (video_base_uri or source.default_video_base_uri(video_rels)).rstrip("/")
+            print(
+                f"building videos table from {len(video_refs)} external video(s) "
+                f"(base: {resolved_base_uri}) ..."
+            )
+
+            def ext_video_batches():
+                rows: list[dict] = []
+                uris: list[str] = []
+                positions: list[int] = []
+                sizes: list[int] = []
+                pending_bytes = 0
+
+                def flush() -> pa.RecordBatch:
+                    arrays = [
+                        pa.array([r["video_key"] for r in rows], type=pa.string()),
+                        pa.array([r["chunk_index"] for r in rows], type=pa.int64()),
+                        pa.array([r["file_index"] for r in rows], type=pa.int64()),
+                        pa.array([r["file_size"] for r in rows], type=pa.int64()),
+                        pa.array([r["moov_offset"] for r in rows], type=pa.int64()),
+                        pa.array([r["moov_size"] for r in rows], type=pa.int64()),
+                        pa.array([r["kf_indices"] for r in rows], type=pa.list_(pa.int64())),
+                        pa.array([r["kf_positions"] for r in rows], type=pa.list_(pa.int64())),
+                        lancedb.blob_uri_array(uris, positions=positions, sizes=sizes),
+                    ]
+                    return pa.RecordBatch.from_arrays(arrays, schema=schema)
+
+                for ref in video_refs:
+                    p = probed[ref.rel_path]
+                    rows.append(
+                        {
+                            "video_key": ref.video_key,
+                            "chunk_index": ref.chunk_index,
+                            "file_index": ref.file_index,
+                            **p.to_index_dict(),
+                        }
+                    )
+                    uris.append(_external_video_uri(resolved_base_uri, ref.rel_path))
+                    positions.append(0)
+                    sizes.append(p.file_size)
+                    pending_bytes += len(p.kf_indices) * 16 + 256
+                    if pending_bytes >= EXTERNAL_VIDEO_BATCH_BYTES:
+                        yield flush()
+                        rows, uris, positions, sizes, pending_bytes = [], [], [], [], 0
+                if rows:
+                    yield flush()
+
+            videos_table = db.create_table(
+                VIDEOS_TABLE,
+                pa.RecordBatchReader.from_batches(schema, ext_video_batches()),
+                schema=schema,
+                mode="create",
+                initial_bases=[lancedb.BasePath(path=resolved_base_uri, name="source_videos", id=1)],
+            )
+            total_reads = sum(p.range_gets for p in probed.values())
+            total_bytes_read = sum(p.bytes_read for p in probed.values())
+            total_video_bytes = sum(p.file_size for p in probed.values())
+            print(
+                f"  {videos_table.count_rows()} rows "
+                f"({total_reads} range GETs, {total_bytes_read / 1e6:.1f} MB read vs "
+                f"{total_video_bytes / 1e9:.2f} GB source MP4s)"
+            )
+            _create_scalar_indexes(db, has_videos=True)
+            _print_done(out_target, extra=f"external base: {resolved_base_uri}")
+        else:
+            videos_table = db.create_table(VIDEOS_TABLE, schema=schema, mode="create")
+            print("  0 rows")
+            _create_scalar_indexes(db, has_videos=False)
+            _print_done(out_target)
+
+
+def convert(
+    out_dir: Path | str,
+    repo_id: str | None = None,
+    root: Path | str | None = None,
+    allow_defects: bool = False,
+    *,
+    video_mode: VideoMode = "auto",
+    video_base_uri: str | None = None,
+    revision: str | None = None,
+    storage_options: dict[str, str] | None = None,
+    source_storage_options: dict[str, str] | None = None,
+    video_workers: int = DEFAULT_IO_WORKERS,
+    header_probe_bytes: int = DEFAULT_HEADER_PROBE_BYTES,
+) -> None:
+    """Convert one LeRobot v3.0 dataset to the three-table Lance layout.
+
+    Parameters
+    ----------
+    out_dir:
+        Local directory or object-store URI (``s3://``, ``gs://``, ``hf://``)
+        where the Lance tables are written.
+    repo_id:
+        Hugging Face Hub dataset id (e.g. ``lerobot/droid_1.0.1``). In
+        ``external`` mode (the default for ``repo_id``), no MP4s are downloaded
+        and external descriptors are pinned to the resolved 40-char commit SHA.
+    root:
+        Local LeRobot dataset directory or object-store URI (``s3://``, ``gs://``,
+        ``hf://``, ``file://``).
+    allow_defects:
+        Convert even when source checks find defects in referenced files.
+    video_mode:
+        ``"auto"`` (default): ``"external"`` for remote ``root`` URIs and
+        ``repo_id``; ``"copy"`` for local directory ``root``. Pass ``"external"``
+        to write zero-copy External Blob v2 descriptors without copying MP4s, or
+        ``"copy"`` to embed MP4 bytes as managed blobs.
+    video_base_uri:
+        Optional explicit base URI registered in ``initial_bases`` for external
+        video descriptors (e.g. an ``s3://`` prefix when indexing from a local
+        mirror).
+    revision:
+        Optional Hugging Face Hub revision (branch, tag, or commit SHA).
+    storage_options:
+        Optional storage options forwarded to ``lancedb.connect`` (and to the
+        remote source unless ``source_storage_options`` is given).
+    source_storage_options:
+        Optional separate storage options for reading the remote source.
+    video_workers:
+        Concurrent range-read workers for external MP4 probing.
+    header_probe_bytes:
+        Initial prefix read size per MP4 when locating ``moov`` (default 1 MiB).
+    """
+    if repo_id is None and root is None:
+        raise ValueError("pass --repo-id or --root")
+
+    mode = _resolve_video_mode(video_mode, repo_id, root, video_base_uri=video_base_uri)
+    if mode == "external":
+        _convert_external(
+            out_dir,
+            repo_id=repo_id,
+            root=root,
+            allow_defects=allow_defects,
+            video_base_uri=video_base_uri,
+            revision=revision,
+            storage_options=storage_options,
+            source_storage_options=source_storage_options,
+            video_workers=video_workers,
+            header_probe_bytes=header_probe_bytes,
+        )
+    else:
+        _convert_copy(
+            out_dir,
+            repo_id=repo_id,
+            root=root,
+            allow_defects=allow_defects,
+            storage_options=storage_options,
+        )
+
+
+def _parse_kv_options(items: list[str] | None, parser: argparse.ArgumentParser) -> dict[str, str] | None:
+    if not items:
+        return None
+    parsed: dict[str, str] = {}
+    for item in items:
+        if "=" not in item:
+            parser.error(f"invalid storage option {item!r}: expected KEY=VALUE")
+        key, value = item.split("=", 1)
+        if not key:
+            parser.error(f"invalid storage option {item!r}: empty key")
+        parsed[key] = value
+    return parsed
 
 
 def main() -> None:
@@ -396,25 +864,88 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--repo-id", default=None, help="Hub dataset id, e.g. lerobot/pusht (downloads if not cached)"
+        "--repo-id",
+        default=None,
+        help="Hub dataset id, e.g. lerobot/droid_1.0.1 (zero-copy external by default)",
     )
     parser.add_argument(
-        "--root", default=None, type=Path, help="local LeRobot dataset dir (nothing is downloaded)"
+        "--root",
+        default=None,
+        help="local LeRobot dataset dir or remote URI (s3://, gs://, hf://, file://)",
     )
-    parser.add_argument("--out", required=True, type=Path, help="output directory for the Lance layout")
+    parser.add_argument(
+        "--out",
+        required=True,
+        help="output local directory or remote URI (s3://, gs://, hf://) for the Lance layout",
+    )
+    parser.add_argument(
+        "--video-mode",
+        choices=["auto", "external", "copy"],
+        default="auto",
+        help=(
+            "how to store videos in videos.lance: 'external' writes zero-copy External Blob v2 "
+            "descriptors without downloading/copying MP4s; 'copy' embeds MP4 bytes as managed "
+            "blobs; 'auto' (default) uses 'external' for remote/--repo-id sources and 'copy' for local dirs"
+        ),
+    )
+    parser.add_argument(
+        "--video-base-uri",
+        default=None,
+        help="explicit base URI registered in initial_bases for external video descriptors",
+    )
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="Hugging Face Hub revision (branch, tag, or commit SHA; pinned to commit SHA in external mode)",
+    )
+    parser.add_argument(
+        "--storage-option",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help="storage option forwarded to LanceDB and remote source (repeatable, e.g. aws_region=us-east-2)",
+    )
+    parser.add_argument(
+        "--source-storage-option",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help="storage option for reading the remote source only (overrides --storage-option for source reads)",
+    )
+    parser.add_argument(
+        "--video-workers",
+        type=int,
+        default=DEFAULT_IO_WORKERS,
+        help=f"concurrent range-read workers in external mode (default: {DEFAULT_IO_WORKERS})",
+    )
     parser.add_argument(
         "--allow-defects",
         action="store_true",
         help=(
-            "convert even when the doctor finds defects in files episodes reference; "
+            "convert even when source checks find defects in files episodes reference; "
             "the output keeps them"
         ),
     )
     args = parser.parse_args()
     if args.repo_id is None and args.root is None:
         parser.error("pass --repo-id and/or --root")
+
+    storage_options = _parse_kv_options(args.storage_option, parser)
+    source_storage_options = _parse_kv_options(args.source_storage_option, parser)
+
     try:
-        convert(args.out, repo_id=args.repo_id, root=args.root, allow_defects=args.allow_defects)
+        convert(
+            args.out,
+            repo_id=args.repo_id,
+            root=args.root,
+            allow_defects=args.allow_defects,
+            video_mode=args.video_mode,
+            video_base_uri=args.video_base_uri,
+            revision=args.revision,
+            storage_options=storage_options,
+            source_storage_options=source_storage_options,
+            video_workers=args.video_workers,
+        )
     except DamagedSourceError as err:
         parser.exit(1, f"\n{err}\n")
 

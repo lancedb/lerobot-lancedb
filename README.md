@@ -48,14 +48,15 @@ walkthrough](https://github.com/lancedb/lerobot-lancedb/blob/main/docs/walkthrou
 pip install --extra-index-url https://pypi.fury.io/lancedb/ lerobot-lancedb
 ```
 
-The extra index is needed because `lancedb>=0.37.1b0` (blob v2 + `fetch_blob_ranges`,
-what makes the remote reads fast) is a beta, published on fury.io, not PyPI yet.
+The extra index is needed because `lancedb>=0.42.0b26` (External Blob v2
+`initial_bases`, commit-pinned `hf://`, and `fetch_blob_ranges`) is a beta,
+published on fury.io, not PyPI yet.
 
 | dependency | floor | why |
 |---|---|---|
 | `lerobot` | `>=0.6.0` | metadata, feature, depth and video utilities the converter and loader reuse |
-| `lancedb` | `>=0.37.1b0` | blob v2 columns + `fetch_blob_ranges` |
-| `av` | `>=12` | byte-index construction and container inspection |
+| `lancedb` | `>=0.42.0b26` | External Blob v2 `initial_bases`, commit-pinned `hf://`, and `fetch_blob_ranges` |
+| `av` | `>=12` | byte-index construction (`copy` mode) and container inspection (`doctor`) |
 
 `lerobot` also supplies the loader's heavy deps (torch, torchcodec, numpy), so
 they're pinned there.
@@ -63,14 +64,24 @@ they're pinned there.
 ## Convert
 
 ```bash
-# from the Hub (downloads if not cached):
-lerobot-lance-convert --repo-id lerobot/pusht --out ./pusht-lance
-# or a dataset already on disk (nothing downloaded):
+# Zero-copy from S3 to S3 (0 bytes of MP4 downloaded or copied):
+lerobot-lance-convert --root s3://bucket/droid --out s3://bucket/droid-lance
+
+# Zero-copy from Hugging Face Hub (pins external base to the resolved 40-char commit SHA):
+lerobot-lance-convert --repo-id lerobot/droid_1.0.1 --out ./droid-lance
+
+# Local dataset (copies MP4s by default; pass --video-mode external to reference in place):
 lerobot-lance-convert --root /path/to/dataset --out ./my-lance
 ```
 
-Then push `./pusht-lance/` to object storage (`aws s3 cp --recursive`, etc.) and
-point training at the URI.
+`--video-mode` defaults to `auto`: remote roots (`s3://`, `gs://`, `hf://`, and
+`--repo-id`) write zero-copy External Blob v2 descriptors (`external`) by
+range-reading only each MP4's `moov` header, while local directory roots copy
+MP4s into managed blobs (`copy`) so removing the source directory does not break
+the output. Pass `--video-mode external` or `--video-mode copy` to override, and
+`--video-base-uri` when indexing from a local mirror of an object-store bucket.
+For local outputs converted in `copy` mode, push `./my-lance/` to object storage
+(`aws s3 cp --recursive`, etc.) and point training at the URI.
 
 The conversion runs the doctor's checks on the source first and refuses a dataset
 that is damaged where its own metadata references it - short aggregated videos,
@@ -130,11 +141,13 @@ else in `meta/` is copied verbatim:
   Row N is frame N, so a batch of indices is one point-read, no index structure
   needed. Numeric vectors become fixed-size lists; language columns
   (lerobot#3467) keep their nested `list<struct>` with extension types stripped.
-- **`videos.lance`** - each mp4 verbatim in a blob v2 column, plus byte-index
-  columns (`file_size`, `moov_offset`, `moov_size`, `kf_indices`, `kf_positions`).
-  The loader turns a frame window into a keyframe-aligned byte range and fetches a
-  whole batch's video bytes in one `fetch_blob_ranges`: an 8-frame window costs
-  ~100 KB of transfer, not the whole file.
+- **`videos.lance`** - one row per source mp4: either an External Blob v2
+  descriptor referencing the original mp4 in place (`--video-mode external`) or
+  the mp4 verbatim in a managed blob v2 column (`--video-mode copy`), plus
+  byte-index columns (`file_size`, `moov_offset`, `moov_size`, `kf_indices`,
+  `kf_positions`). The loader turns a frame window into a keyframe-aligned byte
+  range and fetches a whole batch's video bytes in one `fetch_blob_ranges`: an
+  8-frame window costs ~100 KB of transfer, not the whole file.
 - **`meta.lance`** - the `meta/` files as `(path, bytes)`, so a remote root can
   materialize `meta/` through the same Lance connection instead of a side channel
   (droid's per-episode stats alone are 566 MB).
