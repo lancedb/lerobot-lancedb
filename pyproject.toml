@@ -45,7 +45,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+s3 = [
+    "boto3>=1.28.0",
+]
+gcs = [
+    "gcsfs>=2024.2.0",
+]
+cloud = [
+    "boto3>=1.28.0",
+    "gcsfs>=2024.2.0",
+]
 dev = [
+    "boto3>=1.28.0",
+    "pytest>=8.0",
     "ruff>=0.14.1",
     "build>=1.2",
     "twine>=5.1",

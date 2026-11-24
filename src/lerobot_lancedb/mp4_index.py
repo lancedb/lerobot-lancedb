@@ -61,8 +61,8 @@ class ProbedMp4:
     file_size: int
     moov_offset: int
     moov_size: int
-    kf_indices: list[int]
-    kf_positions: list[int]
+    kf_indices: NDArray[np.int64]
+    kf_positions: NDArray[np.int64]
     sample_count: int
     fps: float
     faststart: bool
@@ -75,8 +75,8 @@ class ProbedMp4:
             "file_size": self.file_size,
             "moov_offset": self.moov_offset,
             "moov_size": self.moov_size,
-            "kf_indices": self.kf_indices,
-            "kf_positions": self.kf_positions,
+            "kf_indices": self.kf_indices.tolist(),
+            "kf_positions": self.kf_positions.tolist(),
         }
 
 
@@ -220,13 +220,14 @@ def _parse_ctts(stbl: bytes, sample_count: int) -> NDArray[np.int64]:
     return np.repeat(offsets, counts)
 
 
-def _parse_edit_offset(trak: bytes, movie_timescale: int, media_timescale: int) -> float:
+def _parse_edit_list(trak: bytes) -> tuple[int, int] | None:
+    """Return ``(empty_duration_movie_ticks, media_time_ticks)`` for a single rate-1 edit, or None."""
     edts = _find_optional_child(trak, b"edts")
     if edts is None:
-        return 0.0
+        return None
     elst = _find_optional_child(trak[edts.payload_start : edts.end], b"elst")
     if elst is None:
-        return 0.0
+        return None
     payload = trak[edts.payload_start + elst.payload_start : edts.payload_start + elst.end]
     if len(payload) < 8:
         raise ValueError("Truncated elst box")
@@ -235,7 +236,7 @@ def _parse_edit_offset(trak: bytes, movie_timescale: int, media_timescale: int) 
         raise ValueError(f"Unsupported elst version {version}")
     count = struct.unpack_from(">I", payload, 4)[0]
     if count == 0:
-        return 0.0
+        return None
     entry_size = 20 if version == 1 else 12
     if 8 + count * entry_size > len(payload):
         raise ValueError(f"Malformed elst: count {count} exceeds box length {len(payload)}")
@@ -248,7 +249,7 @@ def _parse_edit_offset(trak: bytes, movie_timescale: int, media_timescale: int) 
         empty_duration = entries.pop(0)[0]
     if len(entries) != 1 or entries[0][1] < 0 or entries[0][2:] != (1, 0):
         raise ValueError(f"Unsupported MP4 edit list (entries={entries!r}): expected one rate-one media edit")
-    return empty_duration / movie_timescale - entries[0][1] / media_timescale
+    return empty_duration, entries[0][1]
 
 
 def _parse_stsz(payload: bytes) -> NDArray[np.int64]:
@@ -265,6 +266,50 @@ def _parse_stsz(payload: bytes) -> NDArray[np.int64]:
             f"Malformed stsz: sample_count={sample_count} requires {required} bytes, box has {len(payload)}"
         )
     return np.frombuffer(payload, dtype=">u4", count=sample_count, offset=12).astype(np.int64)
+
+
+def _parse_stz2(payload: bytes) -> NDArray[np.int64]:
+    if len(payload) < 12:
+        raise ValueError("Truncated stz2 box")
+    field_size = payload[7]
+    sample_count = struct.unpack_from(">I", payload, 8)[0]
+    if field_size == 16:
+        required = 12 + sample_count * 2
+        if required > len(payload):
+            raise ValueError(
+                f"Malformed stz2: sample_count={sample_count} requires {required} bytes, box has {len(payload)}"
+            )
+        return np.frombuffer(payload, dtype=">u2", count=sample_count, offset=12).astype(np.int64)
+    if field_size == 8:
+        required = 12 + sample_count
+        if required > len(payload):
+            raise ValueError(
+                f"Malformed stz2: sample_count={sample_count} requires {required} bytes, box has {len(payload)}"
+            )
+        return np.frombuffer(payload, dtype=np.uint8, count=sample_count, offset=12).astype(np.int64)
+    if field_size == 4:
+        nbytes = (sample_count + 1) // 2
+        required = 12 + nbytes
+        if required > len(payload):
+            raise ValueError(
+                f"Malformed stz2: sample_count={sample_count} requires {required} bytes, box has {len(payload)}"
+            )
+        raw = np.frombuffer(payload, dtype=np.uint8, count=nbytes, offset=12)
+        out = np.empty(nbytes * 2, dtype=np.int64)
+        out[0::2] = (raw >> 4) & 0x0F
+        out[1::2] = raw & 0x0F
+        return out[:sample_count]
+    raise ValueError(f"Unsupported stz2 field_size={field_size}")
+
+
+def _parse_sample_sizes(stbl: bytes) -> NDArray[np.int64]:
+    stsz = _find_optional_child(stbl, b"stsz")
+    if stsz is not None:
+        return _parse_stsz(stbl[stsz.payload_start : stsz.end])
+    stz2 = _find_optional_child(stbl, b"stz2")
+    if stz2 is not None:
+        return _parse_stz2(stbl[stz2.payload_start : stz2.end])
+    raise ValueError("Missing MP4 box stsz/stz2")
 
 
 def _parse_stsc(payload: bytes) -> list[tuple[int, int, int]]:
@@ -286,7 +331,10 @@ def _parse_chunk_offsets(stbl: bytes) -> NDArray[np.int64]:
         count = struct.unpack_from(">I", payload, 4)[0]
         if 8 + count * 8 > len(payload):
             raise ValueError(f"Malformed co64: count={count} exceeds box length {len(payload)}")
-        return np.frombuffer(payload, dtype=">u8", count=count, offset=8).astype(np.int64)
+        raw = np.frombuffer(payload, dtype=">u8", count=count, offset=8)
+        if raw.size and int(raw.max()) > np.iinfo(np.int64).max:
+            raise ValueError("Malformed co64: chunk offset exceeds int64 range")
+        return raw.astype(np.int64)
     stco = _find_optional_child(stbl, b"stco")
     if stco is None:
         raise ValueError("Missing stco/co64 chunk offsets")
@@ -370,7 +418,10 @@ def _parse_moov_keyframes(
     moov_payload: bytes,
     *,
     path: str,
-) -> tuple[list[int], list[int], int, float]:
+    mdat_payload_start: int,
+    mdat_end: int,
+    file_size: int,
+) -> tuple[NDArray[np.int64], NDArray[np.int64], int, float]:
     """Parse keyframe indices/positions, sample count, and average fps from a ``moov`` payload."""
     if _find_optional_child(moov_payload, b"mvex") is not None:
         raise ValueError(f"{path}: fragmented MP4 (mvex box in moov) is not supported")
@@ -382,7 +433,7 @@ def _parse_moov_keyframes(
     )
     stbl = _find_descendant(trak_payload, [b"mdia", b"minf", b"stbl"])
 
-    sample_sizes = _parse_stsz(_find_child_payload(stbl, b"stsz"))
+    sample_sizes = _parse_sample_sizes(stbl)
     n_samples = len(sample_sizes)
     if n_samples == 0:
         raise ValueError(f"{path}: video track has 0 samples")
@@ -399,25 +450,45 @@ def _parse_moov_keyframes(
     if len(sync_samples) == 0:
         raise ValueError(f"{path}: no sync samples (empty kf_positions)")
 
+    sample_offsets = _compute_sample_offsets(stsc, chunk_offsets, sample_sizes)
+    min_offset = int(sample_offsets.min())
+    if min_offset < 0 or bool((sample_offsets > file_size - sample_sizes).any()):
+        max_end = int((sample_offsets + sample_sizes).max())
+        raise ValueError(
+            f"{path}: truncated MP4 (sample byte range [{min_offset}, {max_end}) exceeds file_size={file_size})"
+        )
+    if min_offset < mdat_payload_start or bool((sample_offsets > mdat_end - sample_sizes).any()):
+        max_end = int((sample_offsets + sample_sizes).max())
+        raise ValueError(
+            f"{path}: sample byte range [{min_offset}, {max_end}) falls outside "
+            f"mdat [{mdat_payload_start}, {mdat_end})"
+        )
+
     sample_pts_units = np.empty(n_samples, dtype=np.int64)
     sample_pts_units[0] = 0
     if n_samples > 1:
         np.cumsum(sample_durations[:-1], out=sample_pts_units[1:])
     composition_offsets = _parse_ctts(stbl, n_samples)
-    edit_offset = _parse_edit_offset(trak_payload, movie_timescale, media_timescale)
-    sample_pts = (sample_pts_units + composition_offsets).astype(np.float64) / float(media_timescale)
-    sample_pts += edit_offset
-    sample_offsets = _compute_sample_offsets(stsc, chunk_offsets, sample_sizes)
+    raw_pts_units = sample_pts_units + composition_offsets
+
+    edit = _parse_edit_list(trak_payload)
+    if edit is not None:
+        empty_duration, media_time = edit
+        # Match FFmpeg's mov_fix_index: snap media_time to the first sample with
+        # raw_pts >= media_time so stream-copy trimmed files align with PyAV PTS.
+        ge = raw_pts_units[raw_pts_units >= media_time]
+        snapped_media_time = int(ge.min()) if ge.size else media_time
+        sample_pts = (raw_pts_units - snapped_media_time).astype(np.float64) / float(media_timescale)
+        sample_pts += float(empty_duration) / float(movie_timescale)
+    else:
+        sample_pts = raw_pts_units.astype(np.float64) / float(media_timescale)
 
     # Sort by presentation-order frame index to match PyAV's `packet.pts * time_base * fps`
     # even on Open-GOP / B-frame streams where decode order differs from presentation order.
-    entries = sorted(
-        (round(float(pts) * avg_fps), int(pos))
-        for pts, pos in zip(sample_pts[sync_samples], sample_offsets[sync_samples], strict=True)
-    )
-    kf_indices = [entry[0] for entry in entries]
-    kf_positions = [entry[1] for entry in entries]
-    return kf_indices, kf_positions, n_samples, avg_fps
+    kf_idx = np.rint(sample_pts[sync_samples] * avg_fps).astype(np.int64)
+    kf_pos = sample_offsets[sync_samples].astype(np.int64, copy=False)
+    order = np.lexsort((kf_pos, kf_idx))
+    return kf_idx[order], kf_pos[order], n_samples, avg_fps
 
 
 def probe_mp4_byte_index(
@@ -482,9 +553,30 @@ def probe_mp4_byte_index(
 
         if has_moov and has_mdat:
             assert moov_box is not None and mdat_box is not None
+            if mdat_box.end > file_size:
+                raise ValueError(
+                    f"{path}: truncated MP4 (mdat ends at {mdat_box.end}, file_size={file_size})"
+                )
+            if mdat_box.end < file_size and len(data) < file_size:
+                tail_offset = mdat_box.end
+                tail_len = min(max_probe_bytes, file_size - tail_offset)
+                tail = tracked_read(tail_offset, tail_len)
+                tail_boxes = _iter_boxes(
+                    tail, 0, len(tail), absolute_base=tail_offset, file_size=file_size, allow_truncated=True
+                )
+                if any(b.type == b"moof" for b in tail_boxes):
+                    raise ValueError(f"{path}: fragmented MP4 (tail moof box) is not supported")
+                if any(b.type == b"mdat" for b in tail_boxes):
+                    raise ValueError(f"{path}: multiple mdat boxes (tail mdat) are not supported")
+                if any(b.type == b"moov" for b in tail_boxes):
+                    raise ValueError(f"{path}: multiple moov boxes (tail moov) are not supported")
             moov_payload = data[moov_box.payload_start : moov_box.end]
             kf_indices, kf_positions, sample_count, avg_fps = _parse_moov_keyframes(
-                moov_payload, path=path
+                moov_payload,
+                path=path,
+                mdat_payload_start=mdat_box.payload_start,
+                mdat_end=mdat_box.end,
+                file_size=file_size,
             )
             return ProbedMp4(
                 file_size=file_size,
@@ -501,7 +593,11 @@ def probe_mp4_byte_index(
 
         if has_mdat and moov_box is None:
             assert mdat_box is not None
-            if mdat_box.end >= file_size:
+            if mdat_box.end > file_size:
+                raise ValueError(
+                    f"{path}: truncated MP4 (mdat ends at {mdat_box.end}, file_size={file_size})"
+                )
+            if mdat_box.end == file_size:
                 raise ValueError(f"{path}: mdat reaches EOF ({mdat_box.end}/{file_size}) with no moov box")
             tail_offset = mdat_box.end
             tail_len = min(max_probe_bytes, file_size - tail_offset)
@@ -523,7 +619,11 @@ def probe_mp4_byte_index(
                 )
             moov_payload = tail[tail_moov.payload_start - tail_offset : tail_moov.end - tail_offset]
             kf_indices, kf_positions, sample_count, avg_fps = _parse_moov_keyframes(
-                moov_payload, path=path
+                moov_payload,
+                path=path,
+                mdat_payload_start=mdat_box.payload_start,
+                mdat_end=mdat_box.end,
+                file_size=file_size,
             )
             return ProbedMp4(
                 file_size=file_size,

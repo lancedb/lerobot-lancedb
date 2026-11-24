@@ -17,6 +17,7 @@ range-read MP4 headers without downloading video payloads.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,9 +26,10 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlsplit
 
 DEFAULT_IO_WORKERS = 16
+_CONTENT_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$")
 
 
 @dataclass(frozen=True)
@@ -50,34 +52,112 @@ def is_remote_uri(path: str | Path) -> bool:
 
 
 def _file_uri_to_path(uri: str) -> Path:
-    parsed = urlparse(uri)
+    parsed = urlsplit(uri)
     if parsed.scheme != "file":
         raise ValueError(f"Expected file:// URI, got {uri!r}")
     if parsed.netloc and parsed.netloc != "localhost":
         raise ValueError(f"Non-local file:// host is not supported: {uri!r}")
+    if parsed.query or parsed.fragment:
+        raise ValueError(f"Query and fragment are not supported in file:// URI: {uri!r}")
+    if not parsed.path.startswith("/"):
+        raise ValueError(f"Expected absolute file:// path, got {uri!r}")
     return Path(unquote(parsed.path))
+
+
+def normalize_base_uri(uri: str) -> str:
+    """Validate and canonicalize an external blob base URI for Lance ``initial_bases``."""
+    raw = uri.strip()
+    if not is_uri(raw):
+        raise ValueError(
+            "External video base URI must be an absolute URI with scheme "
+            f"(e.g. s3://, hf://, file://), got {uri!r}"
+        )
+    parsed = urlsplit(raw)
+    if not parsed.scheme:
+        raise ValueError(f"Invalid external video base URI (missing scheme): {uri!r}")
+    if parsed.query or parsed.fragment:
+        raise ValueError(
+            "External video base URI must not contain a query or fragment ('?' or '#'); "
+            f"percent-encode literal characters in path segments instead: {uri!r}"
+        )
+    if parsed.scheme == "file":
+        if parsed.netloc and parsed.netloc != "localhost":
+            raise ValueError(f"Non-local file:// host is not supported: {uri!r}")
+        if not parsed.path.startswith("/"):
+            raise ValueError(f"file:// base URI must be an absolute path: {uri!r}")
+    elif not parsed.netloc:
+        raise ValueError(f"Invalid external video base URI (missing host/bucket): {uri!r}")
+    safe = "/@" if parsed.scheme == "hf" else "/"
+    clean_path = quote(unquote(parsed.path.rstrip("/")), safe=safe)
+    if parsed.scheme == "file" and not clean_path:
+        clean_path = "/"
+    return f"{parsed.scheme}://{parsed.netloc}{clean_path}"
+
+
+def validate_rel_path(rel_path: str) -> list[str]:
+    """Validate a POSIX relative path and return its non-empty path segments."""
+    if not rel_path or "\x00" in rel_path or "\\" in rel_path or rel_path.startswith("/"):
+        raise ValueError(f"Unsafe relative path: {rel_path!r}")
+    parts = rel_path.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"Unsafe relative path: {rel_path!r}")
+    return parts
+
+
+def _safe_staging_path(staging_dir: Path, rel_path: str) -> Path:
+    """Validate ``rel_path`` and return a target strictly inside ``staging_dir``."""
+    parts = validate_rel_path(rel_path)
+    base = staging_dir.resolve()
+    dst = staging_dir.joinpath(*parts)
+    parent_resolved = dst.parent.resolve()
+    if not parent_resolved.is_relative_to(base) or not (parent_resolved / dst.name).is_relative_to(base):
+        raise ValueError(f"Relative path escapes staging directory: {rel_path!r}")
+    return dst
+
+
+def _validate_content_range(
+    header: str | None, *, offset: int, max_length: int, label: str
+) -> int:
+    if not header:
+        raise RuntimeError(f"Missing Content-Range header on HTTP 206 response for {label}")
+    match = _CONTENT_RANGE_RE.match(header.strip())
+    if not match:
+        raise RuntimeError(f"Malformed Content-Range header {header!r} for {label}")
+    start, end = int(match.group(1)), int(match.group(2))
+    if start != offset or end < start:
+        raise RuntimeError(
+            f"Unexpected Content-Range {header!r} (requested offset {offset}) for {label}"
+        )
+    expected_len = end - start + 1
+    if expected_len > max_length:
+        raise RuntimeError(
+            f"Content-Range {header!r} returns {expected_len} bytes, exceeding requested {max_length} for {label}"
+        )
+    return expected_len
 
 
 def parse_hf_dataset_uri(uri: str) -> tuple[str, str | None, str]:
     """Parse ``hf://datasets/<repo>[@rev][/subpath]`` into ``(repo_id, revision, subpath)``."""
-    prefix = "hf://datasets/"
-    if not uri.startswith(prefix):
+    parsed = urlsplit(uri)
+    if parsed.scheme != "hf" or parsed.netloc != "datasets":
         raise ValueError(f"Only hf://datasets/... URIs are supported, got {uri!r}")
-    rest = uri[len(prefix) :].strip("/")
+    if parsed.query or parsed.fragment:
+        raise ValueError(f"Query and fragment are not supported in Hugging Face URI: {uri!r}")
+    rest = parsed.path.strip("/")
     if not rest:
         raise ValueError(f"Empty Hugging Face dataset URI: {uri!r}")
     parts = rest.split("/")
     if len(parts) == 1:
-        repo_part, subpath = parts[0], ""
+        repo_part, raw_subpath = parts[0], ""
     elif "@" in parts[0]:
-        repo_part, subpath = parts[0], "/".join(parts[1:])
+        repo_part, raw_subpath = parts[0], "/".join(parts[1:])
     else:
         repo_part = f"{parts[0]}/{parts[1]}"
-        subpath = "/".join(parts[2:])
+        raw_subpath = "/".join(parts[2:])
     repo_id, _, rev = repo_part.partition("@")
     if not repo_id:
         raise ValueError(f"Invalid Hugging Face dataset URI: {uri!r}")
-    return repo_id, (rev or None), subpath
+    return unquote(repo_id), (unquote(rev) or None), unquote(raw_subpath)
 
 
 def _parse_retry_after(header_value: str | None, default: float) -> float:
@@ -159,10 +239,10 @@ class LocalSource(DatasetSource):
         return self.root
 
     def materialize_data(self, rel_paths: list[str], staging_dir: Path) -> list[Path]:
-        return [self.root / rel for rel in rel_paths]
+        return [_safe_staging_path(self.root, rel) for rel in rel_paths]
 
     def read_range(self, rel_path: str, offset: int, length: int) -> bytes:
-        with open(self.root / rel_path, "rb") as fh:
+        with open(_safe_staging_path(self.root, rel_path), "rb") as fh:
             fh.seek(offset)
             return fh.read(length)
 
@@ -198,7 +278,8 @@ class HubSource(DatasetSource):
         self.commit_sha = info.sha
         self._api = api
 
-        prefix = f"/{self.subpath}" if self.subpath else ""
+        encoded_subpath = quote(self.subpath, safe="/") if self.subpath else ""
+        prefix = f"/{encoded_subpath}" if encoded_subpath else ""
         self.root_uri = f"hf://datasets/{self.repo_id}@{self.commit_sha}{prefix}"
         self.root_label = self.root_uri
 
@@ -246,8 +327,9 @@ class HubSource(DatasetSource):
     def _download_rel_paths(self, rel_paths: list[str], staging_dir: Path) -> list[Path]:
         import huggingface_hub
 
-        def _fetch(rel: str) -> Path:
-            dst = staging_dir / rel
+        targets = [(rel, _safe_staging_path(staging_dir, rel)) for rel in rel_paths]
+
+        def _fetch(rel: str, dst: Path) -> Path:
             if dst.exists():
                 return dst
             cached = Path(
@@ -260,19 +342,23 @@ class HubSource(DatasetSource):
                 )
             )
             dst.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dst.with_suffix(dst.suffix + f".tmp-{threading.get_ident()}")
+            tmp = dst.with_name(f".{dst.name}.tmp-{threading.get_ident()}")
             try:
-                os.symlink(cached, tmp)
-            except OSError:
-                import shutil
+                try:
+                    os.symlink(cached, tmp)
+                except OSError:
+                    import shutil
 
-                shutil.copy2(cached, tmp)
-            tmp.replace(dst)
+                    shutil.copy2(cached, tmp)
+                tmp.replace(dst)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
             return dst
 
         results: dict[str, Path] = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            futs = {pool.submit(_fetch, rel): rel for rel in rel_paths}
+            futs = {pool.submit(_fetch, rel, dst): rel for rel, dst in targets}
             for fut in as_completed(futs):
                 rel = futs[fut]
                 results[rel] = fut.result()
@@ -303,9 +389,13 @@ class HubSource(DatasetSource):
             try:
                 resp = self._session.get(
                     url,
-                    headers={"Range": f"bytes={offset}-{end}"},
+                    headers={
+                        "Range": f"bytes={offset}-{end}",
+                        "Accept-Encoding": "identity",
+                    },
                     timeout=60.0,
                     allow_redirects=True,
+                    stream=True,
                 )
             except requests.RequestException as err:
                 last_err = err
@@ -314,15 +404,48 @@ class HubSource(DatasetSource):
                 time.sleep(min(1.5 * (2**attempt), 15.0))
                 continue
 
-            if resp.status_code == 206:
-                return resp.content
-            if resp.status_code == 200:
-                return resp.content[offset : offset + length]
-            if resp.status_code in (429, 500, 502, 503, 504) and attempt < 6:
-                delay = _parse_retry_after(resp.headers.get("Retry-After"), 1.5 * (2**attempt))
-                time.sleep(delay)
-                continue
-            resp.raise_for_status()
+            retry_delay: float | None = None
+            with resp:
+                if resp.status_code == 206:
+                    expected_len = _validate_content_range(
+                        resp.headers.get("Content-Range"),
+                        offset=offset,
+                        max_length=length,
+                        label=url,
+                    )
+                    chunks: list[bytes] = []
+                    received = 0
+                    for chunk in resp.iter_content(chunk_size=min(65536, max(1, expected_len))):
+                        if not chunk:
+                            continue
+                        received += len(chunk)
+                        if received > expected_len:
+                            raise RuntimeError(
+                                f"HTTP 206 response exceeded Content-Range ({expected_len} bytes) for {url}"
+                            )
+                        chunks.append(chunk)
+                    if received != expected_len:
+                        raise RuntimeError(
+                            f"Truncated HTTP 206 response ({received}/{expected_len} bytes) for {url}"
+                        )
+                    return b"".join(chunks)
+
+                if resp.status_code == 200:
+                    raw_stream = getattr(resp, "raw", None)
+                    if raw_stream is not None:
+                        raw_stream.close()
+                    raise RuntimeError(
+                        f"Server ignored Range request (returned HTTP 200 instead of 206) for {url}"
+                    )
+
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 6:
+                    retry_delay = _parse_retry_after(resp.headers.get("Retry-After"), 1.5 * (2**attempt))
+                else:
+                    resp.raise_for_status()
+                    raise RuntimeError(f"Unexpected HTTP {resp.status_code} for Range request on {url}")
+
+            if retry_delay is not None:
+                time.sleep(retry_delay)
         raise RuntimeError(f"Range GET failed for {url} after retries: {last_err}")
 
     def default_video_base_uri(self, video_rels: list[str]) -> str:
@@ -367,16 +490,23 @@ class S3Source(DatasetSource):
     ) -> None:
         import boto3
 
-        clean = uri.rstrip("/")
-        if not clean.startswith("s3://"):
+        parsed = urlsplit(uri)
+        if parsed.scheme != "s3":
             raise ValueError(f"Expected s3:// URI, got {uri!r}")
-        bucket, _, prefix = clean[5:].partition("/")
+        if parsed.query or parsed.fragment:
+            raise ValueError(
+                "Query and fragment are not supported in s3:// root URI; "
+                f"percent-encode literal '?' or '#' in prefix segments instead: {uri!r}"
+            )
+        bucket = parsed.netloc
         if not bucket:
             raise ValueError(f"Invalid S3 URI (missing bucket): {uri!r}")
-        self.root_uri = clean
-        self.root_label = clean
+        raw_prefix = unquote(parsed.path).strip("/")
+        encoded_prefix = quote(raw_prefix, safe="/")
         self.bucket = bucket
-        self.prefix = f"{prefix.strip('/')}/" if prefix.strip("/") else ""
+        self.prefix = f"{raw_prefix}/" if raw_prefix else ""
+        self.root_uri = f"s3://{bucket}/{encoded_prefix}" if encoded_prefix else f"s3://{bucket}"
+        self.root_label = self.root_uri
         self.max_workers = max(1, max_workers)
         self._client_kwargs = _s3_client_kwargs(storage_options, self.max_workers)
         self._client = boto3.client("s3", **self._client_kwargs)
@@ -401,19 +531,24 @@ class S3Source(DatasetSource):
         return objects
 
     def _download_rel_paths(self, rel_paths: list[str], staging_dir: Path) -> list[Path]:
-        def _fetch(rel: str) -> Path:
-            dst = staging_dir / rel
+        targets = [(rel, _safe_staging_path(staging_dir, rel)) for rel in rel_paths]
+
+        def _fetch(rel: str, dst: Path) -> Path:
             if dst.exists():
                 return dst
             dst.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dst.with_suffix(dst.suffix + f".tmp-{threading.get_ident()}")
-            self._client.download_file(self.bucket, f"{self.prefix}{rel}", str(tmp))
-            tmp.replace(dst)
+            tmp = dst.with_name(f".{dst.name}.tmp-{threading.get_ident()}")
+            try:
+                self._client.download_file(self.bucket, f"{self.prefix}{rel}", str(tmp))
+                tmp.replace(dst)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
             return dst
 
         results: dict[str, Path] = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            futs = {pool.submit(_fetch, rel): rel for rel in rel_paths}
+            futs = {pool.submit(_fetch, rel, dst): rel for rel, dst in targets}
             for fut in as_completed(futs):
                 rel = futs[fut]
                 results[rel] = fut.result()
@@ -433,14 +568,25 @@ class S3Source(DatasetSource):
     def read_range(self, rel_path: str, offset: int, length: int) -> bytes:
         if length <= 0:
             return b""
+        key = f"{self.prefix}{rel_path}"
+        label = f"s3://{self.bucket}/{key}"
         resp = self._client.get_object(
             Bucket=self.bucket,
-            Key=f"{self.prefix}{rel_path}",
+            Key=key,
             Range=f"bytes={offset}-{offset + length - 1}",
         )
         body = resp["Body"]
         try:
-            return body.read()
+            status = (resp.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+            if status is not None and status != 206:
+                raise RuntimeError(f"S3 server ignored Range request (HTTP {status}) for {label}")
+            content_range = resp.get("ContentRange")
+            if content_range is not None:
+                _validate_content_range(content_range, offset=offset, max_length=length, label=label)
+            data = body.read(length + 1)
+            if len(data) > length:
+                raise RuntimeError(f"S3 Range response exceeded requested {length} bytes for {label}")
+            return data
         finally:
             body.close()
 
@@ -460,11 +606,14 @@ class FsspecSource(DatasetSource):
     ) -> None:
         import fsspec
 
-        clean = uri.rstrip("/")
-        self.root_uri = clean
-        self.root_label = clean
+        canonical = normalize_base_uri(uri)
+        parsed = urlsplit(canonical)
+        decoded_path = unquote(parsed.path)
+        decoded_url = f"{parsed.scheme}://{parsed.netloc}{decoded_path}"
+        self.root_uri = canonical
+        self.root_label = canonical
         self.max_workers = max(1, max_workers)
-        self._fs, root_path = fsspec.url_to_fs(clean, **(storage_options or {}))
+        self._fs, root_path = fsspec.url_to_fs(decoded_url, **(storage_options or {}))
         self._root_path = root_path.rstrip("/")
         self._files_cache: dict[str, SourceObject] | None = None
 
@@ -488,19 +637,24 @@ class FsspecSource(DatasetSource):
         return objects
 
     def _download_rel_paths(self, rel_paths: list[str], staging_dir: Path) -> list[Path]:
-        def _fetch(rel: str) -> Path:
-            dst = staging_dir / rel
+        targets = [(rel, _safe_staging_path(staging_dir, rel)) for rel in rel_paths]
+
+        def _fetch(rel: str, dst: Path) -> Path:
             if dst.exists():
                 return dst
             dst.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dst.with_suffix(dst.suffix + f".tmp-{threading.get_ident()}")
-            tmp.write_bytes(self._fs.cat_file(self._full_path(rel)))
-            tmp.replace(dst)
+            tmp = dst.with_name(f".{dst.name}.tmp-{threading.get_ident()}")
+            try:
+                tmp.write_bytes(self._fs.cat_file(self._full_path(rel)))
+                tmp.replace(dst)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
             return dst
 
         results: dict[str, Path] = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            futs = {pool.submit(_fetch, rel): rel for rel in rel_paths}
+            futs = {pool.submit(_fetch, rel, dst): rel for rel, dst in targets}
             for fut in as_completed(futs):
                 rel = futs[fut]
                 results[rel] = fut.result()
@@ -541,6 +695,10 @@ def open_source(
             return LocalSource(_file_uri_to_path(raw))
         if raw.startswith("hf://"):
             parsed_repo, uri_rev, subpath = parse_hf_dataset_uri(raw)
+            if revision and uri_rev and revision != uri_rev:
+                raise ValueError(
+                    f"Conflicting revisions: --revision={revision!r} vs URI revision {uri_rev!r} in {raw!r}"
+                )
             token = (storage_options or {}).get("token") or (storage_options or {}).get("hf_token")
             return HubSource(
                 parsed_repo,
@@ -557,10 +715,18 @@ def open_source(
                     return FsspecSource(raw, storage_options=storage_options, max_workers=max_workers)
                 except ImportError as err:
                     raise ImportError(
-                        "Reading an s3:// source requires either 'boto3' or 's3fs'. "
-                        "Install one of them (e.g. `pip install boto3`)."
+                        "Reading an s3:// source requires 'boto3' or 's3fs'. "
+                        "Install S3 support with: pip install 'lerobot-lancedb[s3]'"
                     ) from err
             return S3Source(raw, storage_options=storage_options, max_workers=max_workers)
+        if raw.startswith("gs://"):
+            try:
+                return FsspecSource(raw, storage_options=storage_options, max_workers=max_workers)
+            except ImportError as err:
+                raise ImportError(
+                    "Reading a gs:// source requires 'gcsfs'. "
+                    "Install GCS support with: pip install 'lerobot-lancedb[gcs]'"
+                ) from err
         if is_uri(raw):
             return FsspecSource(raw, storage_options=storage_options, max_workers=max_workers)
         return LocalSource(Path(raw))

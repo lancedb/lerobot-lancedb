@@ -45,7 +45,12 @@ walkthrough](https://github.com/lancedb/lerobot-lancedb/blob/main/docs/walkthrou
 ## Install
 
 ```bash
+# Base install (local disk and Hugging Face Hub):
 pip install --extra-index-url https://pypi.fury.io/lancedb/ lerobot-lancedb
+
+# Add cloud source adapters for zero-copy conversion from S3 / GCS buckets:
+pip install --extra-index-url https://pypi.fury.io/lancedb/ "lerobot-lancedb[s3]"
+pip install --extra-index-url https://pypi.fury.io/lancedb/ "lerobot-lancedb[gcs]"
 ```
 
 The extra index is needed because `lancedb>=0.42.0b26` (External Blob v2
@@ -57,14 +62,17 @@ published on fury.io, not PyPI yet.
 | `lerobot` | `>=0.6.0` | metadata, feature, depth and video utilities the converter and loader reuse |
 | `lancedb` | `>=0.42.0b26` | External Blob v2 `initial_bases`, commit-pinned `hf://`, and `fetch_blob_ranges` |
 | `av` | `>=12` | byte-index construction (`copy` mode) and container inspection (`doctor`) |
+| `boto3` (`[s3]` / `[cloud]`) | `>=1.28` | optional S3 source adapter for zero-copy `s3://` conversion |
+| `gcsfs` (`[gcs]` / `[cloud]`) | `>=2024.2` | optional GCS source adapter for zero-copy `gs://` conversion |
 
-`lerobot` also supplies the loader's heavy deps (torch, torchcodec, numpy), so
-they're pinned there.
+`lerobot` also supplies the loader's heavy deps (torch, torchcodec, numpy,
+fsspec, requests), so they're pinned there.
 
 ## Convert
 
 ```bash
-# Zero-copy from S3 to S3 (0 bytes of MP4 downloaded or copied):
+# Zero-copy from S3 to S3 (requires `lerobot-lancedb[s3]`; range-reads only MP4 headers,
+# never downloads or copies MP4 payloads into videos.lance):
 lerobot-lance-convert --root s3://bucket/droid --out s3://bucket/droid-lance
 
 # Zero-copy from Hugging Face Hub (pins external base to the resolved 40-char commit SHA):
@@ -75,13 +83,19 @@ lerobot-lance-convert --root /path/to/dataset --out ./my-lance
 ```
 
 `--video-mode` defaults to `auto`: remote roots (`s3://`, `gs://`, `hf://`, and
-`--repo-id`) write zero-copy External Blob v2 descriptors (`external`) by
-range-reading only each MP4's `moov` header, while local directory roots copy
-MP4s into managed blobs (`copy`) so removing the source directory does not break
-the output. Pass `--video-mode external` or `--video-mode copy` to override, and
-`--video-base-uri` when indexing from a local mirror of an object-store bucket.
-For local outputs converted in `copy` mode, push `./my-lance/` to object storage
-(`aws s3 cp --recursive`, etc.) and point training at the URI.
+`--repo-id`) write zero-copy External Blob v2 descriptors (`external`) without
+copying MP4 payloads into `videos.lance`, while local directory roots copy MP4s
+into managed blobs (`copy`) so removing the source directory does not break the
+output. External conversion transfers only the bounded Range-GET bytes needed to
+read each MP4's `moov` box (1 MiB initial probe by default) and stages `meta/`
+plus referenced `data/*.parquet` files under `TMPDIR` during preflight. External
+MP4 indexing supports standard non-fragmented single-`mdat` MP4s (`stsz`/`stz2`
+and rate-one edit lists) and rejects truncated, fragmented (`moof`/`mvex`), or
+multi-`mdat` containers before writing output. Pass `--video-mode external` or
+`--video-mode copy` to override, and `--video-base-uri` when indexing from a
+local mirror of an object-store bucket. For local outputs converted in `copy`
+mode, push `./my-lance/` to object storage (`aws s3 cp --recursive`, etc.) and
+point training at the URI.
 
 The conversion runs the doctor's checks on the source first and refuses a dataset
 that is damaged where its own metadata references it - short aggregated videos,
