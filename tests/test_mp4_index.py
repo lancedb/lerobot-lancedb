@@ -243,3 +243,67 @@ def test_probe_supports_stz2_and_elst_bounds_parity_with_pyav(tmp_path: Path):
     clipped_mp4.write_bytes(bytes(buf_clip))
     with pytest.raises(ValueError, match="edit list truncates trailing samples"):
         probe_local_mp4(clipped_mp4)
+
+    # 4. Zero-duration elst (segment_duration == 0, which FFmpeg decodes as 0 frames) is rejected.
+    zero_mp4 = tmp_path / "zero_elst.mp4"
+    buf_zero = bytearray(bframe_mp4.read_bytes())
+    struct.pack_into(">Iihh", buf_zero, elst_pos + 12, 0, media_time, rate_int, rate_frac)
+    zero_mp4.write_bytes(bytes(buf_zero))
+    with pytest.raises(ValueError, match="non-positive segment_duration=0"):
+        probe_local_mp4(zero_mp4)
+
+    # 5. FFmpeg av_rescale rounding boundary (1917 ms * 12288 / 1000 -> 23556 ticks;
+    # media_time 2044 + 23556 == 25600 == final sample PTS -> PyAV decodes 23 of 24 frames).
+    boundary_mp4 = tmp_path / "boundary_elst.mp4"
+    buf_boundary = bytearray(bframe_mp4.read_bytes())
+    struct.pack_into(">Iihh", buf_boundary, elst_pos + 12, 1917, 2044, rate_int, rate_frac)
+    boundary_mp4.write_bytes(bytes(buf_boundary))
+    with pytest.raises(ValueError, match="23 of 24 samples presented"):
+        probe_local_mp4(boundary_mp4)
+
+
+def test_probe_tail_moov_jumps_large_free_padding_before_and_after_moov(tmp_path: Path):
+    orig = tmp_path / "tail.mp4"
+    _encode_mp4(orig, frames=24, faststart=False)
+    expected = build_video_byte_index(orig)
+    raw = orig.read_bytes()
+    moov_offset = expected["moov_offset"]
+    prefix = raw[:moov_offset]
+    moov = raw[moov_offset:]
+    free_size = DEFAULT_MAX_PROBE_BYTES + 4096
+    free_hdr = struct.pack(">I4s", free_size, b"free")
+
+    for placement in ("before", "after"):
+        segments = (
+            [(prefix, len(prefix)), (free_hdr, free_size), (moov, len(moov))]
+            if placement == "before"
+            else [(prefix, len(prefix)), (moov, len(moov)), (free_hdr, free_size)]
+        )
+        total_size = sum(seg_len for _, seg_len in segments)
+
+        def _read(_p: str, off: int, length: int, segs=segments, size=total_size) -> bytes:
+            end = min(off + length, size)
+            out = bytearray()
+            pos = off
+            cursor = 0
+            for head, seg_len in segs:
+                seg_end = cursor + seg_len
+                if pos < seg_end and pos < end:
+                    rel = pos - cursor
+                    take = min(end, seg_end) - pos
+                    if rel < len(head):
+                        head_take = min(take, len(head) - rel)
+                        out.extend(head[rel : rel + head_take])
+                        take -= head_take
+                    if take > 0:
+                        out.extend(b"\x00" * take)
+                    pos = min(end, seg_end)
+                cursor = seg_end
+            return bytes(out)
+
+        probed = probe_mp4_byte_index(f"free_{placement}.mp4", _read, file_size=total_size, header_probe_bytes=64)
+        assert probed.sample_count == 24
+        assert probed.kf_indices.tolist() == expected["kf_indices"]
+        assert probed.kf_positions.tolist() == expected["kf_positions"]
+        assert probed.moov_size == len(moov)
+        assert probed.bytes_read < 64 * 1024

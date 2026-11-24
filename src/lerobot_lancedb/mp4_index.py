@@ -476,15 +476,21 @@ def _parse_moov_keyframes(
     edit = _parse_edit_list(trak_payload)
     if edit is not None:
         empty_duration, segment_duration, media_time = edit
-        max_raw_pts = int(raw_pts_units.max())
-        if (
-            segment_duration > 0
-            and (max_raw_pts - media_time) * movie_timescale >= segment_duration * media_timescale
-        ):
-            edit_end_ceil = (
-                media_time + (segment_duration * media_timescale + movie_timescale - 1) // movie_timescale
+        if segment_duration <= 0:
+            raise ValueError(
+                f"{path}: MP4 edit list has non-positive segment_duration={segment_duration} "
+                "(presents 0 samples)"
             )
-            presented = int(((raw_pts_units >= media_time) & (raw_pts_units < edit_end_ceil)).sum())
+        # Match FFmpeg mov_fix_index (libavformat/mov.c): av_rescale uses AV_ROUND_NEAR_INF.
+        edit_duration_media = (segment_duration * media_timescale + movie_timescale // 2) // movie_timescale
+        if edit_duration_media <= 0:
+            raise ValueError(
+                f"{path}: MP4 edit list has 0-tick media duration (presents 0 samples)"
+            )
+        edit_end_media = media_time + edit_duration_media
+        max_raw_pts = int(raw_pts_units.max())
+        if max_raw_pts >= edit_end_media:
+            presented = int(((raw_pts_units >= media_time) & (raw_pts_units < edit_end_media)).sum())
             raise ValueError(
                 f"{path}: MP4 edit list truncates trailing samples "
                 f"({presented} of {n_samples} samples presented within edit duration); "
@@ -649,32 +655,79 @@ def probe_mp4_byte_index(
                 )
             if mdat_box.end == file_size:
                 raise ValueError(f"{path}: mdat reaches EOF ({mdat_box.end}/{file_size}) with no moov box")
-            tail_offset = mdat_box.end
-            tail_len = min(max_probe_bytes, file_size - tail_offset)
-            tail = tracked_read(tail_offset, tail_len)
-            tail_boxes = _iter_boxes(
-                tail, 0, len(tail), absolute_base=tail_offset, file_size=file_size, allow_truncated=True
-            )
-            if any(b.type == b"moof" for b in tail_boxes):
-                raise ValueError(f"{path}: fragmented MP4 (tail moof box) is not supported")
-            if any(b.type == b"mdat" for b in tail_boxes):
-                raise ValueError(f"{path}: multiple mdat boxes (tail mdat) are not supported")
-            tail_moov_boxes = [b for b in tail_boxes if b.type == b"moov"]
-            if len(tail_moov_boxes) != 1:
-                raise ValueError(f"{path}: expected 1 tail moov box, found {len(tail_moov_boxes)}")
-            tail_moov = tail_moov_boxes[0]
-            if tail_moov.end > tail_offset + len(tail):
+            if top[-1].end > file_size:
                 raise ValueError(
-                    f"{path}: tail moov ({tail_moov.size} bytes) exceeds max_probe_bytes={max_probe_bytes}"
+                    f"{path}: truncated trailing MP4 box {top[-1].type!r} "
+                    f"(ends at {top[-1].end}, file_size={file_size})"
                 )
-            if tail_boxes[-1].end > file_size:
-                raise ValueError(
-                    f"{path}: truncated trailing MP4 box {tail_boxes[-1].type!r} "
-                    f"(ends at {tail_boxes[-1].end}, file_size={file_size})"
+
+            pos = top[-1].end
+            box_count = 0
+            tail_moov: _Box | None = None
+            moov_payload: bytes | None = None
+            first_tail_read = True
+
+            while pos < file_size:
+                if first_tail_read and tail_moov is None:
+                    win_len = min(max(header_probe_bytes, _TAIL_HEADER_WINDOW_BYTES), file_size - pos)
+                else:
+                    win_len = min(_TAIL_HEADER_WINDOW_BYTES, file_size - pos)
+                first_tail_read = False
+
+                buf = tracked_read(pos, win_len)
+                if not buf:
+                    raise ValueError(f"{path}: empty range read while scanning tail at offset {pos}")
+                boxes = _iter_boxes(
+                    buf, 0, len(buf), absolute_base=pos, file_size=file_size, allow_truncated=True
                 )
-            if tail_boxes[-1].end < file_size:
-                scan_trailing_boxes(tail_boxes[-1].end)
-            moov_payload = tail[tail_moov.payload_start - tail_offset : tail_moov.end - tail_offset]
+                if not boxes:
+                    raise ValueError(f"{path}: truncated trailing MP4 box header at offset {pos}")
+
+                for box in boxes:
+                    box_count += 1
+                    if box_count > _MAX_TAIL_BOXES:
+                        raise ValueError(
+                            f"{path}: too many trailing top-level boxes after mdat (>{_MAX_TAIL_BOXES})"
+                        )
+                    if box.type == b"moof":
+                        raise ValueError(f"{path}: fragmented MP4 (tail moof box) is not supported")
+                    if box.type == b"mdat":
+                        raise ValueError(f"{path}: multiple mdat boxes (tail mdat) are not supported")
+                    if box.end > file_size:
+                        raise ValueError(
+                            f"{path}: truncated trailing MP4 box {box.type!r} "
+                            f"(ends at {box.end}, file_size={file_size})"
+                        )
+                    if box.type == b"moov":
+                        if tail_moov is not None:
+                            raise ValueError(f"{path}: multiple moov boxes (tail moov) are not supported")
+                        if box.size > max_probe_bytes:
+                            raise ValueError(
+                                f"{path}: tail moov ({box.size} bytes) exceeds max_probe_bytes={max_probe_bytes}"
+                            )
+                        tail_moov = box
+                        buf_end = pos + len(buf)
+                        if box.end <= buf_end:
+                            moov_payload = buf[box.payload_start - pos : box.end - pos]
+                        else:
+                            have = buf[box.payload_start - pos :] if box.payload_start < buf_end else b""
+                            need_from = max(box.payload_start, buf_end)
+                            need_len = box.end - need_from
+                            rest = tracked_read(need_from, need_len)
+                            if len(rest) != need_len:
+                                raise ValueError(
+                                    f"{path}: truncated tail moov read ({len(rest)}/{need_len} bytes)"
+                                )
+                            moov_payload = have + rest
+
+                next_pos = boxes[-1].end
+                if next_pos <= pos:
+                    raise ValueError(f"{path}: non-advancing trailing MP4 box at offset {pos}")
+                pos = next_pos
+
+            if tail_moov is None or moov_payload is None:
+                raise ValueError(f"{path}: expected 1 tail moov box, found 0")
+
             kf_indices, kf_positions, sample_count, avg_fps = _parse_moov_keyframes(
                 moov_payload,
                 path=path,

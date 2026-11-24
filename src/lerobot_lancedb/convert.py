@@ -28,7 +28,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shutil
@@ -494,16 +493,15 @@ def _local_build_dir(out_path: Path):
 @contextmanager
 def _local_publish_lock(resolved_out: Path):
     """Serialize local publication to ``resolved_out`` across threads and processes."""
+    resolved_out.parent.mkdir(parents=True, exist_ok=True)
     with _PUBLISH_LOCKS_GUARD:
         thread_lock = _PUBLISH_LOCKS.get(resolved_out)
         if thread_lock is None:
             thread_lock = threading.Lock()
             _PUBLISH_LOCKS[resolved_out] = thread_lock
-    uid_suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
-    lock_dir = Path(tempfile.gettempdir()) / f"lerobot-lancedb-locks{uid_suffix}"
-    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    digest = hashlib.sha256(os.fsencode(resolved_out)).hexdigest()[:32]
-    lock_path = lock_dir / f"{digest}.lock"
+    # Derive lock location strictly from resolved_out so processes with different
+    # TMPDIR values coordinate on the exact same inode.
+    lock_path = resolved_out.parent / f".{resolved_out.name}.publish.lock"
     with thread_lock:
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -691,28 +689,31 @@ def _convert_copy(
         if not (src_root / "meta").is_dir():
             raise FileNotFoundError(f"{src_root} does not look like a LeRobot dataset (no meta/ dir)")
     elif repo_id is not None:
-        import huggingface_hub
-
         src_opts = source_storage_options if source_storage_options is not None else storage_options
-        token = (
-            (src_opts or {}).get("token")
-            or (src_opts or {}).get("hf_token")
-            or os.environ.get("HF_TOKEN")
-            or huggingface_hub.get_token()
-        )
-        api = huggingface_hub.HfApi(token=token)
-        info = api.dataset_info(repo_id, revision=revision or "main")
-        if not info.sha:
-            raise RuntimeError(f"Could not resolve commit SHA for {repo_id!r}@{revision or 'main'}")
-        effective_revision = info.sha
-        src_root = Path(
-            huggingface_hub.snapshot_download(
-                repo_id=repo_id,
-                repo_type="dataset",
-                revision=effective_revision,
-                token=token,
+        explicit_token = (src_opts or {}).get("token") or (src_opts or {}).get("hf_token")
+        if revision is None:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+            ds_kwargs = {"token": explicit_token} if explicit_token else {}
+            ds = LeRobotDataset(repo_id, **ds_kwargs)  # preserves v3.0 default and $HF_LEROBOT_HOME cache
+            src_root = Path(ds.root)
+        else:
+            import huggingface_hub
+
+            token = explicit_token or os.environ.get("HF_TOKEN") or huggingface_hub.get_token()
+            api = huggingface_hub.HfApi(token=token)
+            info = api.dataset_info(repo_id, revision=revision)
+            if not info.sha:
+                raise RuntimeError(f"Could not resolve commit SHA for {repo_id!r}@{revision}")
+            effective_revision = info.sha
+            src_root = Path(
+                huggingface_hub.snapshot_download(
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    revision=effective_revision,
+                    token=token,
+                )
             )
-        )
     else:
         raise ValueError("pass --repo-id or --root")
 

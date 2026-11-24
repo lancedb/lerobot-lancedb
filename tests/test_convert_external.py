@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import struct
 import sys
@@ -538,18 +539,29 @@ def test_revision_pinned_in_copy_and_external_never_falls_back_to_hub(tmp_path: 
     monkeypatch.setattr(huggingface_hub, "HfApi", _FakeHfApi)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot_download)
 
-    # 1. copy mode resolves revision -> commit SHA and converts strictly from that snapshot.
+    # 1. copy mode with explicit --revision resolves commit SHA and converts strictly from that snapshot.
     convert(tmp_path / "managed_out", repo_id="test/fixture", video_mode="copy", revision="v3.0")
     assert calls == [
         ("dataset_info", "test/fixture@v3.0"),
         ("snapshot_download", f"test/fixture@{sha}"),
     ]
 
-    # 2. Passing --revision with a non-hf:// --root fails loudly instead of being ignored.
+    # 2. copy mode with omitted --revision preserves LeRobotDataset default (v3.0 + local cache).
+    ds_calls: list[tuple[str, dict]] = []
+
+    def _fake_lerobot_dataset(repo_id, **kwargs):
+        ds_calls.append((repo_id, kwargs))
+        return SimpleNamespace(root=selected)
+
+    monkeypatch.setattr("lerobot.datasets.lerobot_dataset.LeRobotDataset", _fake_lerobot_dataset)
+    convert(tmp_path / "managed_default_out", repo_id="test/fixture", video_mode="copy")
+    assert ds_calls == [("test/fixture", {})]
+
+    # 3. Passing --revision with a non-hf:// --root fails loudly instead of being ignored.
     with pytest.raises(ValueError, match="--revision is only supported"):
         convert(tmp_path / "bad_rev_out", root=selected, video_mode="copy", revision=sha)
 
-    # 3. external mode fails loudly when staged meta/ is incomplete instead of pulling another revision.
+    # 4. external mode fails loudly when staged meta/ is incomplete instead of pulling another revision.
     (selected / "meta" / "tasks.parquet").unlink()
 
     class _StagedSource(LocalSource):
@@ -604,7 +616,8 @@ def test_local_publish_serializes_writers_and_preserves_backup_on_rollback_error
             (root / name).mkdir(parents=True, exist_ok=True)
             (root / name / "owner").write_text(root.name)
 
-    # 1. Two concurrent publications serialize cleanly and leave a coherent single-owner output.
+    # 1. Two concurrent publications serialize cleanly (even across distinct TMPDIRs)
+    # and leave a coherent single-owner output.
     with ThreadPoolExecutor(max_workers=2) as pool:
         f1 = pool.submit(_commit_local_output, build_a, out)
         f2 = pool.submit(_commit_local_output, build_b, out)
@@ -612,6 +625,7 @@ def test_local_publish_serializes_writers_and_preserves_backup_on_rollback_error
         f2.result(10)
     owners = {(out / name / "owner").read_text() for name in _MANAGED_OUTPUT_ENTRIES}
     assert len(owners) == 1 and owners <= {"build_a", "build_b"}
+    assert (tmp_path / ".out.publish.lock").exists()
 
     # 2. If swap fails AND rollback also fails, the backup directory is preserved rather than deleted.
     build_c = tmp_path / "build_c"
@@ -666,6 +680,79 @@ def test_range_validation_and_fsspec_core_compat(tmp_path: Path, monkeypatch):
     mem_fs.pipe(f"{prefix}/meta/info.json", b"{}")
     src = FsspecSource(f"memory://{prefix}")
     assert "meta/info.json" in src.list_files()
+
+    # 4. GCS streaming range reader validates 206 + Content-Range and aborts on 200 without reading body.
+    loop = asyncio.new_event_loop()
+    loop_thread = Thread(target=loop.run_forever, daemon=True)
+    loop_thread.start()
+    try:
+
+        class _FakeAioResp:
+            def __init__(self, status: int, headers: dict[str, str], body: bytes):
+                self.status = status
+                self.headers = headers
+                self._body = body
+                self.closed = False
+                self.read_started = False
+
+                class _Content:
+                    async def iter_chunked(_c_self, chunk_size: int):
+                        self.read_started = True
+                        for i in range(0, len(self._body), chunk_size):
+                            yield self._body[i : i + chunk_size]
+
+                self.content = _Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return None
+
+            def close(self):
+                self.closed = True
+
+            def raise_for_status(self):
+                if self.status >= 400:
+                    raise RuntimeError(f"HTTP {self.status}")
+
+        resp_206 = _FakeAioResp(206, {"Content-Range": "bytes 4-9/16"}, b"456789")
+        resp_200 = _FakeAioResp(200, {"Content-Length": "2097152"}, b"X" * 64)
+        gcs_resps = [resp_206, resp_200]
+
+        class _FakeGcsFs:
+            requests_timeout = 10.0
+
+            def __init__(self):
+                self.loop = loop
+                self.session = SimpleNamespace(get=lambda *_a, **_kw: gcs_resps.pop(0))
+
+            async def _set_session(self):
+                return self.session
+
+            def url(self, path: str) -> str:
+                return f"https://gcs.example.test/{path}"
+
+            def _get_headers(self, headers: dict[str, str]) -> dict[str, str]:
+                return dict(headers)
+
+            def _get_params(self, kwargs: dict[str, str]) -> dict[str, str]:
+                return dict(kwargs)
+
+        fake_gcs = FsspecSource.__new__(FsspecSource)
+        fake_gcs._fs = _FakeGcsFs()
+        fake_gcs._root_path = "bucket/ds"
+        fake_gcs.root_uri = "gs://bucket/ds"
+        fake_gcs._is_gcs = True
+
+        assert fake_gcs.read_range("videos/clip.mp4", 4, 6) == b"456789"
+        with pytest.raises(RuntimeError, match="HTTP 200 instead of 206"):
+            fake_gcs.read_range("videos/clip.mp4", 0, 64)
+        assert resp_200.closed and not resp_200.read_started
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=5)
+        loop.close()
 
 
 def test_s3_loopback_roundtrip_storage_options_and_special_keys(tmp_path: Path, monkeypatch):

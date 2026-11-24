@@ -414,6 +414,14 @@ class HubSource(DatasetSource):
             retry_delay: float | None = None
             with resp:
                 if resp.status_code == 206:
+                    encoding = (resp.headers.get("Content-Encoding") or "").strip().lower()
+                    if encoding and encoding != "identity":
+                        raw_stream = getattr(resp, "raw", None)
+                        if raw_stream is not None:
+                            raw_stream.close()
+                        raise RuntimeError(
+                            f"Unexpected Content-Encoding {encoding!r} on HTTP 206 response for {url}"
+                        )
                     expected_len = _validate_content_range(
                         resp.headers.get("Content-Range"),
                         offset=offset,
@@ -427,6 +435,9 @@ class HubSource(DatasetSource):
                             continue
                         received += len(chunk)
                         if received > expected_len:
+                            raw_stream = getattr(resp, "raw", None)
+                            if raw_stream is not None:
+                                raw_stream.close()
                             raise RuntimeError(
                                 f"HTTP 206 response exceeded Content-Range ({expected_len} bytes) for {url}"
                             )
@@ -628,6 +639,9 @@ class FsspecSource(DatasetSource):
         self.max_workers = max(1, max_workers)
         self._fs, root_path = url_to_fs(decoded_url, **(storage_options or {}))
         self._root_path = root_path.rstrip("/")
+        self._is_gcs = parsed.scheme == "gs" and all(
+            hasattr(self._fs, attr) for attr in ("_set_session", "url", "_get_headers", "_get_params", "loop")
+        )
         self._files_cache: dict[str, SourceObject] | None = None
 
     def _full_path(self, rel_path: str) -> str:
@@ -684,10 +698,108 @@ class FsspecSource(DatasetSource):
     def materialize_data(self, rel_paths: list[str], staging_dir: Path) -> list[Path]:
         return self._download_rel_paths(rel_paths, staging_dir)
 
+    def _read_gcs_range(self, rel_path: str, offset: int, length: int) -> bytes:
+        import asyncio
+
+        from fsspec.asyn import sync
+
+        async def _fetch() -> bytes:
+            await self._fs._set_session()
+            full_path = self._full_path(rel_path)
+            url = self._fs.url(full_path)
+            end = offset + length - 1
+            params = self._fs._get_params({})
+            timeout = getattr(self._fs, "requests_timeout", 60.0)
+            last_err: Exception | None = None
+
+            for attempt in range(7):
+                headers = self._fs._get_headers(
+                    {"Range": f"bytes={offset}-{end}", "Accept-Encoding": "identity"}
+                )
+                retry_delay: float | None = None
+                try:
+                    async with self._fs.session.get(
+                        url,
+                        params=params,
+                        headers=headers,
+                        timeout=timeout,
+                        auto_decompress=False,
+                    ) as resp:
+                        if resp.status == 206:
+                            encoding = (resp.headers.get("Content-Encoding") or "").strip().lower()
+                            if encoding and encoding != "identity":
+                                resp.close()
+                                raise RuntimeError(
+                                    f"Unexpected Content-Encoding {encoding!r} on GCS Range response for {url}"
+                                )
+                            expected_len = _validate_content_range(
+                                resp.headers.get("Content-Range"),
+                                offset=offset,
+                                max_length=length,
+                                label=url,
+                            )
+                            chunks: list[bytes] = []
+                            received = 0
+                            async for chunk in resp.content.iter_chunked(min(65536, max(1, expected_len))):
+                                if not chunk:
+                                    continue
+                                received += len(chunk)
+                                if received > expected_len:
+                                    resp.close()
+                                    raise RuntimeError(
+                                        f"GCS HTTP 206 response exceeded Content-Range ({expected_len} bytes) "
+                                        f"for {url}"
+                                    )
+                                chunks.append(chunk)
+                            if received != expected_len:
+                                raise RuntimeError(
+                                    f"Truncated GCS HTTP 206 response ({received}/{expected_len} bytes) "
+                                    f"for {url}"
+                                )
+                            return b"".join(chunks)
+
+                        if resp.status == 200:
+                            resp.close()
+                            raise RuntimeError(
+                                f"GCS server ignored Range request (returned HTTP 200 instead of 206) for {url}"
+                            )
+
+                        if resp.status in (429, 500, 502, 503, 504) and attempt < 6:
+                            retry_delay = _parse_retry_after(
+                                resp.headers.get("Retry-After"), 1.5 * (2**attempt)
+                            )
+                            resp.close()
+                        else:
+                            resp.close()
+                            resp.raise_for_status()
+                            raise RuntimeError(
+                                f"Unexpected GCS HTTP {resp.status} for Range request on {url}"
+                            )
+                except (OSError, asyncio.TimeoutError) as err:
+                    last_err = err
+                    if attempt == 6:
+                        raise
+                    retry_delay = min(1.5 * (2**attempt), 15.0)
+
+                if retry_delay is not None:
+                    await asyncio.sleep(retry_delay)
+
+            raise RuntimeError(f"GCS Range GET failed for {url} after retries: {last_err}")
+
+        return sync(self._fs.loop, _fetch)
+
     def read_range(self, rel_path: str, offset: int, length: int) -> bytes:
         if length <= 0:
             return b""
-        return self._fs.cat_file(self._full_path(rel_path), start=offset, end=offset + length)
+        if self._is_gcs:
+            return self._read_gcs_range(rel_path, offset, length)
+        data = self._fs.cat_file(self._full_path(rel_path), start=offset, end=offset + length)
+        if len(data) > length:
+            raise RuntimeError(
+                f"Range read returned {len(data)} bytes, exceeding requested {length} "
+                f"for {self.root_uri}/{rel_path}"
+            )
+        return data
 
     def default_video_base_uri(self, video_rels: list[str]) -> str:
         return _default_base_from_root(self.root_uri, video_rels)
