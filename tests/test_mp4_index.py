@@ -11,6 +11,7 @@ import pytest
 
 from lerobot_lancedb.mp4_index import (
     DEFAULT_HEADER_PROBE_BYTES,
+    DEFAULT_MAX_PROBE_BYTES,
     _parse_stz2,
     probe_local_mp4,
     probe_mp4_byte_index,
@@ -156,8 +157,44 @@ def test_probe_rejects_truncated_faststart_and_trailing_mdat(tmp_path: Path):
             header_probe_bytes=min(1024, len(raw) // 2),
         )
 
+    # 4. Trailing second mdat after a >64 MiB free box is detected by jumping box headers
+    # without reading the padding payload.
+    free_size = DEFAULT_MAX_PROBE_BYTES + 8
+    free_hdr = struct.pack(">I4s", free_size, b"free")
+    tail_mdat = struct.pack(">I4s", 8, b"mdat")
+    virtual_size = len(raw) + free_size + len(tail_mdat)
+    total_read = 0
 
-def test_probe_supports_stz2_and_nonaligned_elst_parity_with_pyav(tmp_path: Path):
+    def _virtual_read(_p: str, off: int, length: int) -> bytes:
+        nonlocal total_read
+        end = min(off + length, virtual_size)
+        out = bytearray()
+        pos = off
+        while pos < end:
+            if pos < len(raw):
+                take = min(end, len(raw)) - pos
+                out.extend(raw[pos : pos + take])
+            elif pos < len(raw) + len(free_hdr):
+                start_in = pos - len(raw)
+                take = min(end - pos, len(free_hdr) - start_in)
+                out.extend(free_hdr[start_in : start_in + take])
+            elif pos < len(raw) + free_size:
+                take = min(end, len(raw) + free_size) - pos
+                out.extend(b"\x00" * take)
+            else:
+                start_in = pos - (len(raw) + free_size)
+                take = min(end - pos, len(tail_mdat) - start_in)
+                out.extend(tail_mdat[start_in : start_in + take])
+            pos += take
+        total_read += len(out)
+        return bytes(out)
+
+    with pytest.raises(ValueError, match="multiple mdat"):
+        probe_mp4_byte_index("padded_tail.mp4", _virtual_read, file_size=virtual_size)
+    assert total_read == DEFAULT_HEADER_PROBE_BYTES + len(tail_mdat)
+
+
+def test_probe_supports_stz2_and_elst_bounds_parity_with_pyav(tmp_path: Path):
     # 1. Rewrite stsz -> stz2 (16-bit compact sample sizes) and verify parity with PyAV.
     orig = tmp_path / "stsz.mp4"
     compact = tmp_path / "stz2.mp4"
@@ -180,8 +217,8 @@ def test_probe_supports_stz2_and_nonaligned_elst_parity_with_pyav(tmp_path: Path
     assert _parse_stz2(struct.pack(">I3xBI", 0, 8, 3) + bytes([5, 12, 250])).tolist() == [5, 12, 250]
     assert _parse_stz2(struct.pack(">I3xBI", 0, 4, 3) + bytes([0x3A, 0x70])).tolist() == [3, 10, 7]
 
-    # 2. Non-frame-aligned elst media_time (as produced by `ffmpeg -ss ... -c copy`)
-    # snaps to the first displayed sample with raw_pts >= media_time, matching PyAV.
+    # 2. Non-frame-aligned leading elst media_time snaps to the first displayed sample
+    # with raw_pts >= media_time and reports exact presented frame count, matching PyAV.
     bframe_mp4 = tmp_path / "bframes.mp4"
     trimmed_mp4 = tmp_path / "trimmed_elst.mp4"
     _encode_mp4(bframe_mp4, frames=24, faststart=True, bframes=2)
@@ -190,8 +227,19 @@ def test_probe_supports_stz2_and_nonaligned_elst_parity_with_pyav(tmp_path: Path
     version = buf[elst_pos + 4]
     assert version == 0
     seg_dur, media_time, rate_int, rate_frac = struct.unpack_from(">Iihh", buf, elst_pos + 12)
-    # Shift media_time to a non-frame-aligned offset mid-GOP.
     struct.pack_into(">Iihh", buf, elst_pos + 12, seg_dur, media_time + 3379, rate_int, rate_frac)
     trimmed_mp4.write_bytes(bytes(buf))
 
-    assert probe_local_mp4(trimmed_mp4).to_index_dict() == build_video_byte_index(trimmed_mp4)
+    probed_trimmed = probe_local_mp4(trimmed_mp4)
+    assert probed_trimmed.to_index_dict() == build_video_byte_index(trimmed_mp4)
+    with av.open(str(trimmed_mp4)) as container:
+        decoded_trimmed = sum(1 for _ in container.decode(video=0))
+    assert probed_trimmed.sample_count == decoded_trimmed < 24
+
+    # 3. Tail-truncating elst (segment_duration shorter than encoded samples) is rejected loudly.
+    clipped_mp4 = tmp_path / "clipped_elst.mp4"
+    buf_clip = bytearray(bframe_mp4.read_bytes())
+    struct.pack_into(">Iihh", buf_clip, elst_pos + 12, 400, media_time, rate_int, rate_frac)
+    clipped_mp4.write_bytes(bytes(buf_clip))
+    with pytest.raises(ValueError, match="edit list truncates trailing samples"):
+        probe_local_mp4(clipped_mp4)

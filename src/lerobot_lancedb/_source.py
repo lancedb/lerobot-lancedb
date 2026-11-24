@@ -124,10 +124,17 @@ def _validate_content_range(
     if not match:
         raise RuntimeError(f"Malformed Content-Range header {header!r} for {label}")
     start, end = int(match.group(1)), int(match.group(2))
+    total_raw = match.group(3)
     if start != offset or end < start:
         raise RuntimeError(
             f"Unexpected Content-Range {header!r} (requested offset {offset}) for {label}"
         )
+    if total_raw != "*":
+        total = int(total_raw)
+        if end >= total:
+            raise RuntimeError(
+                f"Invalid Content-Range {header!r} (last byte {end} >= total length {total}) for {label}"
+            )
     expected_len = end - start + 1
     if expected_len > max_length:
         raise RuntimeError(
@@ -580,12 +587,18 @@ class S3Source(DatasetSource):
             status = (resp.get("ResponseMetadata") or {}).get("HTTPStatusCode")
             if status is not None and status != 206:
                 raise RuntimeError(f"S3 server ignored Range request (HTTP {status}) for {label}")
-            content_range = resp.get("ContentRange")
-            if content_range is not None:
-                _validate_content_range(content_range, offset=offset, max_length=length, label=label)
-            data = body.read(length + 1)
-            if len(data) > length:
-                raise RuntimeError(f"S3 Range response exceeded requested {length} bytes for {label}")
+            expected_len = _validate_content_range(
+                resp.get("ContentRange"), offset=offset, max_length=length, label=label
+            )
+            data = body.read(expected_len + 1)
+            if len(data) > expected_len:
+                raise RuntimeError(
+                    f"S3 Range response exceeded Content-Range ({expected_len} bytes) for {label}"
+                )
+            if len(data) < expected_len:
+                raise RuntimeError(
+                    f"Truncated S3 Range response ({len(data)}/{expected_len} bytes) for {label}"
+                )
             return data
         finally:
             body.close()
@@ -604,7 +617,7 @@ class FsspecSource(DatasetSource):
         storage_options: dict[str, str] | None = None,
         max_workers: int = DEFAULT_IO_WORKERS,
     ) -> None:
-        import fsspec
+        from fsspec.core import url_to_fs
 
         canonical = normalize_base_uri(uri)
         parsed = urlsplit(canonical)
@@ -613,7 +626,7 @@ class FsspecSource(DatasetSource):
         self.root_uri = canonical
         self.root_label = canonical
         self.max_workers = max(1, max_workers)
-        self._fs, root_path = fsspec.url_to_fs(decoded_url, **(storage_options or {}))
+        self._fs, root_path = url_to_fs(decoded_url, **(storage_options or {}))
         self._root_path = root_path.rstrip("/")
         self._files_cache: dict[str, SourceObject] | None = None
 

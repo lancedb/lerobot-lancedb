@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import struct
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from shutil import copytree
 from threading import Thread
@@ -27,13 +30,22 @@ from lerobot.datasets import dataset_metadata as upstream_meta
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 
 from lerobot_lancedb import LanceDBDataset
-from lerobot_lancedb._source import FsspecSource, HubSource, LocalSource, S3Source, parse_hf_dataset_uri
+from lerobot_lancedb._source import (
+    FsspecSource,
+    HubSource,
+    LocalSource,
+    S3Source,
+    _validate_content_range,
+    parse_hf_dataset_uri,
+)
 from lerobot_lancedb.convert import (
+    _MANAGED_OUTPUT_ENTRIES,
     FRAMES_TABLE,
     META_TABLE,
     VIDEO_BLOB_COLUMN,
     VIDEOS_TABLE,
     DamagedSourceError,
+    _commit_local_output,
     _resolve_video_mode,
     convert,
     main,
@@ -505,21 +517,39 @@ def test_truncated_faststart_mp4_rejected_by_external_convert(tmp_path: Path):
     assert not out.exists()
 
 
-def test_revision_forwarded_in_copy_and_external_never_falls_back_to_hub(tmp_path: Path, monkeypatch):
+def test_revision_pinned_in_copy_and_external_never_falls_back_to_hub(tmp_path: Path, monkeypatch):
     selected = _make_dataset(tmp_path / "selected", frames_per_ep=6)
+    sha = "b" * 40
+    calls: list[tuple[str, str]] = []
 
-    # 1. copy mode forwards revision to LeRobotDataset.
-    recorded: list[tuple[str, dict]] = []
+    class _FakeHfApi:
+        def __init__(self, token=None):
+            self.token = token
 
-    def _fake_lerobot_dataset(repo_id, **kwargs):
-        recorded.append((repo_id, kwargs))
-        return SimpleNamespace(root=selected)
+        def dataset_info(self, repo_id, revision="main"):
+            calls.append(("dataset_info", f"{repo_id}@{revision}"))
+            return SimpleNamespace(sha=sha)
 
-    monkeypatch.setattr("lerobot.datasets.lerobot_dataset.LeRobotDataset", _fake_lerobot_dataset)
-    convert(tmp_path / "managed_out", repo_id="test/fixture", video_mode="copy", revision="requested-sha")
-    assert recorded == [("test/fixture", {"revision": "requested-sha"})]
+    def _fake_snapshot_download(*, repo_id, repo_type, revision, token):
+        assert repo_type == "dataset"
+        calls.append(("snapshot_download", f"{repo_id}@{revision}"))
+        return str(selected)
 
-    # 2. external mode fails loudly when staged meta/ is incomplete instead of pulling another revision.
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FakeHfApi)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot_download)
+
+    # 1. copy mode resolves revision -> commit SHA and converts strictly from that snapshot.
+    convert(tmp_path / "managed_out", repo_id="test/fixture", video_mode="copy", revision="v3.0")
+    assert calls == [
+        ("dataset_info", "test/fixture@v3.0"),
+        ("snapshot_download", f"test/fixture@{sha}"),
+    ]
+
+    # 2. Passing --revision with a non-hf:// --root fails loudly instead of being ignored.
+    with pytest.raises(ValueError, match="--revision is only supported"):
+        convert(tmp_path / "bad_rev_out", root=selected, video_mode="copy", revision=sha)
+
+    # 3. external mode fails loudly when staged meta/ is incomplete instead of pulling another revision.
     (selected / "meta" / "tasks.parquet").unlink()
 
     class _StagedSource(LocalSource):
@@ -536,6 +566,106 @@ def test_revision_forwarded_in_copy_and_external_never_falls_back_to_hub(tmp_pat
 
     with pytest.raises(FileNotFoundError, match="tasks.parquet"):
         convert(tmp_path / "ext_out", repo_id="test/fixture", revision="requested-sha")
+
+
+def test_tail_clipped_elst_rejected_by_external_convert(tmp_path: Path):
+    src = _make_dataset(tmp_path / "src", frames_per_ep=10)
+    video = src / "videos" / VIDEO_KEY / "chunk-000" / "file-000.mp4"
+    buf = bytearray(video.read_bytes())
+    elst_idx = buf.index(b"elst")
+    struct.pack_into(">I", buf, elst_idx + 12, 400)
+    video.write_bytes(bytes(buf))
+
+    out = tmp_path / "out"
+    with pytest.raises(DamagedSourceError, match="edit list truncates trailing samples"):
+        convert(out, root=src, video_mode="external")
+    assert not out.exists()
+
+
+def test_remote_output_refuses_in_place_overwrite(tmp_path: Path, monkeypatch):
+    src = _make_dataset(tmp_path / "src", frames_per_ep=6)
+
+    class _ExistingRemoteDb:
+        def list_tables(self, page_token=None):
+            return SimpleNamespace(tables=[FRAMES_TABLE, VIDEOS_TABLE, META_TABLE], page_token=None)
+
+    monkeypatch.setattr("lerobot_lancedb.convert._connect_output", lambda *_a, **_kw: _ExistingRemoteDb())
+    for mode in ("external", "copy"):
+        with pytest.raises(FileExistsError, match="already contains table"):
+            convert("s3://example-bucket/already-published", root=src, video_mode=mode)
+
+
+def test_local_publish_serializes_writers_and_preserves_backup_on_rollback_error(tmp_path: Path, monkeypatch):
+    out = tmp_path / "out"
+    build_a = tmp_path / "build_a"
+    build_b = tmp_path / "build_b"
+    for root in (out, build_a, build_b):
+        for name in _MANAGED_OUTPUT_ENTRIES:
+            (root / name).mkdir(parents=True, exist_ok=True)
+            (root / name / "owner").write_text(root.name)
+
+    # 1. Two concurrent publications serialize cleanly and leave a coherent single-owner output.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(_commit_local_output, build_a, out)
+        f2 = pool.submit(_commit_local_output, build_b, out)
+        f1.result(10)
+        f2.result(10)
+    owners = {(out / name / "owner").read_text() for name in _MANAGED_OUTPUT_ENTRIES}
+    assert len(owners) == 1 and owners <= {"build_a", "build_b"}
+
+    # 2. If swap fails AND rollback also fails, the backup directory is preserved rather than deleted.
+    build_c = tmp_path / "build_c"
+    for name in _MANAGED_OUTPUT_ENTRIES:
+        (build_c / name).mkdir(parents=True, exist_ok=True)
+        (build_c / name / "owner").write_text("build_c")
+
+    real_rename = Path.rename
+
+    def _flaky_rename(self: Path, target: Path):
+        if self == build_c / f"{FRAMES_TABLE}.lance":
+            raise OSError("simulated publish failure")
+        if self.name == "meta" and self.parent.name.startswith(".out.old-"):
+            raise OSError("simulated rollback failure")
+        return real_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", _flaky_rename)
+    with pytest.raises(OSError, match="simulated publish failure"):
+        _commit_local_output(build_c, out)
+    backups = list(tmp_path.glob(".out.old-*"))
+    assert len(backups) == 1
+    assert (backups[0] / "meta" / "owner").exists()
+
+
+def test_range_validation_and_fsspec_core_compat(tmp_path: Path, monkeypatch):
+    # 1. Content-Range rejects last-byte >= total-length.
+    with pytest.raises(RuntimeError, match="last byte 7 >= total length 7"):
+        _validate_content_range("bytes 4-7/7", offset=4, max_length=4, label="clip.mp4")
+
+    # 2. S3Source requires Content-Range and exact body length matching Content-Range.
+    for content_range, body_bytes, match in [
+        (None, b"1234", "Missing Content-Range"),
+        ("bytes 4-6/20", b"1234", "exceeded Content-Range"),
+        ("bytes 4-7/20", b"12", "Truncated S3 Range"),
+    ]:
+        body = BytesIO(body_bytes)
+        resp: dict[str, object] = {"Body": body, "ResponseMetadata": {"HTTPStatusCode": 206}}
+        if content_range is not None:
+            resp["ContentRange"] = content_range
+        fake_s3 = S3Source.__new__(S3Source)
+        fake_s3._client = SimpleNamespace(get_object=lambda _r=resp, **_kw: _r, close=lambda: None)
+        fake_s3.prefix = ""
+        fake_s3.bucket = "test-bucket"
+        with pytest.raises(RuntimeError, match=match):
+            fake_s3.read_range("clip.mp4", 4, 4)
+        assert body.closed
+
+    # 3. FsspecSource uses fsspec.core.url_to_fs (compatible with fsspec==2024.2.0 / gcsfs==2024.2.0).
+    monkeypatch.delattr(fsspec, "url_to_fs", raising=False)
+    mem_fs = fsspec.filesystem("memory")
+    prefix = f"lerobot-fsspec-compat-{tmp_path.name}"
+    mem_fs.pipe(f"{prefix}/meta/info.json", b"{}")
+    src = FsspecSource(f"memory://{prefix}")
+    assert "meta/info.json" in src.list_files()
 
 
 def test_s3_loopback_roundtrip_storage_options_and_special_keys(tmp_path: Path, monkeypatch):

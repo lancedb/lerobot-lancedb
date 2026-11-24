@@ -88,14 +88,17 @@ copying MP4 payloads into `videos.lance`, while local directory roots copy MP4s
 into managed blobs (`copy`) so removing the source directory does not break the
 output. External conversion transfers only the bounded Range-GET bytes needed to
 read each MP4's `moov` box (1 MiB initial probe by default) and stages `meta/`
-plus referenced `data/*.parquet` files under `TMPDIR` during preflight. External
-MP4 indexing supports standard non-fragmented single-`mdat` MP4s (`stsz`/`stz2`
-and rate-one edit lists) and rejects truncated, fragmented (`moof`/`mvex`), or
-multi-`mdat` containers before writing output. Pass `--video-mode external` or
-`--video-mode copy` to override, and `--video-base-uri` when indexing from a
-local mirror of an object-store bucket. For local outputs converted in `copy`
-mode, push `./my-lance/` to object storage (`aws s3 cp --recursive`, etc.) and
-point training at the URI.
+plus referenced `data/*.parquet` files under `TMPDIR` during preflight. External MP4 indexing supports standard non-fragmented single-`mdat` MP4s
+(`stsz`/`stz2` and rate-one edit lists that do not truncate trailing samples)
+and rejects truncated, tail-clipped, fragmented (`moof`/`mvex`), or multi-`mdat`
+containers before writing output. Remote `--out` prefixes refuse overwriting
+existing tables in place (convert to a new prefix or remove the prior tables
+first), while local `--out` directories build in a sibling staging directory and
+swap cleanly on success. Pass `--video-mode external` or `--video-mode copy` to
+override, and `--video-base-uri` when indexing from a local mirror of an
+object-store bucket. For local outputs converted in `copy` mode, push
+`./my-lance/` to object storage (`aws s3 cp --recursive`, etc.) and point
+training at the URI.
 
 The conversion runs the doctor's checks on the source first and refuses a dataset
 that is damaged where its own metadata references it - short aggregated videos,

@@ -28,10 +28,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import shutil
 import sys
 import tempfile
+import threading
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -39,6 +42,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
 
 import lancedb
 import numpy as np
@@ -77,6 +85,8 @@ VIDEO_BATCH_BYTES = 512 * 1024 * 1024
 EXTERNAL_VIDEO_BATCH_BYTES = 64 * 1024 * 1024
 VideoMode = Literal["auto", "external", "copy"]
 _MANAGED_OUTPUT_ENTRIES = ("meta", f"{META_TABLE}.lance", f"{FRAMES_TABLE}.lance", f"{VIDEOS_TABLE}.lance")
+_PUBLISH_LOCKS_GUARD = threading.Lock()
+_PUBLISH_LOCKS: dict[Path, threading.Lock] = {}
 
 
 class _StagedMetaMissing(RuntimeError):
@@ -481,42 +491,109 @@ def _local_build_dir(out_path: Path):
             shutil.rmtree(build_dir, ignore_errors=True)
 
 
+@contextmanager
+def _local_publish_lock(resolved_out: Path):
+    """Serialize local publication to ``resolved_out`` across threads and processes."""
+    with _PUBLISH_LOCKS_GUARD:
+        thread_lock = _PUBLISH_LOCKS.get(resolved_out)
+        if thread_lock is None:
+            thread_lock = threading.Lock()
+            _PUBLISH_LOCKS[resolved_out] = thread_lock
+    uid_suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
+    lock_dir = Path(tempfile.gettempdir()) / f"lerobot-lancedb-locks{uid_suffix}"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    digest = hashlib.sha256(os.fsencode(resolved_out)).hexdigest()[:32]
+    lock_path = lock_dir / f"{digest}.lock"
+    with thread_lock:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _commit_local_output(build_dir: Path, out_path: Path) -> None:
     """Publish a fully built local output directory without clobbering existing tables on failure."""
     resolved = out_path.resolve()
-    if not resolved.exists():
-        build_dir.rename(resolved)
-        return
-    if not resolved.is_dir():
-        raise FileExistsError(f"Output path exists and is not a directory: {resolved}")
+    with _local_publish_lock(resolved):
+        if not resolved.exists():
+            build_dir.rename(resolved)
+            return
+        if not resolved.is_dir():
+            raise FileExistsError(f"Output path exists and is not a directory: {resolved}")
 
-    backup_dir = Path(tempfile.mkdtemp(prefix=f".{resolved.name}.old-", dir=resolved.parent))
-    moved_old: list[str] = []
-    moved_new: list[str] = []
-    try:
-        for name in _MANAGED_OUTPUT_ENTRIES:
-            existing = resolved / name
-            if existing.exists():
-                existing.rename(backup_dir / name)
-                moved_old.append(name)
-        for name in _MANAGED_OUTPUT_ENTRIES:
-            built = build_dir / name
-            if built.exists():
-                built.rename(resolved / name)
-                moved_new.append(name)
-    except BaseException:
-        for name in reversed(moved_new):
-            target = resolved / name
-            if target.exists():
-                target.rename(build_dir / name)
-        for name in reversed(moved_old):
-            saved = backup_dir / name
-            if saved.exists():
-                saved.rename(resolved / name)
-        raise
-    finally:
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir, ignore_errors=True)
+        backup_dir = Path(tempfile.mkdtemp(prefix=f".{resolved.name}.old-", dir=resolved.parent))
+        moved_old: list[str] = []
+        moved_new: list[str] = []
+        can_delete_backup = False
+        try:
+            for name in _MANAGED_OUTPUT_ENTRIES:
+                existing = resolved / name
+                if existing.exists():
+                    existing.rename(backup_dir / name)
+                    moved_old.append(name)
+            for name in _MANAGED_OUTPUT_ENTRIES:
+                built = build_dir / name
+                if built.exists():
+                    built.rename(resolved / name)
+                    moved_new.append(name)
+            can_delete_backup = True
+        except BaseException:
+            rollback_ok = True
+            for name in reversed(moved_new):
+                target = resolved / name
+                if target.exists():
+                    try:
+                        target.rename(build_dir / name)
+                    except OSError:
+                        rollback_ok = False
+            for name in reversed(moved_old):
+                saved = backup_dir / name
+                if saved.exists():
+                    try:
+                        saved.rename(resolved / name)
+                    except OSError:
+                        rollback_ok = False
+            if rollback_ok and not any(backup_dir.iterdir()):
+                can_delete_backup = True
+            else:
+                print(
+                    f"warning: rollback of {resolved} was incomplete; previous output preserved at {backup_dir}",
+                    file=sys.stderr,
+                )
+            raise
+        finally:
+            if can_delete_backup and backup_dir.exists():
+                shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def _ensure_remote_output_empty(db, out_target: Path | str) -> None:
+    """Refuse overwriting an existing remote output where tables cannot be swapped atomically."""
+    managed = {META_TABLE, FRAMES_TABLE, VIDEOS_TABLE}
+    existing: set[str] = set()
+    page_token: str | None = None
+    while True:
+        listing = db.list_tables(page_token=page_token) if page_token else db.list_tables()
+        for name in listing.tables:
+            if name in managed:
+                existing.add(name)
+        page_token = listing.page_token
+        if not page_token:
+            break
+    if existing:
+        found = ", ".join(sorted(existing))
+        raise FileExistsError(
+            f"Remote output {str(out_target)!r} already contains table(s): {found}. "
+            "Refusing to overwrite an existing remote dataset in place because LanceDB cannot "
+            "swap tables atomically across object storage; convert to a new prefix or remove "
+            "the existing tables first."
+        )
 
 
 def _prepare_stamped_meta(src_meta_dir: Path, target_dir: Path) -> Path:
@@ -603,25 +680,47 @@ def _convert_copy(
     allow_defects: bool,
     revision: str | None,
     storage_options: dict[str, str] | None,
+    source_storage_options: dict[str, str] | None = None,
 ) -> None:
+    if is_remote_uri(out_target):
+        _ensure_remote_output_empty(_connect_output(out_target, storage_options), out_target)
+
+    effective_revision = revision
     if root is not None:
         src_root = _local_path(root)
         if not (src_root / "meta").is_dir():
             raise FileNotFoundError(f"{src_root} does not look like a LeRobot dataset (no meta/ dir)")
     elif repo_id is not None:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        import huggingface_hub
 
-        ds_kwargs = {"revision": revision} if revision is not None else {}
-        ds = LeRobotDataset(repo_id, **ds_kwargs)  # downloads to $HF_LEROBOT_HOME if needed
-        src_root = Path(ds.root)
+        src_opts = source_storage_options if source_storage_options is not None else storage_options
+        token = (
+            (src_opts or {}).get("token")
+            or (src_opts or {}).get("hf_token")
+            or os.environ.get("HF_TOKEN")
+            or huggingface_hub.get_token()
+        )
+        api = huggingface_hub.HfApi(token=token)
+        info = api.dataset_info(repo_id, revision=revision or "main")
+        if not info.sha:
+            raise RuntimeError(f"Could not resolve commit SHA for {repo_id!r}@{revision or 'main'}")
+        effective_revision = info.sha
+        src_root = Path(
+            huggingface_hub.snapshot_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                revision=effective_revision,
+                token=token,
+            )
+        )
     else:
         raise ValueError("pass --repo-id or --root")
 
+    # Select files from meta/episodes before auditing/creating output so an
+    # incomplete snapshot fails locally without falling back to another Hub revision.
+    meta = _load_local_metadata(repo_id or str(src_root), root=src_root, revision=effective_revision)
     _reject_damaged_source(src_root, repo_id, allow_defects)
 
-    # Select files from meta/episodes before creating the output, so an
-    # incomplete source fails without leaving a half-built dataset behind.
-    meta = _load_local_metadata(repo_id or str(src_root), root=src_root, revision=revision)
     data_files, video_files = _referenced_files(meta, src_root)
     _check_referenced_files_exist(src_root, data_files, video_files)
     _warn_orphans(src_root, data_files, video_files)
@@ -655,28 +754,35 @@ def _convert_copy(
         if pending:
             yield pa.RecordBatch.from_pylist(pending, schema=storage_schema)
 
-    def _build_into(db, meta_dir: Path, *, table_mode: str) -> None:
-        frames_table = _write_frames_table(db, data_files, mode=table_mode)
+    def _build_into(db, meta_dir: Path) -> None:
+        frames_table = _write_frames_table(db, data_files, mode="create")
         print(f"building videos table from {len(video_files)} files (managed copy) ...")
-        videos_table = db.create_table(VIDEOS_TABLE, schema=schema, mode=table_mode)
         if video_files:
-            videos_table.add(pa.RecordBatchReader.from_batches(storage_schema, video_batches()))
+            videos_table = db.create_table(
+                VIDEOS_TABLE,
+                pa.RecordBatchReader.from_batches(storage_schema, video_batches()),
+                schema=schema,
+                mode="create",
+            )
+        else:
+            videos_table = db.create_table(VIDEOS_TABLE, schema=schema, mode="create")
         print(f"  {videos_table.count_rows()} rows")
-        _write_meta_table(db, meta_dir, mode=table_mode)
+        _write_meta_table(db, meta_dir, mode="create")
         _create_scalar_indexes(frames_table, videos_table if video_files else None)
 
     if is_remote_uri(out_target):
         with tempfile.TemporaryDirectory(prefix="lerobot-lance-convert-") as tmp:
             meta_dir = _prepare_stamped_meta(src_root / "meta", Path(tmp))
             db = _connect_output(out_target, storage_options)
-            _build_into(db, meta_dir, table_mode="overwrite")
+            _ensure_remote_output_empty(db, out_target)
+            _build_into(db, meta_dir)
         _print_done(out_target)
     else:
         out_path = _local_path(out_target)
         with _local_build_dir(out_path) as build_dir:
             meta_dir = _prepare_stamped_meta(src_root / "meta", build_dir)
             db = _connect_output(build_dir, storage_options)
-            _build_into(db, meta_dir, table_mode="create")
+            _build_into(db, meta_dir)
             _commit_local_output(build_dir, out_path)
         _print_done(out_target)
 
@@ -749,6 +855,8 @@ def _convert_external(
     header_probe_bytes: int,
 ) -> None:
     normalized_explicit_base = normalize_base_uri(video_base_uri) if video_base_uri is not None else None
+    if is_remote_uri(out_target):
+        _ensure_remote_output_empty(_connect_output(out_target, storage_options), out_target)
     src_opts = source_storage_options if source_storage_options is not None else storage_options
     with (
         open_source(
@@ -928,15 +1036,14 @@ def _convert_external(
             if video_keys:
                 yield flush()
 
-        def _build_into(db, meta_dir: Path, *, table_mode: str, drop_existing_videos: bool) -> None:
+        def _build_into(db, meta_dir: Path) -> None:
             videos_create_kwargs = {"storage_options": videos_write_opts} if videos_write_opts else {}
+            frames_table = _write_frames_table(db, data_paths, mode="create")
             if video_refs:
                 print(
                     f"building videos table from {len(video_refs)} external video(s) "
                     f"(base: {resolved_base_uri}) ..."
                 )
-                if drop_existing_videos:
-                    db.drop_table(VIDEOS_TABLE, ignore_missing=True)
                 videos_table = db.create_table(
                     VIDEOS_TABLE,
                     pa.RecordBatchReader.from_batches(schema, ext_video_batches()),
@@ -951,13 +1058,10 @@ def _convert_external(
                     f"{total_video_bytes / 1e9:.2f} GB source MP4s)"
                 )
             else:
-                if drop_existing_videos:
-                    db.drop_table(VIDEOS_TABLE, ignore_missing=True)
                 videos_table = db.create_table(VIDEOS_TABLE, schema=schema, mode="create")
                 print("  0 rows")
 
-            frames_table = _write_frames_table(db, data_paths, mode=table_mode)
-            _write_meta_table(db, meta_dir, mode=table_mode)
+            _write_meta_table(db, meta_dir, mode="create")
             _create_scalar_indexes(frames_table, videos_table if video_refs else None)
 
         if is_remote_uri(out_target):
@@ -972,14 +1076,15 @@ def _convert_external(
                 )
             meta_dir = _prepare_stamped_meta(meta_root / "meta", staging / "_stamped")
             db = _connect_output(out_target, storage_options)
-            _build_into(db, meta_dir, table_mode="overwrite", drop_existing_videos=True)
+            _ensure_remote_output_empty(db, out_target)
+            _build_into(db, meta_dir)
             _print_done(out_target, extra=f"external base: {resolved_base_uri}" if video_refs else "")
         else:
             out_path = _local_path(out_target)
             with _local_build_dir(out_path) as build_dir:
                 meta_dir = _prepare_stamped_meta(meta_root / "meta", build_dir)
                 db = _connect_output(build_dir, storage_options)
-                _build_into(db, meta_dir, table_mode="create", drop_existing_videos=False)
+                _build_into(db, meta_dir)
                 _commit_local_output(build_dir, out_path)
             _print_done(out_target, extra=f"external base: {resolved_base_uri}" if video_refs else "")
 
@@ -1037,6 +1142,10 @@ def convert(
     """
     if repo_id is None and root is None:
         raise ValueError("pass --repo-id or --root")
+    if revision is not None and root is not None and not str(root).startswith("hf://"):
+        raise ValueError(
+            "--revision is only supported for Hugging Face Hub sources (--repo-id or hf:// root)"
+        )
 
     mode = _resolve_video_mode(video_mode, repo_id, root, video_base_uri=video_base_uri)
     if mode == "external":
@@ -1060,6 +1169,7 @@ def convert(
             allow_defects=allow_defects,
             revision=revision,
             storage_options=storage_options,
+            source_storage_options=source_storage_options,
         )
 
 
