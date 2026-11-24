@@ -557,6 +557,35 @@ def test_revision_pinned_in_copy_and_external_never_falls_back_to_hub(tmp_path: 
     convert(tmp_path / "managed_default_out", repo_id="test/fixture", video_mode="copy")
     assert ds_calls == [("test/fixture", {})]
 
+    # 2b. LeRobot 0.6.0 compatibility: explicit token without --revision works when LeRobotDataset
+    # has no token= parameter (reusing $HF_LEROBOT_HOME cache if present, else downloading with token).
+    class _LegacyLeRobotDataset:
+        def __init__(self, repo_id):  # no token parameter (LeRobot 0.6.0)
+            raise AssertionError("Should not call 0.6.0 LeRobotDataset with explicit token")
+
+    monkeypatch.setattr("lerobot.datasets.lerobot_dataset.LeRobotDataset", _LegacyLeRobotDataset)
+    fake_home = tmp_path / "lerobot_home"
+    copytree(selected, fake_home / "test/cached")
+    monkeypatch.setattr(upstream_meta, "HF_LEROBOT_HOME", fake_home)
+    calls.clear()
+    convert(
+        tmp_path / "managed_06_cached",
+        repo_id="test/cached",
+        video_mode="copy",
+        source_storage_options={"token": "hf_06"},
+    )
+    assert calls == []
+    convert(
+        tmp_path / "managed_06_remote",
+        repo_id="test/uncached",
+        video_mode="copy",
+        source_storage_options={"token": "hf_06"},
+    )
+    assert calls == [
+        ("dataset_info", f"test/uncached@{upstream_meta.CODEBASE_VERSION}"),
+        ("snapshot_download", f"test/uncached@{sha}"),
+    ]
+
     # 3. Passing --revision with a non-hf:// --root fails loudly instead of being ignored.
     with pytest.raises(ValueError, match="--revision is only supported"):
         convert(tmp_path / "bad_rev_out", root=selected, video_mode="copy", revision=sha)

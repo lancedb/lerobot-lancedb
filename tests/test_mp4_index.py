@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import shutil
 import struct
+import subprocess
 from pathlib import Path
 
 import av
@@ -261,6 +263,44 @@ def test_probe_supports_stz2_and_elst_bounds_parity_with_pyav(tmp_path: Path):
     with pytest.raises(ValueError, match="23 of 24 samples presented"):
         probe_local_mp4(boundary_mp4)
 
+    # 6. Open-GOP trimmed MP4 presenting leading B-frame(s) before first sync sample PTS
+    # (whose decodability cannot be proven from container metadata alone) is rejected.
+    ctts_pos = bframe_mp4.read_bytes().index(b"ctts")
+    buf_opengop = bytearray(bframe_mp4.read_bytes())
+    # Give sample 0 (the first sync sample) a larger composition offset than sample 1 so
+    # sample 1 presents earlier than sample 0 while falling inside elst [media_time, edit_end).
+    c0_count, c0_off = struct.unpack_from(">II", buf_opengop, ctts_pos + 12)
+    assert c0_count >= 1
+    struct.pack_into(">II", buf_opengop, ctts_pos + 12, 1, c0_off + 2048)
+    opengop_mp4 = tmp_path / "opengop_leading.mp4"
+    opengop_mp4.write_bytes(bytes(buf_opengop))
+    with pytest.raises(ValueError, match="open-GOP leading sample"):
+        probe_local_mp4(opengop_mp4)
+
+    if shutil.which("ffmpeg"):
+        full_og = tmp_path / "full_opengop.mp4"
+        trimmed_og = tmp_path / "trimmed_opengop.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=32x32:rate=10", "-frames:v", "36",
+                "-c:v", "libx264", "-g", "6", "-bf", "2",
+                "-x264-params", "open-gop=1:b-adapt=0:scenecut=0",
+                "-threads", "1", "-movflags", "faststart", str(full_og),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", "0.45", "-i", str(full_og), "-c", "copy", "-movflags", "faststart",
+                str(trimmed_og),
+            ],
+            check=True,
+        )
+        with pytest.raises(ValueError, match="open-GOP leading sample"):
+            probe_local_mp4(trimmed_og)
+
 
 def test_probe_tail_moov_jumps_large_free_padding_before_and_after_moov(tmp_path: Path):
     orig = tmp_path / "tail.mp4"
@@ -268,20 +308,33 @@ def test_probe_tail_moov_jumps_large_free_padding_before_and_after_moov(tmp_path
     expected = build_video_byte_index(orig)
     raw = orig.read_bytes()
     moov_offset = expected["moov_offset"]
-    prefix = raw[:moov_offset]
+    mdat_offset = raw.index(b"mdat") - 4
+    prefix = bytearray(raw[:moov_offset])
+    body_pad = 16384
+    mdat_size = struct.unpack_from(">I", prefix, mdat_offset)[0]
+    struct.pack_into(">I", prefix, mdat_offset, mdat_size + body_pad)
     moov = raw[moov_offset:]
     free_size = DEFAULT_MAX_PROBE_BYTES + 4096
     free_hdr = struct.pack(">I4s", free_size, b"free")
 
     for placement in ("before", "after"):
         segments = (
-            [(prefix, len(prefix)), (free_hdr, free_size), (moov, len(moov))]
+            [(bytes(prefix), len(prefix) + body_pad), (free_hdr, free_size), (moov, len(moov))]
             if placement == "before"
-            else [(prefix, len(prefix)), (moov, len(moov)), (free_hdr, free_size)]
+            else [(bytes(prefix), len(prefix) + body_pad), (moov, len(moov)), (free_hdr, free_size)]
         )
         total_size = sum(seg_len for _, seg_len in segments)
+        read_sizes: list[int] = []
 
-        def _read(_p: str, off: int, length: int, segs=segments, size=total_size) -> bytes:
+        def _read(
+            _p: str,
+            off: int,
+            length: int,
+            segs=segments,
+            size=total_size,
+            sizes=read_sizes,
+        ) -> bytes:
+            sizes.append(length)
             end = min(off + length, size)
             out = bytearray()
             pos = off
@@ -307,3 +360,12 @@ def test_probe_tail_moov_jumps_large_free_padding_before_and_after_moov(tmp_path
         assert probed.kf_positions.tolist() == expected["kf_positions"]
         assert probed.moov_size == len(moov)
         assert probed.bytes_read < 64 * 1024
+
+        if placement == "after":
+            # Verify first tail read respects max_probe_bytes even with default 1 MiB header_probe_bytes.
+            read_sizes.clear()
+            probed_bounded = probe_mp4_byte_index(
+                "free_after_bounded.mp4", _read, file_size=total_size, max_probe_bytes=4096
+            )
+            assert probed_bounded.sample_count == 24
+            assert all(sz <= 4096 for sz in read_sizes)

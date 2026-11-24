@@ -473,6 +473,9 @@ def _parse_moov_keyframes(
     composition_offsets = _parse_ctts(stbl, n_samples)
     raw_pts_units = sample_pts_units + composition_offsets
 
+    first_sync = int(sync_samples[0])
+    first_sync_pts = int(raw_pts_units[first_sync])
+
     edit = _parse_edit_list(trak_payload)
     if edit is not None:
         empty_duration, segment_duration, media_time = edit
@@ -496,16 +499,43 @@ def _parse_moov_keyframes(
                 f"({presented} of {n_samples} samples presented within edit duration); "
                 "unsupported in external mode"
             )
-        presented_count = int((raw_pts_units >= media_time).sum())
+        if first_sync > 0:
+            pre_sync_in_edit = int((raw_pts_units[:first_sync] >= media_time).sum())
+            if pre_sync_in_edit > 0:
+                raise ValueError(
+                    f"{path}: MP4 edit list presents {pre_sync_in_edit} sample(s) before first sync "
+                    f"sample (index {first_sync}); unsupported in external mode"
+                )
+        leading_in_edit = int(
+            ((raw_pts_units[first_sync:] >= media_time) & (raw_pts_units[first_sync:] < first_sync_pts)).sum()
+        )
+        if leading_in_edit > 0:
+            raise ValueError(
+                f"{path}: MP4 edit list presents {leading_in_edit} open-GOP leading sample(s) "
+                f"before first sync sample PTS ({first_sync_pts}); container metadata cannot confirm "
+                "decodability — re-encode or trim at a closed keyframe"
+            )
+        presented_count = int((raw_pts_units[first_sync:] >= media_time).sum())
         if presented_count == 0:
             raise ValueError(f"{path}: MP4 edit list presents 0 samples")
         # Match FFmpeg's mov_fix_index: snap media_time to the first sample with
         # raw_pts >= media_time so stream-copy trimmed files align with PyAV PTS.
-        ge = raw_pts_units[raw_pts_units >= media_time]
+        ge = raw_pts_units[first_sync:][raw_pts_units[first_sync:] >= media_time]
         snapped_media_time = int(ge.min())
         sample_pts = (raw_pts_units - snapped_media_time).astype(np.float64) / float(media_timescale)
         sample_pts += float(empty_duration) / float(movie_timescale)
     else:
+        if first_sync > 0:
+            raise ValueError(
+                f"{path}: MP4 video track starts with {first_sync} non-sync sample(s) before first "
+                "keyframe; unsupported in external mode"
+            )
+        leading_before_sync = int((raw_pts_units < first_sync_pts).sum())
+        if leading_before_sync > 0:
+            raise ValueError(
+                f"{path}: MP4 starts with {leading_before_sync} open-GOP leading sample(s) before "
+                f"first sync sample PTS ({first_sync_pts}); container metadata cannot confirm decodability"
+            )
         presented_count = n_samples
         sample_pts = raw_pts_units.astype(np.float64) / float(media_timescale)
 
@@ -542,6 +572,8 @@ def probe_mp4_byte_index(
     """
     if file_size <= 0:
         raise ValueError(f"{path}: invalid file_size={file_size}")
+    if max_probe_bytes < 16:
+        raise ValueError(f"{path}: max_probe_bytes must be >= 16, got {max_probe_bytes}")
 
     range_gets = 0
     bytes_read = 0
@@ -559,9 +591,16 @@ def probe_mp4_byte_index(
         """Jump box-by-box from ``start_pos`` to EOF, rejecting trailing moof/mdat/moov."""
         pos = start_pos
         box_count = 0
+        tail_bytes_read = 0
         while pos < file_size:
-            win_len = min(_TAIL_HEADER_WINDOW_BYTES, file_size - pos)
+            remaining_budget = max_probe_bytes - tail_bytes_read
+            if remaining_budget <= 0:
+                raise ValueError(
+                    f"{path}: trailing box scan exceeded max_probe_bytes={max_probe_bytes}"
+                )
+            win_len = min(_TAIL_HEADER_WINDOW_BYTES, remaining_budget, file_size - pos)
             buf = tracked_read(pos, win_len)
+            tail_bytes_read += len(buf)
             if not buf:
                 raise ValueError(f"{path}: empty range read while scanning trailing boxes at offset {pos}")
             boxes = _iter_boxes(
@@ -663,18 +702,29 @@ def probe_mp4_byte_index(
 
             pos = top[-1].end
             box_count = 0
+            tail_bytes_read = 0
             tail_moov: _Box | None = None
             moov_payload: bytes | None = None
             first_tail_read = True
 
             while pos < file_size:
+                remaining_budget = max_probe_bytes - tail_bytes_read
+                if remaining_budget <= 0:
+                    raise ValueError(
+                        f"{path}: tail probe exceeded max_probe_bytes={max_probe_bytes}"
+                    )
                 if first_tail_read and tail_moov is None:
-                    win_len = min(max(header_probe_bytes, _TAIL_HEADER_WINDOW_BYTES), file_size - pos)
+                    win_len = min(
+                        max(header_probe_bytes, _TAIL_HEADER_WINDOW_BYTES),
+                        remaining_budget,
+                        file_size - pos,
+                    )
                 else:
-                    win_len = min(_TAIL_HEADER_WINDOW_BYTES, file_size - pos)
+                    win_len = min(_TAIL_HEADER_WINDOW_BYTES, remaining_budget, file_size - pos)
                 first_tail_read = False
 
                 buf = tracked_read(pos, win_len)
+                tail_bytes_read += len(buf)
                 if not buf:
                     raise ValueError(f"{path}: empty range read while scanning tail at offset {pos}")
                 boxes = _iter_boxes(
@@ -713,7 +763,13 @@ def probe_mp4_byte_index(
                             have = buf[box.payload_start - pos :] if box.payload_start < buf_end else b""
                             need_from = max(box.payload_start, buf_end)
                             need_len = box.end - need_from
+                            if tail_bytes_read + need_len > max_probe_bytes:
+                                raise ValueError(
+                                    f"{path}: tail moov read ({tail_bytes_read + need_len} bytes) "
+                                    f"exceeds max_probe_bytes={max_probe_bytes}"
+                                )
                             rest = tracked_read(need_from, need_len)
+                            tail_bytes_read += len(rest)
                             if len(rest) != need_len:
                                 raise ValueError(
                                     f"{path}: truncated tail moov read ({len(rest)}/{need_len} bytes)"

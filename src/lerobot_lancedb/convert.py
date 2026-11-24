@@ -692,11 +692,50 @@ def _convert_copy(
         src_opts = source_storage_options if source_storage_options is not None else storage_options
         explicit_token = (src_opts or {}).get("token") or (src_opts or {}).get("hf_token")
         if revision is None:
+            import inspect
+
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-            ds_kwargs = {"token": explicit_token} if explicit_token else {}
-            ds = LeRobotDataset(repo_id, **ds_kwargs)  # preserves v3.0 default and $HF_LEROBOT_HOME cache
-            src_root = Path(ds.root)
+            sig_target = LeRobotDataset.__init__ if isinstance(LeRobotDataset, type) else LeRobotDataset
+            params = inspect.signature(sig_target).parameters
+            accepts_token = "token" in params or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            if not explicit_token:
+                ds = LeRobotDataset(repo_id)  # preserves v3.0 default and $HF_LEROBOT_HOME cache
+                src_root = Path(ds.root)
+            elif accepts_token:
+                ds = LeRobotDataset(repo_id, token=explicit_token)
+                src_root = Path(ds.root)
+            else:
+                # LeRobot 0.6.x does not accept token= on LeRobotDataset.__init__:
+                # reuse a complete $HF_LEROBOT_HOME/<repo_id> cache if present,
+                # otherwise download through huggingface_hub with the explicit token.
+                from lerobot.datasets.dataset_metadata import CODEBASE_VERSION, HF_LEROBOT_HOME
+
+                cached_root = HF_LEROBOT_HOME / repo_id
+                if (cached_root / "meta" / "info.json").is_file() and (cached_root / "data").is_dir():
+                    src_root = cached_root
+                else:
+                    import huggingface_hub
+                    from huggingface_hub.errors import RevisionNotFoundError
+
+                    api = huggingface_hub.HfApi(token=explicit_token)
+                    try:
+                        info = api.dataset_info(repo_id, revision=CODEBASE_VERSION)
+                    except RevisionNotFoundError:
+                        info = api.dataset_info(repo_id, revision="main")
+                    if not info.sha:
+                        raise RuntimeError(f"Could not resolve commit SHA for {repo_id!r}")
+                    effective_revision = info.sha
+                    src_root = Path(
+                        huggingface_hub.snapshot_download(
+                            repo_id=repo_id,
+                            repo_type="dataset",
+                            revision=effective_revision,
+                            token=explicit_token,
+                        )
+                    )
         else:
             import huggingface_hub
 
