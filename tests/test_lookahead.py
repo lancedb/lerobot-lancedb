@@ -85,6 +85,24 @@ def test_range_io_overlaps_current_decode(dataset_root, monkeypatch):
     assert finished.is_set() and background
 
 
+def test_partial_vector_read_retains_whole_arrow_allocation():
+    class Table:
+        def fetch_blob_ranges(self, column, requests):
+            return pa.array([bytes(n) for _, _, n in requests])
+
+    buffer = RangeBuffer(8)
+    table = Table()
+    try:
+        buffer.submit(table, [(1, 0, 4), (2, 0, 4)])
+        buffer.consume(1, _SparseBlobSource(4, None), [(0, 4)])
+        buffer.submit(table, [(2, 0, 4), (3, 0, 4)])
+        assert buffer.reserved == 8 and (3, 0, 4) not in buffer.pending
+        buffer.consume(2, _SparseBlobSource(4, None), [(0, 4)])
+        assert buffer.reserved == 0
+    finally:
+        buffer.close()
+
+
 @pytest.mark.parametrize("failed", [True, False])
 def test_in_flight_reservation_and_recovery(failed):
     started, finish = threading.Event(), threading.Event()
