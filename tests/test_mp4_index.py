@@ -6,6 +6,7 @@ import shutil
 import struct
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import av
 import numpy as np
@@ -13,6 +14,7 @@ import pytest
 import torch
 from torchcodec.decoders import VideoDecoder
 
+from lerobot_lancedb import reader
 from lerobot_lancedb.mp4_index import (
     DEFAULT_HEADER_PROBE_BYTES,
     DEFAULT_MAX_PROBE_BYTES,
@@ -440,6 +442,15 @@ def test_multi_gop_sample_index_pixel_and_pts(tmp_path, codec, options, size, go
         # Exact mode independently scans the synthesized timeline, including holes.
         actual = VideoDecoder(mini).get_frames_at(indices=[positions[s] for s in index.order[indices]])
         assert torch.equal(actual.data, expected.data)
+        # Exercise the reader's approximate-seek strategy on the same encoded data.
+        ds = reader.LanceDBDataset.__new__(reader.LanceDBDataset)
+        ds.meta = SimpleNamespace(features={"camera": {"shape": [3, 720, 1280]}})
+        ds.return_uint8 = True
+        ds.tolerance_s = 0.0001
+        source = SimpleNamespace(cached_span=lambda start, end: data[start:end])
+        requests = [(0, expected.pts_seconds.tolist())]
+        result = ds._decode_mini_file(("camera", 0, 0), requests, reader._MiniFile(index, source), spans, [indices])
+        assert torch.equal(result[0][1], expected.data.squeeze(0))
         assert torch.equal(actual.pts_seconds, expected.pts_seconds)
         assert np.array_equal(
             np.rint(actual.pts_seconds.numpy() * index.timescale), index.pts[index.order[indices]]

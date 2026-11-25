@@ -150,6 +150,40 @@ def test_cold_multi_file_mini_ranges(indexed_videos, monkeypatch):
     assert restored._decoder_cache._total_bytes == restored._index_cache._total_bytes == 0
 
 
+def test_mini_pts_mismatch_reopens_only_failed_file(indexed_videos, monkeypatch):
+    root, paths, options, count = indexed_videos
+    ds = reader.LanceDBDataset(root=root, storage_options=options, return_uint8=True)
+    real_decoder = VideoDecoder
+    opened = []
+
+    def open_decoder(source, **kwargs):
+        decoder = real_decoder(source, **kwargs)
+        if isinstance(source, bytes):
+            # Only one mini-container has one frame. Corrupt its returned PTS
+            # while keeping its pixels, so the same-batch retry is observable.
+            if decoder.metadata.num_frames == 1:
+                get_frames = decoder.get_frames_at
+
+                def wrong_pts(**kwargs):
+                    batch = get_frames(**kwargs)
+                    batch.pts_seconds.add_(1.0)
+                    return batch
+
+                decoder.get_frames_at = wrong_pts
+        else:
+            opened.append(source)
+        return decoder
+
+    monkeypatch.setattr("torchcodec.decoders.VideoDecoder", open_decoder)
+    items = ds.__getitems__([500, count + 501])
+    for item, path, frame in zip(items, paths, [500, 501], strict=True):
+        expected = real_decoder(path).get_frames_at([frame])
+        assert torch.equal(item[VIDEO_KEY], expected.data[0])
+        assert torch.equal(item["timestamp"], expected.pts_seconds[0].float())
+    assert ds._mini_ineligible == {(VIDEO_KEY, 0, 0)}
+    assert len(opened) == 1 and isinstance(opened[0], reader._SparseBlobSource)
+
+
 def test_open_gop_falls_back_to_sparse_decoder(tmp_path):
     src = _make_dataset(tmp_path / "source", frames_per_ep=40)
     path = sorted((src / "videos").rglob("*.mp4"))[0]
@@ -228,6 +262,55 @@ def test_rgb_deduplicates_and_scatters_in_sample_order(indexed_videos, monkeypat
     assert calls == ([[0, 1], [2, 3]] if batch_size == 2 else [[0, 1, 2, 3]])
     for item, frames in zip(items, expected, strict=True):
         assert torch.equal(item[VIDEO_KEY], frames)
+
+
+def test_depth_projection_and_deltas_in_spawned_worker(tmp_path):
+    path = _make_dataset(tmp_path / "source")
+    info_file = path / "meta/info.json"
+    info = json.loads(info_file.read_text())
+    feature = info["features"][VIDEO_KEY]
+    feature.update(shape=[32, 32, 1], info={"is_depth_map": True, "depth_unit": "mm"})
+    info_file.write_text(json.dumps(info))
+    for clip in (path / "videos").rglob("*.mp4"):
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"testsrc2=size=32x32:rate={FPS}",
+                "-frames:v",
+                "10",
+                "-pix_fmt",
+                "gray12le",
+                "-c:v",
+                "libx265",
+                "-threads",
+                "1",
+                "-x265-params",
+                "lossless=1:pools=none:frame-threads=1:log-level=error",
+                str(clip),
+            ],
+            check=True,
+        )
+    out = tmp_path / "managed"
+    convert(out, root=path, video_mode="copy")
+    options = dict(root=out, columns=[VIDEO_KEY], delta_timestamps={VIDEO_KEY: [-0.1, 0.0]})
+    ds = reader.LanceDBDataset(**options)
+    expected = reader.LanceDBDataset(**options, use_mini_mp4=False).__getitems__([0, 1])
+    ds[0]
+    assert ds._depth_keys == [VIDEO_KEY] and ds._index_cache._total_bytes == 0
+    loader = torch.utils.data.DataLoader(
+        ds, batch_sampler=[[0, 1]], num_workers=1, multiprocessing_context="spawn"
+    )
+    (batch,) = loader
+    assert batch[VIDEO_KEY].shape == (2, 2, 1, 32, 32)
+    assert set(batch) == {VIDEO_KEY, VIDEO_KEY + "_is_pad"}
+    for key in batch:
+        assert torch.equal(batch[key], torch.stack([row[key] for row in expected]))
 
 
 def test_depth_merges_adjacent_windows_within_budget(monkeypatch):
