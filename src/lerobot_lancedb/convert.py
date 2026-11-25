@@ -68,7 +68,7 @@ from ._source import (
     validate_rel_path,
 )
 from .doctor import audit
-from .mp4_index import DEFAULT_HEADER_PROBE_BYTES, ProbedMp4, probe_mp4_byte_index
+from .mp4_index import DEFAULT_HEADER_PROBE_BYTES, ProbedMp4, probe_mp4_byte_index, sample_index_from_mp4
 
 # Schema contract comes from the (temporarily vendored) reader, so the writer and
 # reader can't disagree. Once the loader lands upstream, reader.py is deleted and
@@ -440,6 +440,7 @@ def _videos_schema() -> pa.Schema:
             pa.field("kf_indices", pa.list_(pa.int64())),
             pa.field("kf_positions", pa.list_(pa.int64())),
             _video_blob_field(),
+            pa.field("sample_index", pa.binary(), nullable=True),
         ]
     )
 
@@ -684,6 +685,7 @@ def _convert_copy(
     revision: str | None,
     storage_options: dict[str, str] | None,
     source_storage_options: dict[str, str] | None = None,
+    write_sample_index: bool = True,
 ) -> None:
     if is_remote_uri(out_target):
         _ensure_remote_output_empty(_connect_output(out_target, storage_options), out_target)
@@ -790,6 +792,7 @@ def _convert_copy(
                     "file_index": int(mp4.stem.split("-")[1]),
                     **build_video_byte_index(mp4),
                     VIDEO_BLOB_COLUMN: data,
+                    "sample_index": sample_index_from_mp4(data) if write_sample_index else None,
                 }
             )
             pending_bytes += len(data)
@@ -882,6 +885,7 @@ def _dry_run_external_base(
                 positions=[0],
                 sizes=[sample_probe.file_size],
             ),
+            pa.array([sample_probe.sample_index], type=pa.binary()),
         ],
         schema=schema,
     )
@@ -906,6 +910,7 @@ def _convert_external(
     source_storage_options: dict[str, str] | None,
     video_workers: int,
     header_probe_bytes: int,
+    write_sample_index: bool = True,
 ) -> None:
     normalized_explicit_base = normalize_base_uri(video_base_uri) if video_base_uri is not None else None
     if is_remote_uri(out_target):
@@ -971,6 +976,7 @@ def _convert_external(
                     rel,
                     source.read_range,
                     file_size=source_files[rel].size,
+                    write_sample_index=write_sample_index,
                     header_probe_bytes=header_probe_bytes,
                 )
                 return rel, res
@@ -1046,6 +1052,7 @@ def _convert_external(
             moov_sizes: list[int] = []
             kf_idx_chunks: list[NDArray[np.int64]] = []
             kf_pos_chunks: list[NDArray[np.int64]] = []
+            sample_indices: list[bytes | None] = []
             uris: list[str] = []
             positions: list[int] = []
             sizes: list[int] = []
@@ -1062,6 +1069,7 @@ def _convert_external(
                     _list_int64_array(kf_idx_chunks),
                     _list_int64_array(kf_pos_chunks),
                     lancedb.blob_uri_array(uris, positions=positions, sizes=sizes),
+                    pa.array(sample_indices, type=pa.binary()),
                 ]
                 return pa.RecordBatch.from_arrays(arrays, schema=schema)
 
@@ -1078,7 +1086,8 @@ def _convert_external(
                 uris.append(_external_video_uri(resolved_base_uri, ref.rel_path))
                 positions.append(0)
                 sizes.append(p.file_size)
-                pending_bytes += len(p.kf_indices) * 16 + 256
+                sample_indices.append(p.sample_index)
+                pending_bytes += len(p.kf_indices) * 16 + len(p.sample_index or b"") + 256
                 if pending_bytes >= EXTERNAL_VIDEO_BATCH_BYTES:
                     yield flush()
                     video_keys.clear()
@@ -1089,6 +1098,7 @@ def _convert_external(
                     moov_sizes.clear()
                     kf_idx_chunks.clear()
                     kf_pos_chunks.clear()
+                    sample_indices.clear()
                     uris.clear()
                     positions.clear()
                     sizes.clear()
@@ -1160,6 +1170,7 @@ def convert(
     source_storage_options: dict[str, str] | None = None,
     video_workers: int = DEFAULT_IO_WORKERS,
     header_probe_bytes: int = DEFAULT_HEADER_PROBE_BYTES,
+    write_sample_index: bool = True,
 ) -> None:
     """Convert one LeRobot v3.0 dataset to the three-table Lance layout.
 
@@ -1195,6 +1206,8 @@ def convert(
         Optional separate storage options for reading the remote source.
     video_workers:
         Concurrent range-read workers for external MP4 probing.
+    write_sample_index:
+        Write compact sample tables for indexed RGB reads. False leaves the column null.
     header_probe_bytes:
         Initial prefix read size per MP4 when locating ``moov`` (default 1 MiB).
     """
@@ -1216,6 +1229,7 @@ def convert(
             revision=revision,
             storage_options=storage_options,
             source_storage_options=source_storage_options,
+            write_sample_index=write_sample_index,
             video_workers=video_workers,
             header_probe_bytes=header_probe_bytes,
         )
@@ -1228,6 +1242,7 @@ def convert(
             revision=revision,
             storage_options=storage_options,
             source_storage_options=source_storage_options,
+            write_sample_index=write_sample_index,
         )
 
 
@@ -1312,6 +1327,7 @@ def main() -> None:
             "the output keeps them"
         ),
     )
+    parser.add_argument("--no-sample-index", action="store_true", help="Leave the optional RGB sample index null")
     args = parser.parse_args()
     if args.repo_id is None and args.root is None:
         parser.error("pass --repo-id and/or --root")
@@ -1331,6 +1347,7 @@ def main() -> None:
             storage_options=storage_options,
             source_storage_options=source_storage_options,
             video_workers=args.video_workers,
+            write_sample_index=not args.no_sample_index,
         )
     except DamagedSourceError as err:
         parser.exit(1, f"\n{err}\n")

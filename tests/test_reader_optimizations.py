@@ -3,6 +3,7 @@
 import importlib
 import json
 import pickle
+import subprocess
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import SimpleNamespace
@@ -78,7 +79,7 @@ def test_cold_external_read(indexed_videos, episode, monkeypatch):
     def read_cold():
         rounds.clear()
         responses.clear()
-        ds = reader.LanceDBDataset(root=output, storage_options=options, return_uint8=True)
+        ds = reader.LanceDBDataset(root=output, storage_options=options, return_uint8=True, use_mini_mp4=False)
         items = ds.__getitems__([episode * frame_count + i for i in indices])
         for pos, item in enumerate(items):
             assert torch.equal(item[VIDEO_KEY], reference.data[pos])
@@ -97,6 +98,112 @@ def test_cold_external_read(indexed_videos, episode, monkeypatch):
         print(f"fixed slack bytes={bytes_fixed}")
         assert rounds_fixed == 1
         assert bytes_used < bytes_fixed
+
+
+def test_cold_multi_file_mini_ranges(indexed_videos, monkeypatch):
+    output, paths, options, count = indexed_videos
+    responses = []
+    handles = []
+    send_header = BaseHTTPRequestHandler.send_header
+    fetch_handles = lancedb.table.LanceTable.fetch_blob_files
+
+    def record(handler, header, value):
+        if handler.command == "GET" and header == "Content-Length" and handler.path.endswith(".mp4"):
+            start, end = handler.headers["Range"].removeprefix("bytes=").split("-")
+            responses.append((handler.path, int(start), int(end), int(value)))
+        return send_header(handler, header, value)
+
+    def open_files(table, column, ids):
+        handles.extend(ids)
+        return fetch_handles(table, column, ids)
+
+    monkeypatch.setattr(BaseHTTPRequestHandler, "send_header", record)
+    monkeypatch.setattr(lancedb.table.LanceTable, "fetch_blob_files", open_files)
+    indices = [count + 501, 500, count + 501]
+    baseline = reader.LanceDBDataset(
+        root=output, storage_options=options, use_mini_mp4=False, return_uint8=True
+    ).__getitems__(indices)
+    baseline_gets, baseline_bytes = len(responses), sum(size for *_, size in responses)
+    assert len(handles) == 2
+    responses.clear()
+    handles.clear()
+    ds = reader.LanceDBDataset(
+        root=output, storage_options=options, return_uint8=True, columns=[VIDEO_KEY, "timestamp"]
+    )
+    results = ds.__getitems__(indices)
+    assert len(responses) == 2 < baseline_gets
+    assert not handles and not ds._mini_ineligible
+    bytes_used = sum(size for *_, size in responses)
+    assert bytes_used < baseline_bytes
+    for name, start, end, _ in responses:
+        path = next(p for p in paths if name.endswith(p.name))
+        meta = reader.build_video_byte_index(path)
+        assert end < meta["moov_offset"] or start >= meta["moov_offset"] + meta["moov_size"]
+    print(f"Cold files: {baseline_gets} -> 2 GETs, {baseline_bytes} -> {bytes_used} bytes")
+    responses.clear()
+    repeat = ds.__getitems__(indices)
+    assert not responses and not handles
+    for first, second, expected in zip(results, repeat, baseline, strict=True):
+        for key in first:
+            assert torch.equal(first[key], expected[key]) and torch.equal(first[key], second[key])
+    restored = pickle.loads(pickle.dumps(ds))
+    assert restored._decoder_cache._total_bytes == restored._index_cache._total_bytes == 0
+
+
+def test_open_gop_falls_back_to_sparse_decoder(tmp_path):
+    src = _make_dataset(tmp_path / "source", frames_per_ep=40)
+    path = sorted((src / "videos").rglob("*.mp4"))[0]
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size=32x32:rate={FPS}",
+            "-frames:v",
+            "40",
+            "-c:v",
+            "libx264",
+            "-g",
+            "8",
+            "-bf",
+            "3",
+            "-x264-params",
+            "open-gop=1:b-adapt=0:scenecut=0",
+            "-threads",
+            "1",
+            str(path),
+        ],
+        check=True,
+    )
+    out = tmp_path / "managed"
+    convert(out, root=src, video_mode="copy")
+    key = (VIDEO_KEY, 0, 0)
+    ds = reader.LanceDBDataset(root=out, return_uint8=True)
+    index = reader.ParsedSampleIndex.parse(
+        lancedb.connect(out)
+        .open_table("videos")
+        .take_row_ids([0])
+        .select(["sample_index"])
+        .to_arrow()[0][0]
+        .as_py()
+    )
+    sync = int(index.sync[1])
+    ordinal = index.order.tolist().index(sync)
+    with pytest.raises(ValueError, match="leading pictures"):
+        index.spans([ordinal])
+    start, end = index.byte_span(sync, sync)
+    with pytest.raises(ValueError, match="IDR"):
+        index._check_idr(path.read_bytes()[start:end])
+    ids = [ordinal, ordinal + 2, ordinal, 1]
+    reference = VideoDecoder(path).get_frames_at(indices=ids)
+    for pos, result in enumerate(ds.__getitems__(ids)):
+        assert torch.equal(result[VIDEO_KEY], reference.data[pos])
+        assert torch.equal(result["timestamp"], reference.pts_seconds[pos].float())
+    assert key in ds._mini_ineligible and key in ds._decoder_cache
 
 
 @pytest.mark.parametrize("batch_size", [2, 64])
@@ -278,14 +385,27 @@ def test_only_whole_local_objects_qualify(tmp_path):
     assert reader._local_video_path(descriptor, 4) is None
 
 
-def test_relative_local_base_uses_sparse_decoder(tmp_path, monkeypatch):
+def test_external_hf_unprefixed_cache_option():
+    key = "base_1." + "enable_resolve_cache"
+    options = {key: "false"}
+    reader._apply_external_hf_options(options, {"1": {"uri": HF_URI + "@" + SHA}}, False)
+    assert options[key] == "false" and "base_1.hf_enable_resolve_cache" not in options
+
+
+@pytest.mark.parametrize("legacy", [True, False], ids=["nine-columns", "null-index"])
+def test_relative_local_base_uses_sparse_decoder(tmp_path, monkeypatch, legacy):
     source = _make_dataset(tmp_path / "source")
     output = tmp_path / "old-layout"
     monkeypatch.setattr(
         "lerobot_lancedb.convert._external_table_options",
         lambda uri, *_: {"initial_bases": [lancedb.BasePath(path=uri, name="source_videos", id=1)]},
     )
-    convert(output, root=source, video_mode="external")
+    convert(output, root=source, video_mode="external", write_sample_index=False)
+    table = lancedb.connect(output).open_table("videos")
+    if legacy:
+        table.drop_columns(["sample_index"])
+    else:
+        assert table.search().select(["sample_index"]).to_arrow()[0].null_count == 2
     expected = VideoDecoder(str(sorted((source / "videos").rglob("*.mp4"))[0])).get_frames_at(indices=[1])
     ds = reader.LanceDBDataset(root=output, return_uint8=True)
     assert torch.equal(ds[1][VIDEO_KEY], expected.data[0])

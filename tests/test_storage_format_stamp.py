@@ -2,7 +2,26 @@
 
 import json
 
-from lerobot_lancedb.convert import _stamp_storage_format
+import pyarrow as pa
+
+from lerobot_lancedb.convert import _stamp_storage_format, _videos_schema
+
+
+def test_optional_index_appended_to_upstream_video_schema():
+    schema = _videos_schema()
+    assert schema.names == [
+        "video_key",
+        "chunk_index",
+        "file_index",
+        "file_size",
+        "moov_offset",
+        "moov_size",
+        "kf_indices",
+        "kf_positions",
+        "video_bytes",
+        "sample_index",
+    ]
+    assert schema.field(-1) == pa.field("sample_index", pa.binary(), nullable=True)
 
 
 def _info(meta_dir):
