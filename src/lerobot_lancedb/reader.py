@@ -17,14 +17,16 @@
 from __future__ import annotations
 
 import bisect
+import hashlib
 import io
 import json
 import multiprocessing
+import operator
 import os
 import re
 import shutil
 from collections import OrderedDict, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
@@ -34,12 +36,14 @@ import av
 import huggingface_hub
 import numpy as np
 import torch
-
 from lerobot.configs.video import DEFAULT_DEPTH_UNIT, DepthEncoderConfig
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.depth_utils import dequantize_depth
 from lerobot.datasets.feature_utils import check_delta_timestamps, get_delta_indices
 from lerobot.utils.constants import HF_LEROBOT_HOME
+
+from ._source import parse_hf_dataset_uri
+from ._video_compat import FrameTimestampError, decode_video_frames_pyav
 
 try:
     from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
@@ -47,19 +51,13 @@ except ImportError:  # older lerobot without the hub snapshot cache constant
     HF_LEROBOT_HUB_CACHE = HF_LEROBOT_HOME / "hub"
 from lerobot.utils.import_utils import is_package_available, require_package
 
-# VENDORED COPY of lerobot's LanceDBDataset (the loader PR). Kept here temporarily
-# so `pip install lerobot-lancedb` works end to end against released lerobot; once
-# the loader lands upstream this module is deleted and re-exported from
-# `lerobot.datasets.lancedb_dataset`. Depends on released lerobot for everything
-# except the two PR-new bits: `_lancedb_available` (defined here) and the
-# file-like/float64 decode fix (see `_video_compat`).
+# This standalone loader shares LeRobot metadata and decoding semantics.
+# External Blob v2 table routing and sparse range planning are maintained here.
 _lancedb_available = is_package_available("lancedb")
 
 if TYPE_CHECKING or _lancedb_available:
     import lancedb
     from lancedb.permutation import Permutation
-
-from ._video_compat import FrameTimestampError, decode_video_frames_pyav
 
 FRAMES_TABLE = "frames"
 VIDEOS_TABLE = "videos"
@@ -71,10 +69,52 @@ VIDEO_INDEX_COLUMNS = ("file_size", "moov_offset", "moov_size", "kf_indices", "k
 # ffmpeg reads more bytes than the frames requested. Padding each prefetched range
 # to cover those known reads keeps them off the slow fallback path.
 _OPEN_PROBE_BYTES = 256 * 1024
-_RANGE_SLACK = 64 * 1024
+# Per-call limits for multi-sample RGB decoding within each DataLoader worker.
+# Concurrent file decodes have independent budgets; final sample outputs,
+# scatter copies, and decoder-internal memory are excluded from the byte estimate.
+_RGB_DECODE_MAX_FRAMES = 64
+_RGB_DECODE_MAX_BYTES = 64 << 20
+
+# Limit the temporal span when merging multiple depth windows, further bounded
+# by the byte budget. Individual windows keep the direct decode path; these
+# limits do not split an individual window.
+_DEPTH_DECODE_MAX_SPAN_FRAMES = 64
+_DEPTH_DECODE_MAX_BYTES = 64 << 20
+# PyAV retains decoded uint16 frames while dequantization creates float32 output.
+# Leave extra headroom for the selected-frame stack and allocator overhead.
+_DEPTH_DECODE_BYTES_PER_VALUE = 8
 
 
-def _merge_spans(spans: list[tuple[int, int]], gap: int = _RANGE_SLACK) -> list[tuple[int, int]]:
+def _decode_frame_limit(
+    shape: Sequence[int] | None,
+    *,
+    max_frames: int,
+    max_bytes: int,
+    bytes_per_value: int,
+) -> int:
+    """Bound frame capacity by estimated memory, allowing at least one frame.
+
+    Missing or zero-sized shapes fall back to the frame cap. Callers apply the
+    capacity to unique RGB frames or the temporal span of merged depth windows.
+    """
+    frame_values = int(np.prod(shape)) if shape else 0
+    if not frame_values:
+        return max_frames
+    return min(max_frames, max(1, max_bytes // (frame_values * bytes_per_value)))
+
+
+def _range_slack(meta: dict, is_depth: bool) -> int:
+    """Pad by one average GOP, bounded for FFmpeg read-ahead and depth decode."""
+    positions = meta["kf_positions"]
+    if len(positions) > 1:
+        gop_bytes = (int(positions[-1]) - int(positions[0])) // (len(positions) - 1)
+    else:
+        gop_bytes = meta["file_size"]
+    # PyAV's sequential depth decode reads farther ahead than RGB seeking.
+    return min(max(32 * 1024, gop_bytes), 64 * 1024) * (4 if is_depth else 1)
+
+
+def _merge_spans(spans: list[tuple[int, int]], gap: int) -> list[tuple[int, int]]:
     """Coalesce overlapping or nearby byte ranges into fewer, larger requests."""
     merged: list[tuple[int, int]] = []
     for start, end in sorted(spans):
@@ -216,6 +256,59 @@ class _SparseBlobSource(io.RawIOBase):
         return len(data)
 
 
+class _EpisodeSubsetIndexMapping(Mapping[int, int]):
+    """Index selected episode intervals without allocating an entry per frame."""
+
+    def __init__(self, starts: np.ndarray, ends: np.ndarray):
+        self._starts = starts
+        self._relative_ends = np.cumsum(ends - starts)
+        self.num_frames = int(self._relative_ends[-1]) if len(starts) else 0
+        # A repeated episode contributes rows twice. As in the original dict,
+        # absolute lookups return the last occurrence, in first-insertion order.
+        self._intervals: dict[int, tuple[int, int]] = {}
+        relative = 0
+        for start, end in zip(starts.tolist(), ends.tolist(), strict=True):
+            if start < end:
+                self._intervals[start] = (end, relative)
+            relative += end - start
+        self._absolute_starts = sorted(self._intervals)
+        self._num_keys = sum(end - start for start, (end, _) in self._intervals.items())
+
+    def rel_to_abs(self, index: int) -> int:
+        index = operator.index(index)
+        if index < 0:
+            index += self.num_frames
+        if not 0 <= index < self.num_frames:
+            raise IndexError(index)
+        block = int(self._relative_ends.searchsorted(index, side="right"))
+        base = int(self._relative_ends[block - 1]) if block else 0
+        return int(self._starts[block]) + index - base
+
+    def __getitem__(self, index: int) -> int:
+        if not isinstance(index, (int, float, np.integer, np.floating)):
+            raise KeyError(index)
+        block = bisect.bisect_right(self._absolute_starts, index) - 1
+        if block >= 0:
+            start = self._absolute_starts[block]
+            end, base = self._intervals[start]
+            if index < end and int(index) == index:
+                return base + int(index) - start
+        raise KeyError(index)
+
+    def __len__(self) -> int:
+        return self._num_keys
+
+    def __iter__(self) -> Iterator[int]:
+        for start, (end, _) in self._intervals.items():
+            yield from range(start, end)
+
+    def __eq__(self, other):
+        # Mapping.__eq__ would reconstruct a per-frame dict for each operand.
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        return len(self) == len(other) and all(other.get(key) == value for key, value in self.items())
+
+
 class _VideoDecoderLRU:
     """Per-worker LRU of torchcodec decoders keyed by (video_key, chunk, file).
     eviction is bounded by ``byte_budget`` too, not just entry count.
@@ -256,26 +349,55 @@ def _is_remote_uri(path) -> bool:
     return "://" in str(path)
 
 
-def _storage_options(db_uri: str, storage_options: dict | None, revision: str | None) -> dict:
-    """Build the storage_options for a connect. For hf:// URIs, inject the token
-    and read tables from the same revision the metadata resolved to (lance honors
-    'revision' in storage_options, not an '@rev' URI suffix). Non-hub URIs are
-    left untouched."""
+_METADATA_ROUTING_OPTIONS = {
+    "endpoint",
+    "endpoint_url",
+    "region",
+    "default_region",
+    "virtual_hosted_style_request",
+    "aws_endpoint",
+    "aws_endpoint_url",
+    "aws_region",
+    "aws_default_region",
+    "aws_virtual_hosted_style_request",
+    "account_name",
+    "azure_storage_account_name",
+    "azure_storage_endpoint",
+    "azure_endpoint",
+    "oss_endpoint",
+    "oss_region",
+    "tos_endpoint",
+    "tos_region",
+    "cos_endpoint",
+    "cos_region",
+}
+
+
+def _storage_options(
+    db_uri: str, storage_options: dict | None, revision: str | None, token: str | bool | None = None
+) -> dict:
+    """Resolve HF options once for the connection and each table it opens."""
     options = dict(storage_options or {})
     if db_uri.startswith("hf://"):
-        if "token" not in options:
-            token = huggingface_hub.get_token()
-            if token:
-                options["token"] = token
-        if revision and "revision" not in options:
-            options["revision"] = revision
+        if "token" not in options and "hf_token" not in options and token is not False:
+            resolved_token = token if isinstance(token, str) else huggingface_hub.get_token()
+            if resolved_token:
+                options["token"] = resolved_token
+        uri_revision = parse_hf_dataset_uri(db_uri)[1] if db_uri.startswith("hf://datasets/") else None
+        if uri_revision or revision:
+            options.setdefault("revision", uri_revision or revision)
+        effective_revision = options.get("hf_revision", options.get("revision"))
+        if (
+            re.fullmatch(r"[a-fA-F0-9]{40}", effective_revision or "")
+            and "enable_resolve_cache" not in options
+        ):
+            options.setdefault("hf_enable_resolve_cache", "true")
     return options
 
 
-def _connect(db_uri: str, storage_options: dict | None, revision: str | None = None):
+def _connect(db_uri: str, options: dict):
     if _is_remote_uri(db_uri):
         os.environ.setdefault("LANCE_IO_THREADS", "256")
-    options = _storage_options(db_uri, storage_options, revision)
     return lancedb.connect(db_uri, **({"storage_options": options} if options else {}))
 
 
@@ -312,7 +434,7 @@ def _materialize_meta(db, local_root: Path, storage_options: dict | None = None)
         try:
             tmp_dir.rename(meta_dir)
         except OSError:
-            if not meta_dir.exists(): 
+            if not meta_dir.exists():
                 raise
     finally:
         if tmp_dir.exists():
@@ -333,7 +455,12 @@ def _storage_format_from_info(info_file: Path) -> str | None:
 
 @lru_cache(maxsize=32)
 def is_lance_dataset(
-    repo_id: str | None = None, root: str | Path | None = None, revision: str | None = None
+    repo_id: str | None = None,
+    root: str | Path | None = None,
+    revision: str | None = None,
+    *,
+    token: str | bool | None = None,
+    endpoint: str | None = None,
 ) -> bool:
     """True if the dataset's storage format is Lance.
 
@@ -368,6 +495,8 @@ def is_lance_dataset(
             repo_type="dataset",
             revision=revision,
             cache_dir=HF_LEROBOT_HUB_CACHE,
+            token=token,
+            endpoint=endpoint,
         )
         fmt = _storage_format_from_info(Path(info_file))
     except Exception:
@@ -375,7 +504,7 @@ def is_lance_dataset(
     if fmt is not None:
         return fmt == "lance"
     try:  # legacy Lance datasets (converted before `storage_format`): layout probe
-        paths = huggingface_hub.HfApi().get_paths_info(
+        paths = huggingface_hub.HfApi(token=token, endpoint=endpoint).get_paths_info(
             repo_id, [f"{FRAMES_TABLE}.lance"], repo_type="dataset", revision=revision
         )
     except Exception:  # fall back to the parquet loader
@@ -384,7 +513,11 @@ def is_lance_dataset(
 
 
 def resolve_lance_root(
-    repo_id: str | None, root: str | Path | None, storage_options: dict | None = None
+    repo_id: str | None,
+    root: str | Path | None,
+    storage_options: dict | None = None,
+    revision: str | None = None,
+    token: str | bool | None = None,
 ) -> tuple[str, Path]:
     """Resolve a Lance dataset to its connect URI and the local root holding ``meta/``.
 
@@ -395,29 +528,61 @@ def resolve_lance_root(
     """
     if root is not None and _is_remote_uri(root):
         db_uri = str(root).rstrip("/")
-        local_root = HF_LEROBOT_HOME / "remote" / re.sub(r"[^A-Za-z0-9._-]+", "_", db_uri)
+        options = _storage_options(db_uri, storage_options, revision, token)
+        cache_key = db_uri
+        routing = {k.lower(): v for k, v in options.items() if k.lower() in _METADATA_ROUTING_OPTIONS}
+        if db_uri.startswith("hf://"):
+            ref = options.get("hf_revision", options.get("revision"))
+            if ref:
+                routing["revision"] = ref
+        if routing:
+            identity = json.dumps(routing, sort_keys=True, separators=(",", ":"))
+            cache_key += "-" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+        local_root = HF_LEROBOT_HOME / "remote" / re.sub(r"[^A-Za-z0-9._-]+", "_", cache_key)
         if not (local_root / "meta").exists():
-            options = _storage_options(db_uri, storage_options, None)
-            _materialize_meta(_connect(db_uri, storage_options), local_root, options or None)
+            _materialize_meta(_connect(db_uri, options), local_root, options or None)
         return db_uri, local_root
     root_path = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
     if (root_path / f"{FRAMES_TABLE}.lance").exists():
         return str(root_path), root_path
     if repo_id is not None:
+        options = storage_options or {}
+        ref = options.get("hf_revision", options.get("revision", revision))
+        hub_token = options.get("hf_token", options.get("token", token))
+        if (ref or hub_token is not None) and (root is None or not (root_path / "meta").exists()):
+            # Released LeRobot versions differ in token support. Download just
+            # metadata into a revision-specific Hub snapshot before loading it.
+            root_path = Path(
+                huggingface_hub.snapshot_download(
+                    repo_id,
+                    repo_type="dataset",
+                    revision=ref,
+                    token=hub_token,
+                    allow_patterns="meta/**",
+                    cache_dir=HF_LEROBOT_HUB_CACHE,
+                    local_dir=root,
+                )
+            )
         return f"hf://datasets/{repo_id}", root_path
     raise FileNotFoundError(f"No '{FRAMES_TABLE}.lance' table under {root_path}.")
 
 
 def lance_metadata(
-    repo_id: str | None, root: str | Path | None, revision: str | None = None,
+    repo_id: str | None,
+    root: str | Path | None,
+    revision: str | None = None,
     storage_options: dict | None = None,
+    token: str | bool | None = None,
 ) -> LeRobotDatasetMetadata:
     """LeRobotDatasetMetadata for a Lance dataset, materializing remote-URI ``meta/``.
 
     Lets the training factory resolve metadata (for delta-timestamp resolution)
     without tripping over a remote-URI root.
     """
-    _, local_root = resolve_lance_root(repo_id, root, storage_options)
+    uri, local_root = resolve_lance_root(repo_id, root, storage_options, revision, token)
+    if uri.startswith("hf://"):
+        options = _storage_options(uri, storage_options, revision, token)
+        revision = options.get("hf_revision", options.get("revision"))
     return LeRobotDatasetMetadata(
         repo_id if repo_id is not None else str(local_root), root=local_root, revision=revision
     )
@@ -442,7 +607,8 @@ class LanceDBDataset(torch.utils.data.Dataset):
         tolerance_s: Timestamp synchronization tolerance in seconds.
         revision: Hub revision for the ``meta/`` download.
         return_uint8: Return RGB frames as raw uint8 instead of normalized float32.
-        storage_options: Extra options forwarded to ``lancedb.connect``.
+        storage_options: Options passed to the connection and each table, including External blob bases.
+        token: Hub token, or False to disable implicit Hub authentication.
         video_decoder_cache_size: Max decoders per worker (default 16, also
             bounded by a 2 GiB per-worker byte budget).
         depth_output_unit: Unit depth features dequantize to (``'mm'`` or ``'m'``).
@@ -462,6 +628,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
         storage_options: dict | None = None,
         video_decoder_cache_size: int | None = None,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
+        token: str | bool | None = None,
     ):
         super().__init__()
         require_package("lancedb", extra="lance")
@@ -470,14 +637,18 @@ class LanceDBDataset(torch.utils.data.Dataset):
 
         self.repo_id = repo_id
         self.tolerance_s = tolerance_s
-        self._storage_options = storage_options
-
-        self._db_uri, self.root = resolve_lance_root(repo_id, root, self._storage_options)
-
+        self._db_uri, self.root = resolve_lance_root(repo_id, root, storage_options, revision, token)
+        self._storage_options = _storage_options(self._db_uri, storage_options, revision, token)
+        if self._db_uri.startswith("hf://"):
+            revision = self._storage_options.get("hf_revision", self._storage_options.get("revision"))
         self.meta = LeRobotDatasetMetadata(
             repo_id if repo_id is not None else str(self.root), root=self.root, revision=revision
         )
-        self._hub_revision = self.meta.revision if self._db_uri == f"hf://datasets/{repo_id}" else None
+        if self._db_uri == f"hf://datasets/{repo_id}" and not (root and _is_remote_uri(root)):
+            # The metadata loader may have resolved a LeRobot version tag.
+            # A metadata-only Hub download has a commit-specific snapshot path.
+            resolved = self.root.name if self.root.parent.name == "snapshots" else self.meta.revision
+            self._storage_options = _storage_options(self._db_uri, self._storage_options, resolved, token)
 
         if self.meta.image_keys:
             raise NotImplementedError(
@@ -519,16 +690,11 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 "the dataset metadata is inconsistent."
             )
 
+        self._subset_index = None
         if self.episodes is not None:
-            self._rel_to_abs = np.concatenate(
-                [np.arange(self._ep_from[ep], self._ep_to[ep]) for ep in self.episodes]
+            self._subset_index = _EpisodeSubsetIndexMapping(
+                self._ep_from[self.episodes], self._ep_to[self.episodes]
             )
-            self._absolute_to_relative_idx = {
-                int(abs_idx): rel_idx for rel_idx, abs_idx in enumerate(self._rel_to_abs)
-            }
-        else:
-            self._rel_to_abs = None
-            self._absolute_to_relative_idx = None
 
         self._task_names = list(self.meta.tasks.index)
 
@@ -569,7 +735,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
         self._decode_pool: ThreadPoolExecutor | None = None
         if video_decoder_cache_size is None:
             video_decoder_cache_size = 16
-        self._decoder_cache = _VideoDecoderLRU(video_decoder_cache_size, byte_budget=2 << 30) # 2GB cap
+        self._decoder_cache = _VideoDecoderLRU(video_decoder_cache_size, byte_budget=2 << 30)  # 2GB cap
 
     def _episode_numpy(self, name: str, dtype: type[np.generic]) -> np.ndarray:
         # Read straight from the underlying Arrow column, not HF Dataset __getitem__
@@ -583,8 +749,8 @@ class LanceDBDataset(torch.utils.data.Dataset):
         if self.meta.video_keys:
             self._prefetch_pool = ThreadPoolExecutor(max_workers=1)
             self._decode_pool = ThreadPoolExecutor(max_workers=16)
-        options = _storage_options(self._db_uri, self._storage_options, self._hub_revision)
-        db = _connect(self._db_uri, self._storage_options, revision=self._hub_revision)
+        options = self._storage_options
+        db = _connect(self._db_uri, options)
         table = _open_table(db, FRAMES_TABLE, options or None)
         n_rows = table.count_rows()
         if n_rows != self.meta.total_frames:
@@ -636,15 +802,15 @@ class LanceDBDataset(torch.utils.data.Dataset):
 
     @property
     def num_frames(self) -> int:
-        return len(self._rel_to_abs) if self._rel_to_abs is not None else self.meta.total_frames
+        return self._subset_index.num_frames if self._subset_index is not None else self.meta.total_frames
 
     @property
     def num_episodes(self) -> int:
         return len(self.episodes) if self.episodes is not None else self.meta.total_episodes
 
     @property
-    def absolute_to_relative_idx(self) -> dict[int, int] | None:
-        return self._absolute_to_relative_idx
+    def absolute_to_relative_idx(self) -> Mapping[int, int] | None:
+        return self._subset_index
 
     @property
     def features(self) -> dict[str, dict]:
@@ -725,7 +891,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
         return plans
 
     def _resolve_abs_idx(self, idx: int) -> int:
-        return int(self._rel_to_abs[idx]) if self._rel_to_abs is not None else int(idx)
+        return self._subset_index.rel_to_abs(idx) if self._subset_index is not None else int(idx)
 
     def _episode_index_for_abs_idx(self, abs_idx: int) -> int:
         return int(np.searchsorted(self._ep_from, abs_idx, side="right") - 1)
@@ -785,32 +951,78 @@ class LanceDBDataset(torch.utils.data.Dataset):
         results: list[dict[str, torch.Tensor]] = [{} for _ in plans]
 
         def _decode_file(file_key: tuple, file_requests: list[tuple[int, list[float]]]) -> None:
-            key, chunk_idx, file_idx = file_key
             decoder, source = entries[file_key]
-            if key in self.meta.depth_keys:
-                for sample_idx, shifted_ts in file_requests:
-                    results[sample_idx][key] = self._decode_depth_window(source, shifted_ts, file_key)
-                return
-            fps = decoder.metadata.average_fps
-            for sample_idx, shifted_ts in file_requests:
-                indices = [round(ts * fps) for ts in shifted_ts]
-                batch = decoder.get_frames_at(indices=indices)
-                distance = (torch.tensor(shifted_ts, dtype=torch.float64) - batch.pts_seconds).abs()
-                if (distance >= self.tolerance_s).any():
-                    raise FrameTimestampError(
-                        f"Query timestamps violate tolerance_s={self.tolerance_s} for video "
-                        f"'{key}' (chunk {chunk_idx}, file {file_idx}): queried {shifted_ts}, "
-                        f"loaded {batch.pts_seconds.tolist()}."
-                    )
-                frames = batch.data
-                if not self.return_uint8:
-                    frames = (frames / 255.0).type(torch.float32)
-                results[sample_idx][key] = frames.squeeze(0)
+            if file_key[0] in self.meta.depth_keys:
+                decoded = self._decode_depth_file_requests(source, file_requests, file_key)
+            else:
+                decoded = self._decode_rgb_file_requests(decoder, file_requests, file_key)
+            for sample_idx, frames in decoded:
+                results[sample_idx][file_key[0]] = frames
 
         futures = [self._decode_pool.submit(_decode_file, k, r) for k, r in requests.items()]
         for future in futures:
             future.result()
         return results
+
+    def _decode_rgb_file_requests(
+        self, decoder, file_requests: list[tuple[int, list[float]]], file_key: tuple
+    ) -> list[tuple[int, torch.Tensor]]:
+        """Decode shared frame indices once, checking PTS against every original query."""
+        fps = decoder.metadata.average_fps
+        request_indices = [[round(ts * fps) for ts in timestamps] for _, timestamps in file_requests]
+
+        def decode(indices):
+            batch = decoder.get_frames_at(indices=indices)
+            frames = batch.data if self.return_uint8 else (batch.data / 255.0).float()
+            return frames, batch.pts_seconds
+
+        def finish(request, frames, pts):
+            sample_idx, timestamps = request
+            query = torch.tensor(timestamps, dtype=torch.float64, device=pts.device)
+            if ((query - pts).abs() >= self.tolerance_s).any():
+                key, chunk, file = file_key
+                raise FrameTimestampError(
+                    f"Query timestamps violate tolerance_s={self.tolerance_s} for video "
+                    f"'{key}' (chunk {chunk}, file {file}): queried {timestamps}, loaded {pts.tolist()}."
+                )
+            return sample_idx, frames.squeeze(0)
+
+        if len(file_requests) == 1:
+            return [finish(file_requests[0], *decode(request_indices[0]))]
+
+        unique = sorted({idx for indices in request_indices for idx in indices})
+        limit = _decode_frame_limit(
+            self.meta.features[file_key[0]].get("shape"),
+            max_frames=_RGB_DECODE_MAX_FRAMES,
+            max_bytes=_RGB_DECODE_MAX_BYTES,
+            bytes_per_value=1 if self.return_uint8 else 5,  # uint8 input plus float32 output
+        )
+        if len(unique) <= limit:
+            frames, pts = decode(unique)
+            positions = {index: pos for pos, index in enumerate(unique)}
+            decoded = []
+            for request, indices in zip(file_requests, request_indices, strict=True):
+                take = [positions[index] for index in indices]
+                decoded.append(finish(request, frames[take], pts[take]))
+            return decoded
+
+        # Scatter bounded decode chunks directly into the final sample tensors.
+        # Retaining all decoded chunks until gather would defeat the byte limit.
+        for start in range(0, len(unique), limit):
+            chunk = unique[start : start + limit]
+            frames, pts = decode(chunk)
+            if start == 0:
+                sample_frames = [frames.new_empty((len(req), *frames.shape[1:])) for req in request_indices]
+                sample_pts = [pts.new_empty(len(req)) for req in request_indices]
+            positions = {index: pos for pos, index in enumerate(chunk)}
+            for sample, indices in enumerate(request_indices):
+                target = [pos for pos, index in enumerate(indices) if index in positions]
+                if target:
+                    take = [positions[indices[pos]] for pos in target]
+                    sample_frames[sample][target] = frames[take]
+                    sample_pts[sample][target] = pts[take]
+            del frames, pts
+        return [finish(*args) for args in zip(file_requests, sample_frames, sample_pts, strict=True)]
 
     def _build_video_requests(
         self,
@@ -839,7 +1051,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
         """
         # Lazy: torchcodec is a platform-conditional extra (no wheel on some
         # platforms); upstream video_utils imports it lazily for the same reason.
-        from torchcodec.decoders import VideoDecoder
+        from torchcodec.decoders import VideoDecoder  # noqa: PLC0415
 
         self._load_file_meta([key for key in file_keys if key not in self._file_meta])
 
@@ -851,55 +1063,42 @@ class LanceDBDataset(torch.utils.data.Dataset):
             else:
                 new_files.append(key)
 
+        sources = {key: source for key, (_, source) in prepared.items()}
+        spans_by_key: dict[tuple, list[tuple[int, int]]] = defaultdict(list)
         if new_files:
             handles = self._videos_table.fetch_blob_files(
                 VIDEO_BLOB_COLUMN, [self._video_row_ids[key] for key in new_files]
             )
-            sources = {
-                key: _SparseBlobSource(self._file_meta[key]["file_size"], handle)
-                for key, handle in zip(new_files, handles, strict=True)
-            }
-            spans_by_key: dict[tuple, list[tuple[int, int]]] = {}
-            for key in new_files:
+            for key, handle in zip(new_files, handles, strict=True):
                 meta = self._file_meta[key]
-                spans = [
-                    (0, min(_OPEN_PROBE_BYTES, meta["file_size"])),
-                    # Slack past the moov covers the next box header ffmpeg reads.
-                    (
-                        meta["moov_offset"],
-                        min(meta["moov_offset"] + meta["moov_size"] + _RANGE_SLACK, meta["file_size"]),
-                    ),
-                ]
+                size = meta["file_size"]
+                sources[key] = _SparseBlobSource(size, handle)
+                slack = _range_slack(meta, key[0] in self.meta.depth_keys)
+                spans_by_key[key].extend(
+                    [
+                        (0, min(_OPEN_PROBE_BYTES, size)),
+                        (meta["moov_offset"], min(meta["moov_offset"] + meta["moov_size"] + slack, size)),
+                    ]
+                )
                 if len(meta["kf_positions"]):
                     first_packet = int(meta["kf_positions"][0])
-                    spans.append((first_packet, min(first_packet + _OPEN_PROBE_BYTES, meta["file_size"])))
-                spans_by_key[key] = spans
-            self._fetch_spans(spans_by_key, sources)
+                    spans_by_key[key].append((first_packet, min(first_packet + _OPEN_PROBE_BYTES, size)))
 
-            rgb_files = [key for key in new_files if key[0] not in self.meta.depth_keys]
-            created = self._decode_pool.map(
-                lambda key: VideoDecoder(sources[key], seek_mode="approximate"), rgb_files
-            )
-            for key, decoder in zip(rgb_files, created, strict=True):
-                prepared[key] = (decoder, sources[key])
-            for key in new_files:
-                if key[0] in self.meta.depth_keys:
-                    prepared[key] = (None, sources[key])
+        for key, frame_windows in (windows or {}).items():
+            for first, last in frame_windows:
+                span = self._window_byte_range(key[0], self._file_meta[key], first, last)
+                if not sources[key].covers(*span):
+                    spans_by_key[key].append(span)
+        self._fetch_spans(spans_by_key, sources)
 
-        if windows:
-            window_spans: dict[tuple, list[tuple[int, int]]] = {}
-            for key, frame_windows in windows.items():
-                meta = self._file_meta[key]
-                source = prepared[key][1]
-                spans = [
-                    span
-                    for first, last in frame_windows
-                    for span in [self._window_byte_range(key[0], meta, first, last)]
-                    if not source.covers(*span)
-                ]
-                if spans:
-                    window_spans[key] = spans
-            self._fetch_spans(window_spans, {key: prepared[key][1] for key in window_spans})
+        def open_decoder(key):
+            source = sources[key]
+            decoder = None
+            if key[0] not in self.meta.depth_keys:
+                decoder = VideoDecoder(source, seek_mode="approximate")
+            return key, (decoder, source)
+
+        prepared.update(self._decode_pool.map(open_decoder, new_files))
         return prepared
 
     def _video_file_key(self, key: str, ep_idx: int) -> tuple[str, int, int]:
@@ -931,11 +1130,9 @@ class LanceDBDataset(torch.utils.data.Dataset):
             spans = []
             reach_back = 1 if key[0] in self.meta.depth_keys else 0
             for _, shifted_ts in file_requests:
-                first = round(shifted_ts[0] * fps)
-                last = round(shifted_ts[-1] * fps)
-                start, end = self._window_byte_range(
-                    key[0], meta, min(first, last) - reach_back, max(first, last)
-                )
+                first = round(min(shifted_ts) * fps)
+                last = round(max(shifted_ts) * fps)
+                start, end = self._window_byte_range(key[0], meta, first - reach_back, last)
                 if not source.covers(start, end):
                     spans.append((start, end))
             spans_by_key[key] = spans
@@ -954,8 +1151,8 @@ class LanceDBDataset(torch.utils.data.Dataset):
             self._decoder_cache.put(key, (decoder, source), nbytes=source.buffered + context_cost)
         return prepared
 
-    def _decode_depth_window(self, source, shifted_ts: list[float], file_key: tuple) -> torch.Tensor:
-        """Decode one depth window with upstream's pyav decoder over our sparse source."""
+    def _decode_depth_frames(self, source, shifted_ts: list[float], file_key: tuple) -> torch.Tensor:
+        """Decode and dequantize to (N, C, H, W), preserving timestamp order and the time axis."""
         source.seek(0)
         frames = decode_video_frames_pyav(
             source, shifted_ts, self.tolerance_s, return_uint8=False, is_depth=True
@@ -968,7 +1165,59 @@ class LanceDBDataset(torch.utils.data.Dataset):
             shift=config.shift,
             use_log=config.use_log,
             output_unit=self._depth_output_unit,
-        ).squeeze(0)
+        )
+
+    def _decode_depth_file_requests(
+        self, source, file_requests: list[tuple[int, list[float]]], file_key: tuple
+    ) -> list[tuple[int, torch.Tensor]]:
+        """Merge nearby sample windows so each depth span opens and seeks PyAV once."""
+        if len(file_requests) == 1:
+            sample_idx, shifted_ts = file_requests[0]
+            return [(sample_idx, self._decode_depth_frames(source, shifted_ts, file_key).squeeze(0))]
+
+        fps = float(self.meta.fps)
+        max_span_frames = _decode_frame_limit(
+            self.meta.features[file_key[0]].get("shape"),
+            max_frames=_DEPTH_DECODE_MAX_SPAN_FRAMES,
+            max_bytes=_DEPTH_DECODE_MAX_BYTES,
+            bytes_per_value=_DEPTH_DECODE_BYTES_PER_VALUE,
+        )
+        merge_gap_s = 1.0 / fps + self.tolerance_s
+
+        ordered = sorted(file_requests, key=lambda request: min(request[1]))
+        groups: list[list[tuple[int, list[float]]]] = []
+        group: list[tuple[int, list[float]]] = []
+        group_start = group_end = 0.0
+        for request in ordered:
+            start, end = min(request[1]), max(request[1])
+            merged_end = max(group_end, end)
+            merged_span_frames = int(np.ceil((merged_end - group_start) * fps)) + 1
+            if group and start <= group_end + merge_gap_s and merged_span_frames <= max_span_frames:
+                group.append(request)
+                group_end = merged_end
+            else:
+                if group:
+                    groups.append(group)
+                group = [request]
+                group_start, group_end = start, end
+        groups.append(group)
+
+        decoded: list[tuple[int, torch.Tensor]] = []
+        for group in groups:
+            if len(group) == 1:
+                sample_idx, timestamps = group[0]
+                decoded.append(
+                    (sample_idx, self._decode_depth_frames(source, timestamps, file_key).squeeze(0))
+                )
+                continue
+            unique_ts = sorted({timestamp for _, timestamps in group for timestamp in timestamps})
+            frames = self._decode_depth_frames(source, unique_ts, file_key)
+            positions = {timestamp: position for position, timestamp in enumerate(unique_ts)}
+            for sample_idx, timestamps in group:
+                decoded.append(
+                    (sample_idx, frames[[positions[timestamp] for timestamp in timestamps]].squeeze(0))
+                )
+        return decoded
 
     def _fetch_spans(
         self, spans_by_key: dict[tuple, list[tuple[int, int]]], sources: dict[tuple, _SparseBlobSource]
@@ -976,7 +1225,9 @@ class LanceDBDataset(torch.utils.data.Dataset):
         range_requests: list[tuple[int, int, int]] = []
         range_targets: list[tuple[tuple, int]] = []
         for key, spans in spans_by_key.items():
-            for start, end in _merge_spans(spans):
+            for start, end in _merge_spans(
+                spans, _range_slack(self._file_meta[key], key[0] in self.meta.depth_keys)
+            ):
                 range_requests.append((self._video_row_ids[key], start, end - start))
                 range_targets.append((key, start))
         if not range_requests:
@@ -1029,8 +1280,12 @@ class LanceDBDataset(torch.utils.data.Dataset):
         start_idx = max(int(np.searchsorted(kf_indices, first_frame, side="right")) - 1, 0)
         end_idx = int(np.searchsorted(kf_indices, last_frame, side="right"))
         end = int(kf_positions[end_idx]) if end_idx < len(kf_positions) else meta["file_size"]
-        slack = _RANGE_SLACK * 4 if key in self.meta.depth_keys else _RANGE_SLACK
-        return int(kf_positions[start_idx]), min(end + slack, meta["file_size"])
+        slack = _range_slack(meta, key in self.meta.depth_keys)
+        # TorchCodec fills a 64 KiB AVIO buffer after a seek. A small GOP needs
+        # one whole read from its keyframe, including when it ends a wider window.
+        last_gop_start = int(kf_positions[max(0, end_idx - 1)])
+        padded_end = max(end + slack, last_gop_start + (64 << 10))
+        return int(kf_positions[start_idx]), min(padded_end, meta["file_size"])
 
     def _build_item(self, plan: dict, columns: dict[str, np.ndarray], row_pos: dict[int, int]) -> dict:
         base = row_pos[plan["abs_idx"]]
