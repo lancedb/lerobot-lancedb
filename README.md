@@ -51,6 +51,18 @@ S3 with 20 ms request latency. Both local loaders read warm local files.
 The walkthrough includes the exact commands, streaming replay on the same samples,
 and a wide-table projection measurement. [Loader measurements](docs/walkthrough.md#loader-measurements)
 
+## Selecting and scheduling samples
+
+`select_anchors` pushes a frame predicate into Lance and returns a map-style view for PyTorch.
+A filter selects the center frame. Its camera and action windows can still reach any frame in the same episode.
+Use `lookahead_loader` to prefetch compressed video ranges while preserving a global sampler's batch order.
+Use `LanceDBEpisodePoolDataset` for exactly-once iteration within a bounded pool of episodes.
+
+Eligible RGB videos carry an optional `sample_index`. The reader uses it to construct mini-MP4s from the
+source samples and falls back to sparse reads when needed. On the PushT global-shuffle workload above,
+enabling this index saved 1,977,672 transferred bytes over the measured run, including warmup.
+[Sampling, checkpoints and measurements](docs/walkthrough.md#selecting-anchors-and-loading-windows)
+
 ## Install
 
 ```bash

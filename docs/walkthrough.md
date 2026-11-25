@@ -22,6 +22,70 @@ A video selection also reads timestamps for alignment. A task label needs the ta
 Request either internal column by name to include it in a sample. List every feature with
 `delta_timestamps` in `columns` to get its window and padding mask.
 
+## Selecting anchors and loading windows
+
+```python
+from torch.utils.data import DataLoader
+
+anchors = ds.select_anchors(episodes=[0, 1], where="frame_index >= 4", cameras=["observation.image"])
+sampler = anchors.weighted_sampler(num_samples=64, episode_weights={0: 1, 1: 3})
+for batch in DataLoader(anchors, sampler=sampler, batch_size=8):
+    train(batch)
+```
+
+`where` uses Lance column names. `episodes` intersects with the reader's episode subset. `tasks` accepts
+names and integer IDs. The view orders matches by episode and frame. Its `indices` address the source
+reader, while its sampler yields positions in the view. `episode_weights` and `task_weights` assign total
+mass to each matched group. `anchor_weights` assigns one factor per view position. Filtering selects
+center frames and preserves the full episode bounds used for `delta_timestamps` and padding masks.
+Conversion builds a B-tree for `episode_index` and a bitmap for `task_index` by default.
+`--no-scalar-indexes` skips scalar index creation. On a two-fragment table with 1,048,576 rows and 640
+matches, the projected predicate took 1.00 ms versus 6.05 ms for scanning the same columns and filtering
+in Arrow (median of nine warm queries).
+
+```python
+import torch
+
+with ds.lookahead_loader(batch_size=8, shuffle=True, generator=torch.Generator().manual_seed(42),
+                         num_workers=2, lookahead_batches=2, prefetch_bytes=64 << 20) as batches:
+    for batch in batches:
+        train(batch)
+```
+
+Each worker can fetch compressed byte ranges for its next two assigned batches during the current decode.
+The byte limit includes outstanding reads. Set `lookahead_batches=0` for a matched control or pass a
+`batch_sampler` to supply the order. Exiting the context also releases workers after an early break.
+
+```python
+from contextlib import closing
+
+pool = ds.episode_pool(episode_pool_size=4, batch_size=8, prefetch_anchors=16, seed=42)
+with closing(pool.loader(num_workers=2)) as batches:
+    for batch in batches:
+        train(batch)
+        checkpoint = pool.state_dict()
+        if should_checkpoint():
+            break
+pool.load_state_dict(checkpoint)
+with closing(pool.loader(num_workers=2)) as remaining:
+    for batch in remaining:
+        train(batch)
+```
+
+`LanceDBEpisodePoolDataset(root=..., columns=..., delta_timestamps=...)` is the standalone iterable.
+Use the same worker count, batch size, selection and planner settings on resume. `pool.loader()` tracks
+samples delivered to the training process, including each worker's last short batch. With a separately
+constructed multiprocessing `DataLoader`, save the consumed sample count in `offset` yourself because
+workers can prefetch beyond it. `set_epoch(n)` starts a fresh plan. `order="sequential"` walks each
+worker's episodes in frame order. The default planner mixes resident episodes using remaining anchor
+counts, with `sampling_strategy="round_robin"` also available.
+
+Each worker coalesces compressed reads for up to `prefetch_anchors` center frames, then decodes on demand.
+It can retain an independent frame tensor only while another anchor in that window requests it.
+Both `max_decoded_reuse_frames` and `max_decoded_reuse_bytes` bound these tensors. The optional
+`videos.lance.sample_index` provides the MP4 sample positions and timestamps used for indexed RGB reads.
+`--no-sample-index` disables writing it and `use_mini_mp4=False` disables its use at read time.
+
 ## Choosing a video base
 
 - **Hugging Face Hub.** `--repo-id` resolves the source revision to a commit. The converter
@@ -52,6 +116,32 @@ Request either internal column by name to include it in a sample. List every fea
   URI. For whole RGB files whose size matches the index, TorchCodec opens that path directly.
   Depth files, older relative descriptors and managed blobs use the sparse blob reader. If native
   open fails, the reader retries through Lance. Use `--video-mode copy` for a self-contained dataset.
+
+## Ordered prefetch and episode-pool measurements
+
+This run used the same inputs and 20 ms loopback service described below, with zero DataLoader workers,
+seed 42, batch size two, two warmup batches and ten measured batches. A used the same global shuffle at
+both lookahead depths. B used the same episode/frame sequence across all three readers. The pool admitted
+two episodes and coalesced eight upcoming anchors. Values are from one run of `8a50c06`.
+
+| Workload | A K=0 samples/s | A K=2 samples/s | A p95 wait ms, K=0 / K=2 | B streaming samples/s | B hybrid replay samples/s | B episode pool samples/s |
+|---|---:|---:|---:|---:|---:|---:|
+| PushT | 85.6 | 99.8 | 23.7 / 25.5 | 5,280.7 | 93.8 | 332.4 |
+| DROID-shaped | 191.3 | 211.1 | 24.1 / 22.0 | 181.3 | 275.6 | 196.7 |
+| 720p | 29.8 | 27.4 | 103.0 / 109.1 | 23.5 | 25.3 | 17.9 |
+
+On PushT the pool issued 5 GETs and transferred 54,114 bytes, hybrid replay issued 13 GETs for 52,117
+bytes, and streaming issued 30 GETs for 5,581,210 bytes. The 720p pool had lower throughput than both
+other readers. Timing includes work the streaming reader can complete during startup or warmup.
+
+```bash
+export PYTHONPATH="$PWD/src" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 RAYON_NUM_THREADS=4
+python scripts/bench_loader.py --workloads pusht droid 720p --steps 10 --num-workers 0 \
+    --rtt-ms 20 --lookahead-batches 2 --episode-pool --verify-correctness --output p4-features.json
+```
+
+The JSON records TTFT, p50/p95 waits, GETs, bytes, peak PSS and anchor batches for each row. Verification
+compares restored batches with upstream map-style samples and checks boundary PTS and padding.
 
 ## Loader measurements
 
