@@ -167,6 +167,10 @@ def parse_hf_dataset_uri(uri: str) -> tuple[str, str | None, str]:
     return unquote(repo_id), (unquote(rev) or None), unquote(raw_subpath)
 
 
+def _is_commit_sha(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{40}", value) is not None
+
+
 def _parse_retry_after(header_value: str | None, default: float) -> float:
     if not header_value:
         return min(default, 60.0)

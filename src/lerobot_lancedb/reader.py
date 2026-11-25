@@ -25,6 +25,7 @@ import operator
 import os
 import re
 import shutil
+import stat
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,7 @@ from typing import TYPE_CHECKING
 import av
 import huggingface_hub
 import numpy as np
+import pyarrow as pa
 import torch
 from lerobot.configs.video import DEFAULT_DEPTH_UNIT, DepthEncoderConfig
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
@@ -42,7 +44,7 @@ from lerobot.datasets.depth_utils import dequantize_depth
 from lerobot.datasets.feature_utils import check_delta_timestamps, get_delta_indices
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
-from ._source import parse_hf_dataset_uri
+from ._source import _file_uri_to_path, _is_commit_sha, parse_hf_dataset_uri
 from ._video_compat import FrameTimestampError, decode_video_frames_pyav
 
 try:
@@ -388,11 +390,59 @@ def _storage_options(
             options.setdefault("revision", uri_revision or revision)
         effective_revision = options.get("hf_revision", options.get("revision"))
         if (
-            re.fullmatch(r"[a-fA-F0-9]{40}", effective_revision or "")
+            _is_commit_sha(effective_revision)
             and "enable_resolve_cache" not in options
         ):
             options.setdefault("hf_enable_resolve_cache", "true")
     return options
+
+
+def _apply_external_hf_options(options: dict, bases, token: str | bool | None) -> None:
+    if not isinstance(bases, dict):
+        return
+    for base_id, base in bases.items():
+        if not re.fullmatch(r"[1-9][0-9]*", str(base_id)) or not isinstance(base, dict):
+            continue
+        uri = base.get("uri")
+        if not isinstance(uri, str) or not uri.startswith("hf://datasets/"):
+            continue
+        try:
+            _, uri_ref, _ = parse_hf_dataset_uri(uri)
+        except ValueError:
+            continue
+        pin = uri_ref or base.get("hf_revision")
+        if not _is_commit_sha(pin):
+            continue
+        prefix = f"base_{base_id}."
+        if prefix + "hf_revision" not in options:
+            options.setdefault(prefix + "revision", pin)
+        ref = options.get(prefix + "hf_revision", options.get(prefix + "revision"))
+        if _is_commit_sha(ref) and prefix + "enable_resolve_cache" not in options:
+            cache = options.get("hf_enable_resolve_cache", options.get("enable_resolve_cache", "true"))
+            options.setdefault(prefix + "hf_enable_resolve_cache", cache)
+        hub_token = options.get("hf_token", options.get("token", token))
+        if isinstance(hub_token, str) and prefix + "hf_token" not in options:
+            options.setdefault(prefix + "token", hub_token)
+        if "hf_endpoint" in options and prefix + "endpoint" not in options:
+            options.setdefault(prefix + "hf_endpoint", options["hf_endpoint"])
+
+
+def _local_video_path(descriptor, file_size: int) -> Path | None:
+    if not isinstance(descriptor, dict) or descriptor.get("kind") != 3 or descriptor.get("blob_id") != 0:
+        return None
+    uri = descriptor.get("blob_uri")
+    if not isinstance(uri, str) or not uri.startswith("file://"):
+        return None
+    if descriptor.get("position") != 0 or descriptor.get("size") not in (0, file_size):
+        return None
+    try:
+        path = _file_uri_to_path(uri)
+        info = path.stat()
+        if path.is_absolute() and stat.S_ISREG(info.st_mode) and info.st_size == file_size:
+            return path
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def _connect(db_uri: str, options: dict):
@@ -611,6 +661,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
         token: Hub token, or False to disable implicit Hub authentication.
         video_decoder_cache_size: Max decoders per worker (default 16, also
             bounded by a 2 GiB per-worker byte budget).
+        columns: Requested features and optional task label. Defaults to all features and task.
         depth_output_unit: Unit depth features dequantize to (``'mm'`` or ``'m'``).
             Depth decodes through pyav (16-bit planes torchcodec cannot emit).
     """
@@ -629,6 +680,8 @@ class LanceDBDataset(torch.utils.data.Dataset):
         video_decoder_cache_size: int | None = None,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
         token: str | bool | None = None,
+        *,
+        columns: Sequence[str] | None = None,
     ):
         super().__init__()
         require_package("lancedb", extra="lance")
@@ -647,10 +700,37 @@ class LanceDBDataset(torch.utils.data.Dataset):
         if self._db_uri == f"hf://datasets/{repo_id}" and not (root and _is_remote_uri(root)):
             # The metadata loader may have resolved a LeRobot version tag.
             # A metadata-only Hub download has a commit-specific snapshot path.
-            resolved = self.root.name if self.root.parent.name == "snapshots" else self.meta.revision
+            resolved = self.meta.revision
+            if self.root.parent.name == "snapshots" and _is_commit_sha(self.root.name):
+                resolved = self.root.name
+                self._storage_options.pop("hf_revision", None)
+                self._storage_options["revision"] = resolved
             self._storage_options = _storage_options(self._db_uri, self._storage_options, resolved, token)
 
-        if self.meta.image_keys:
+        # LeRobot 0.7 discards extension fields when it constructs DatasetInfo.
+        info = json.loads((self.meta.root / "meta/info.json").read_text())
+        _apply_external_hf_options(self._storage_options, info.get("lance_external_bases"), token)
+
+        selected = set(columns) if columns is not None else None
+        if selected is not None:
+            if not selected:
+                raise ValueError("columns must be non-empty")
+            unknown = selected.difference(self.meta.features, {"task"})
+            if unknown:
+                raise ValueError(f"Unknown columns: {sorted(unknown)}")
+            missing = set(delta_timestamps or {}) - selected
+            if missing:
+                raise ValueError(f"delta_timestamps keys missing from columns: {sorted(missing)}")
+
+        def active(keys):
+            return keys if selected is None else [key for key in keys if key in selected]
+
+        self._selected = selected
+        self._include_task = selected is None or "task" in selected
+        self._video_keys = active(self.meta.video_keys)
+        self._camera_keys = active(self.meta.camera_keys)
+        self._depth_keys = active(self.meta.depth_keys)
+        if active(self.meta.image_keys):
             raise NotImplementedError(
                 f"Image-backed features are not supported by LanceDBDataset: {self.meta.image_keys}. "
                 "Re-encode them as video."
@@ -658,11 +738,11 @@ class LanceDBDataset(torch.utils.data.Dataset):
         # Depth videos carry 16-bit planes torchcodec cannot emit; they decode
         # through pyav over the same prefetched sources.
         self._depth_output_unit = depth_output_unit
-        if self.meta.depth_keys:
+        if self._depth_keys:
             self.meta.rescale_depth_stats(self._depth_output_unit)
         self._depth_encoder_configs = {
             key: DepthEncoderConfig.from_video_info(self.meta.features[key].get("info"))
-            for key in self.meta.depth_keys
+            for key in self._depth_keys
         }
         if image_transforms is not None and not callable(image_transforms):
             raise TypeError("image_transforms must be callable or None.")
@@ -696,24 +776,29 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 self._ep_from[self.episodes], self._ep_to[self.episodes]
             )
 
-        self._task_names = list(self.meta.tasks.index)
+        self._task_names = list(self.meta.tasks.index) if self._include_task else []
 
-        self._tabular_keys = [
+        self._output_tabular_keys = [
             key
-            for key in self.meta.features
+            for key in active(self.meta.features)
             if key not in self.meta.video_keys and key not in self.meta.image_keys
         ]
-        self._fetch_columns = [to_lance_column(key) for key in self._tabular_keys]
+        self._fetch_tabular_keys = self._output_tabular_keys.copy()
+        if self._video_keys and "timestamp" not in self._fetch_tabular_keys:
+            self._fetch_tabular_keys.append("timestamp")
+        if self._include_task and "task_index" not in self._fetch_tabular_keys:
+            self._fetch_tabular_keys.append("task_index")
+        self._fetch_columns = [to_lance_column(key) for key in self._fetch_tabular_keys]
         self._feature_shapes = {
-            key: tuple(self.meta.features[key].get("shape") or ()) for key in self._tabular_keys
+            key: tuple(self.meta.features[key].get("shape") or ()) for key in self._output_tabular_keys
         }
         # String features pass through as python strings, language columns
         # (list<struct>, lerobot#3467) as python lists of dicts, like upstream.
         self._string_keys = {
-            key for key in self._tabular_keys if self.meta.features[key].get("dtype") == "string"
+            key for key in self._output_tabular_keys if self.meta.features[key].get("dtype") == "string"
         }
         self._language_keys = {
-            key for key in self._tabular_keys if self.meta.features[key].get("dtype") == "language"
+            key for key in self._output_tabular_keys if self.meta.features[key].get("dtype") == "language"
         }
 
         # Which (chunk, file) mp4 holds each episode and where it starts inside
@@ -724,7 +809,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 self._episode_numpy(f"videos/{key}/file_index", np.int64),
                 self._episode_numpy(f"videos/{key}/from_timestamp", np.float64),
             )
-            for key in self.meta.video_keys
+            for key in self._video_keys
         }
 
         self._frames_perm = None
@@ -746,7 +831,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
     def _ensure_open(self) -> None:
         if self._frames_perm is not None:
             return
-        if self.meta.video_keys:
+        if self._video_keys:
             self._prefetch_pool = ThreadPoolExecutor(max_workers=1)
             self._decode_pool = ThreadPoolExecutor(max_workers=16)
         options = self._storage_options
@@ -761,7 +846,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
         self._frames_perm = (
             Permutation.identity(table).select_columns(self._fetch_columns).with_format("arrow")
         )
-        if self.meta.video_keys:
+        if self._video_keys:
             self._videos_table = _open_table(db, VIDEOS_TABLE, options or None)
             # TODO: for million-file datasets, resolve row ids lazily per batch.
             index = (
@@ -814,7 +899,9 @@ class LanceDBDataset(torch.utils.data.Dataset):
 
     @property
     def features(self) -> dict[str, dict]:
-        return self.meta.features
+        if self._selected is None:
+            return self.meta.features
+        return {key: value for key, value in self.meta.features.items() if key in self._selected}
 
     @property
     def fps(self) -> int:
@@ -837,21 +924,21 @@ class LanceDBDataset(torch.utils.data.Dataset):
         # frames-table fetch. The timestamp coverage check in _ensure_decoders is
         # the safety net: any drift costs a re-fetch, never a wrong frame.
         prepared_future = None
-        if self.meta.video_keys:
+        if self._video_keys:
             windows = self._plan_file_windows(plans)
             prepared_future = self._prefetch_pool.submit(self._prepare_files, sorted(windows), windows)
 
         columns = self._fetch_rows(rows)
         items = [self._build_item(plan, columns, row_pos) for plan in plans]
 
-        if self.meta.video_keys:
+        if self._video_keys:
             decoded = self._decode_videos(plans, columns, row_pos, prepared_future.result())
             for item, frames in zip(items, decoded, strict=True):
                 item.update(frames)
         if self.image_transforms is not None:
             for item in items:
-                for cam_key in self.meta.camera_keys:
-                    if cam_key in self.meta.depth_keys:
+                for cam_key in self._camera_keys:
+                    if cam_key in self._depth_keys:
                         continue
                     item[cam_key] = self.image_transforms(item[cam_key])
         return items
@@ -866,7 +953,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
         windows: dict[tuple, list[tuple[int, int]]] = {}
         for plan in plans:
             ep_idx = plan["ep_idx"]
-            for key in self.meta.video_keys:
+            for key in self._video_keys:
                 file_key, span = self._planned_file_window(key, ep_idx, plan, fps)
                 windows.setdefault(file_key, []).append(span)
         return windows
@@ -910,13 +997,13 @@ class LanceDBDataset(torch.utils.data.Dataset):
         _, _, from_ts_arr = self._video_locator[key]
         window = plan["windows"].get(key, [plan["abs_idx"]])
         base = round(float(from_ts_arr[ep_idx]) * fps) - ep_start
-        first = base + min(window) - (1 if key in self.meta.depth_keys else 0)
+        first = base + min(window) - (1 if key in self._depth_keys else 0)
         return self._video_file_key(key, ep_idx), (first, base + max(window))
 
     def _fetch_rows(self, rows: list[int]) -> dict[str, np.ndarray]:
         batch = self._frames_perm.__getitems__(rows)
         columns = {}
-        for key, lance_name in zip(self._tabular_keys, self._fetch_columns, strict=True):
+        for key, lance_name in zip(self._fetch_tabular_keys, self._fetch_columns, strict=True):
             array = batch.column(lance_name)
             if hasattr(array, "combine_chunks"):
                 array = array.combine_chunks()
@@ -952,7 +1039,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
 
         def _decode_file(file_key: tuple, file_requests: list[tuple[int, list[float]]]) -> None:
             decoder, source = entries[file_key]
-            if file_key[0] in self.meta.depth_keys:
+            if file_key[0] in self._depth_keys:
                 decoded = self._decode_depth_file_requests(source, file_requests, file_key)
             else:
                 decoded = self._decode_rgb_file_requests(decoder, file_requests, file_key)
@@ -1033,7 +1120,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
         requests: dict[tuple, list[tuple[int, list[float]]]] = defaultdict(list)
         for sample_idx, plan in enumerate(plans):
             ep_idx = plan["ep_idx"]
-            for key in self.meta.video_keys:
+            for key in self._video_keys:
                 window = plan["windows"].get(key, [plan["abs_idx"]])
                 requests[self._video_file_key(key, ep_idx)].append(
                     (sample_idx, self._shifted_video_timestamps(key, ep_idx, window, timestamps, row_pos))
@@ -1057,10 +1144,19 @@ class LanceDBDataset(torch.utils.data.Dataset):
 
         prepared: dict[tuple, tuple] = {}
         new_files = []
+        direct = {}
         for key in file_keys:
             if key in self._decoder_cache:
                 prepared[key] = self._decoder_cache.get(key)
+            elif (path := self._file_meta[key]["local_path"]) is not None:
+                direct[key] = self._decode_pool.submit(VideoDecoder, str(path), seek_mode="approximate")
             else:
+                new_files.append(key)
+        for key, future in direct.items():
+            try:
+                prepared[key] = (future.result(), None)
+            except Exception:
+                # The path can disappear or the native file opener can reject it.
                 new_files.append(key)
 
         sources = {key: source for key, (_, source) in prepared.items()}
@@ -1073,7 +1169,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 meta = self._file_meta[key]
                 size = meta["file_size"]
                 sources[key] = _SparseBlobSource(size, handle)
-                slack = _range_slack(meta, key[0] in self.meta.depth_keys)
+                slack = _range_slack(meta, key[0] in self._depth_keys)
                 spans_by_key[key].extend(
                     [
                         (0, min(_OPEN_PROBE_BYTES, size)),
@@ -1085,16 +1181,19 @@ class LanceDBDataset(torch.utils.data.Dataset):
                     spans_by_key[key].append((first_packet, min(first_packet + _OPEN_PROBE_BYTES, size)))
 
         for key, frame_windows in (windows or {}).items():
+            if sources[key] is None:
+                continue
             for first, last in frame_windows:
                 span = self._window_byte_range(key[0], self._file_meta[key], first, last)
                 if not sources[key].covers(*span):
                     spans_by_key[key].append(span)
-        self._fetch_spans(spans_by_key, sources)
+        if spans_by_key:
+            self._fetch_spans(spans_by_key, sources)
 
         def open_decoder(key):
             source = sources[key]
             decoder = None
-            if key[0] not in self.meta.depth_keys:
+            if key[0] not in self._depth_keys:
                 decoder = VideoDecoder(source, seek_mode="approximate")
             return key, (decoder, source)
 
@@ -1127,8 +1226,10 @@ class LanceDBDataset(torch.utils.data.Dataset):
         for key, file_requests in requests.items():
             meta = self._file_meta[key]
             source = sources[key]
+            if source is None:
+                continue
             spans = []
-            reach_back = 1 if key[0] in self.meta.depth_keys else 0
+            reach_back = 1 if key[0] in self._depth_keys else 0
             for _, shifted_ts in file_requests:
                 first = round(min(shifted_ts) * fps)
                 last = round(max(shifted_ts) * fps)
@@ -1136,7 +1237,8 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 if not source.covers(start, end):
                     spans.append((start, end))
             spans_by_key[key] = spans
-        self._fetch_spans(spans_by_key, sources)
+        if spans_by_key:
+            self._fetch_spans(spans_by_key, sources)
 
         for key in requests:
             source = sources[key]
@@ -1148,7 +1250,8 @@ class LanceDBDataset(torch.utils.data.Dataset):
             else:  # depth: no torchcodec decoder. size from the feature shape
                 height, width = (tuple(self.meta.features[key[0]].get("shape") or (0, 0)) + (0, 0))[:2]
             context_cost = (8 << 20) + 8 * height * width
-            self._decoder_cache.put(key, (decoder, source), nbytes=source.buffered + context_cost)
+            buffered = source.buffered if source is not None else 0
+            self._decoder_cache.put(key, (decoder, source), nbytes=buffered + context_cost)
         return prepared
 
     def _decode_depth_frames(self, source, shifted_ts: list[float], file_key: tuple) -> torch.Tensor:
@@ -1226,7 +1329,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
         range_targets: list[tuple[tuple, int]] = []
         for key, spans in spans_by_key.items():
             for start, end in _merge_spans(
-                spans, _range_slack(self._file_meta[key], key[0] in self.meta.depth_keys)
+                spans, _range_slack(self._file_meta[key], key[0] in self._depth_keys)
             ):
                 range_requests.append((self._video_row_ids[key], start, end - start))
                 range_targets.append((key, start))
@@ -1243,7 +1346,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
         row_ids = [self._video_row_ids[file_key] for file_key in missing]
         batch = (
             self._videos_table.take_row_ids(row_ids)
-            .select(["video_key", "chunk_index", "file_index", *VIDEO_INDEX_COLUMNS])
+            .select(["video_key", "chunk_index", "file_index", *VIDEO_INDEX_COLUMNS, VIDEO_BLOB_COLUMN])
             .to_arrow()
         )
         if batch.num_rows != len(missing):
@@ -1262,9 +1365,15 @@ class LanceDBDataset(torch.utils.data.Dataset):
         index_values = kf_index_column.values.to_numpy(zero_copy_only=False)
         position_offsets = kf_position_column.offsets.to_numpy(zero_copy_only=False)
         position_values = kf_position_column.values.to_numpy(zero_copy_only=False)
+        descriptors = batch.column(VIDEO_BLOB_COLUMN)
+        has_descriptors = pa.types.is_struct(descriptors.type)
         for i in range(batch.num_rows):
             file_key = (scalars["video_key"][i], scalars["chunk_index"][i], scalars["file_index"][i])
+            local_path = None
+            if has_descriptors and file_key[0] not in self._depth_keys:
+                local_path = _local_video_path(descriptors[i].as_py(), scalars["file_size"][i])
             self._file_meta[file_key] = {
+                "local_path": local_path,
                 "file_size": scalars["file_size"][i],
                 "moov_offset": scalars["moov_offset"][i],
                 "moov_size": scalars["moov_size"][i],
@@ -1280,7 +1389,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
         start_idx = max(int(np.searchsorted(kf_indices, first_frame, side="right")) - 1, 0)
         end_idx = int(np.searchsorted(kf_indices, last_frame, side="right"))
         end = int(kf_positions[end_idx]) if end_idx < len(kf_positions) else meta["file_size"]
-        slack = _range_slack(meta, key in self.meta.depth_keys)
+        slack = _range_slack(meta, key in self._depth_keys)
         # TorchCodec fills a 64 KiB AVIO buffer after a seek. A small GOP needs
         # one whole read from its keyframe, including when it ends a wider window.
         last_gop_start = int(kf_positions[max(0, end_idx - 1)])
@@ -1290,7 +1399,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
     def _build_item(self, plan: dict, columns: dict[str, np.ndarray], row_pos: dict[int, int]) -> dict:
         base = row_pos[plan["abs_idx"]]
         item = {}
-        for key in self._tabular_keys:
+        for key in self._output_tabular_keys:
             data = columns[key]
             shape = self._feature_shapes[key]
             if key in self._language_keys:
@@ -1311,7 +1420,8 @@ class LanceDBDataset(torch.utils.data.Dataset):
             else:
                 item[key] = torch.tensor(data[base])
         item.update(plan["padding"])
-        item["task"] = self._task_names[int(item["task_index"].item())]
+        if self._include_task:
+            item["task"] = self._task_names[int(columns["task_index"][base])]
         return item
 
     def __repr__(self) -> str:

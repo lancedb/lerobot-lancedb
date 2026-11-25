@@ -60,9 +60,11 @@ from ._source import (
     DEFAULT_IO_WORKERS,
     LocalSource,
     _file_uri_to_path,
+    _is_commit_sha,
     is_remote_uri,
     normalize_base_uri,
     open_source,
+    parse_hf_dataset_uri,
     validate_rel_path,
 )
 from .doctor import audit
@@ -357,7 +359,7 @@ def _warn_remote_orphans(
         )
 
 
-def _stamp_storage_format(meta_dir: Path) -> None:
+def _stamp_storage_format(meta_dir: Path, external_bases: dict | None = None) -> None:
     """Declare the Lance storage format in ``meta/info.json``.
 
     Readers select the storage backend from this field; layout detection is only
@@ -365,9 +367,12 @@ def _stamp_storage_format(meta_dir: Path) -> None:
     """
     info_file = meta_dir / "info.json"
     info = json.loads(info_file.read_text())
-    if info.get("storage_format") != "lance":
-        info["storage_format"] = "lance"
-        info_file.write_text(json.dumps(info, indent=4))
+    info["storage_format"] = "lance"
+    if external_bases:
+        info["lance_external_bases"] = external_bases
+    else:
+        info.pop("lance_external_bases", None)
+    info_file.write_text(json.dumps(info, indent=4))
 
 
 def _handle_blocking_defects(source_label: str, messages: list[str], allow_defects: bool) -> None:
@@ -594,13 +599,13 @@ def _ensure_remote_output_empty(db, out_target: Path | str) -> None:
         )
 
 
-def _prepare_stamped_meta(src_meta_dir: Path, target_dir: Path) -> Path:
+def _prepare_stamped_meta(src_meta_dir: Path, target_dir: Path, external_bases: dict | None = None) -> Path:
     """Copy ``src_meta_dir`` fresh into ``target_dir / 'meta'`` and stamp ``storage_format``."""
     meta_dir = target_dir / "meta"
     if meta_dir.exists():
         shutil.rmtree(meta_dir)
     shutil.copytree(src_meta_dir, meta_dir)
-    _stamp_storage_format(meta_dir)
+    _stamp_storage_format(meta_dir, external_bases)
     return meta_dir
 
 
@@ -838,13 +843,23 @@ def _external_video_uri(base_uri: str, rel_path: str) -> str:
     return f"{clean_base}{sep}{encoded_rel}"
 
 
+def _external_table_options(base_uri: str, storage_options, source_storage_options) -> dict:
+    if base_uri.startswith("file://"):
+        # Preserve the absolute URI in the descriptor for local RGB decoders.
+        return {"allow_external_blob_outside_bases": True, "storage_options": storage_options}
+    return {
+        "initial_bases": [lancedb.BasePath(path=base_uri, name="source_videos", id=1)],
+        "storage_options": _merged_videos_write_options(storage_options, source_storage_options),
+    }
+
+
 def _dry_run_external_base(
     staging: Path,
     schema: pa.Schema,
     resolved_base_uri: str,
     sample_ref: _VideoRef,
     sample_probe: ProbedMp4,
-    write_options: dict[str, str] | None,
+    table_options: dict,
 ) -> None:
     """Validate ``initial_bases`` + external URI acceptance locally before mutating a remote output."""
     check_dir = staging / "_external_base_check"
@@ -870,14 +885,12 @@ def _dry_run_external_base(
         ],
         schema=schema,
     )
-    create_kwargs = {"storage_options": write_options} if write_options else {}
     check_db.create_table(
         VIDEOS_TABLE,
         pa.RecordBatchReader.from_batches(schema, [sample_batch]),
         schema=schema,
         mode="create",
-        initial_bases=[lancedb.BasePath(path=resolved_base_uri, name="source_videos", id=1)],
-        **create_kwargs,
+        **table_options,
     )
 
 
@@ -1011,7 +1024,14 @@ def _convert_external(
             if normalized_explicit_base is not None
             else normalize_base_uri(source.default_video_base_uri(video_rels))
         ) if video_refs else ""
-        videos_write_opts = _merged_videos_write_options(storage_options, source_storage_options)
+        table_options = _external_table_options(resolved_base_uri, storage_options, source_storage_options) if video_refs else {}
+        external_bases = None
+        if resolved_base_uri.startswith("hf://datasets/"):
+            repo, ref, _ = parse_hf_dataset_uri(resolved_base_uri)
+            if ref is None and repo == getattr(source, "repo_id", None):
+                ref = getattr(source, "commit_sha", None)
+            if _is_commit_sha(ref):
+                external_bases = {"1": {"uri": resolved_base_uri, "hf_revision": ref}}
 
         total_reads = sum(p.range_gets for p in probed.values())
         total_bytes_read = sum(p.bytes_read for p in probed.values())
@@ -1077,7 +1097,6 @@ def _convert_external(
                 yield flush()
 
         def _build_into(db, meta_dir: Path) -> None:
-            videos_create_kwargs = {"storage_options": videos_write_opts} if videos_write_opts else {}
             frames_table = _write_frames_table(db, data_paths, mode="create")
             if video_refs:
                 print(
@@ -1089,8 +1108,7 @@ def _convert_external(
                     pa.RecordBatchReader.from_batches(schema, ext_video_batches()),
                     schema=schema,
                     mode="create",
-                    initial_bases=[lancedb.BasePath(path=resolved_base_uri, name="source_videos", id=1)],
-                    **videos_create_kwargs,
+                    **table_options,
                 )
                 print(
                     f"  {videos_table.count_rows()} rows "
@@ -1112,9 +1130,9 @@ def _convert_external(
                     resolved_base_uri,
                     video_refs[0],
                     probed[video_refs[0].rel_path],
-                    videos_write_opts,
+                    table_options,
                 )
-            meta_dir = _prepare_stamped_meta(meta_root / "meta", staging / "_stamped")
+            meta_dir = _prepare_stamped_meta(meta_root / "meta", staging / "_stamped", external_bases)
             db = _connect_output(out_target, storage_options)
             _ensure_remote_output_empty(db, out_target)
             _build_into(db, meta_dir)
@@ -1122,7 +1140,7 @@ def _convert_external(
         else:
             out_path = _local_path(out_target)
             with _local_build_dir(out_path) as build_dir:
-                meta_dir = _prepare_stamped_meta(meta_root / "meta", build_dir)
+                meta_dir = _prepare_stamped_meta(meta_root / "meta", build_dir, external_bases)
                 db = _connect_output(build_dir, storage_options)
                 _build_into(db, meta_dir)
                 _commit_local_output(build_dir, out_path)

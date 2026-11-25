@@ -1,7 +1,10 @@
 """Cold External Blob reads and batch decoding contracts."""
 
+import importlib
+import json
 import pickle
 from http.server import BaseHTTPRequestHandler
+from pathlib import Path
 from types import SimpleNamespace
 
 import av
@@ -230,3 +233,178 @@ def test_repo_id_routes_hub_credentials_and_revision(indexed_videos, monkeypatch
     ds = reader.LanceDBDataset(repo_id="test/robot", storage_options={"token": "supplied", "revision": SHA})
     assert downloads == [("test/robot", "supplied", SHA)]
     assert ds.meta.revision == SHA and ds._storage_options["hf_enable_resolve_cache"] == "true"
+
+
+@pytest.mark.parametrize(
+    "options", [{}, {"revision": "main"}, {"hf_revision": "v3.0"}, {"hf_enable_resolve_cache": "false"}]
+)
+def test_mutable_ref_uses_resolved_snapshot(indexed_videos, tmp_path, monkeypatch, options):
+    output, _, _, _ = indexed_videos
+    snapshot = tmp_path / "snapshots" / SHA
+    snapshot.mkdir(parents=True)
+    (snapshot / "meta").symlink_to(output / "meta")
+    monkeypatch.setattr(reader.huggingface_hub, "snapshot_download", lambda *a, **kw: str(snapshot))
+    ds = reader.LanceDBDataset(repo_id="test/robot", revision="main", storage_options=options, token=False)
+    assert ds._storage_options["revision"] == SHA and "hf_revision" not in ds._storage_options
+    assert ds._storage_options["hf_enable_resolve_cache"] == options.get("hf_enable_resolve_cache", "true")
+
+
+def test_only_whole_local_objects_qualify(tmp_path):
+    path = tmp_path / "clip with space.mp4"
+    path.write_bytes(b"1234")
+    descriptor = dict(kind=3, blob_id=0, position=0, size=4, blob_uri=path.as_uri())
+    assert (
+        reader._local_video_path(descriptor, 4)
+        == reader._local_video_path(descriptor | {"size": 0}, 4)
+        == path
+    )
+    for override in [
+        {"position": 1},
+        {"size": 3},
+        {"size": 5},
+        {"blob_id": 1},
+        {"kind": 1},
+        {"blob_uri": "videos/old.mp4", "blob_id": 1},
+        {"blob_uri": "s3://bucket/clip.mp4"},
+        {"blob_uri": "file://server/clip.mp4"},
+        {"blob_uri": tmp_path.as_uri()},
+    ]:
+        assert reader._local_video_path(descriptor | override, 4) is None
+    assert reader._local_video_path({"kind": 3}, 4) is None
+    assert reader._local_video_path(None, 4) is None
+    path.write_bytes(b"short")
+    assert reader._local_video_path(descriptor, 4) is None
+    path.unlink()
+    assert reader._local_video_path(descriptor, 4) is None
+
+
+def test_relative_local_base_uses_sparse_decoder(tmp_path, monkeypatch):
+    source = _make_dataset(tmp_path / "source")
+    output = tmp_path / "old-layout"
+    monkeypatch.setattr(
+        "lerobot_lancedb.convert._external_table_options",
+        lambda uri, *_: {"initial_bases": [lancedb.BasePath(path=uri, name="source_videos", id=1)]},
+    )
+    convert(output, root=source, video_mode="external")
+    expected = VideoDecoder(str(sorted((source / "videos").rglob("*.mp4"))[0])).get_frames_at(indices=[1])
+    ds = reader.LanceDBDataset(root=output, return_uint8=True)
+    assert torch.equal(ds[1][VIDEO_KEY], expected.data[0])
+    assert isinstance(ds._decoder_cache.get((VIDEO_KEY, 0, 0))[1], reader._SparseBlobSource)
+
+
+def test_direct_open_failure_falls_back_to_blob(tmp_path, monkeypatch):
+    src = _make_dataset(tmp_path / "source")
+    output = tmp_path / "out"
+    convert(output, root=src, video_mode="external")
+    path = sorted((src / "videos").rglob("*.mp4"))[0]
+    expected = VideoDecoder(str(path)).get_frames_at(indices=[3])
+    attempts = []
+
+    def open_decoder(source, **kwargs):
+        attempts.append(source)
+        if isinstance(source, str):
+            raise OSError("native opener failed")
+        return VideoDecoder(source, **kwargs)
+
+    monkeypatch.setattr("torchcodec.decoders.VideoDecoder", open_decoder)
+    ds = reader.LanceDBDataset(root=output, return_uint8=True)
+    item = ds[3]
+    assert attempts[0] == str(path) and isinstance(attempts[1], reader._SparseBlobSource)
+    assert torch.equal(item[VIDEO_KEY], expected.data[0])
+    assert torch.equal(item["timestamp"], expected.pts_seconds[0].float())
+    # Depth uses PyAV over a sparse source even for an eligible whole file.
+    ds = reader.LanceDBDataset(root=output)
+    ds._depth_keys = [VIDEO_KEY]
+    ds._ensure_open()
+    key = (VIDEO_KEY, 0, 0)
+    decoder, source = ds._prepare_files([key])[key]
+    assert decoder is None and isinstance(source, reader._SparseBlobSource)
+
+
+@pytest.mark.parametrize("cache_option", [None, "base_1.hf_enable_resolve_cache", "hf_enable_resolve_cache"])
+def test_hybrid_hub_pinned_range_reads(tmp_path, monkeypatch, cache_option):
+    src = _make_dataset(tmp_path / "source")
+    output = tmp_path / "hybrid"
+    base_uri = f"{HF_URI}@{SHA}/videos"
+    convert(output, root=src, video_base_uri=base_uri)
+    meta = reader.LeRobotDatasetMetadata("test/robot", root=output)
+    assert meta.total_frames == 20
+    assert json.loads((output / "meta/info.json").read_text())["lance_external_bases"] == {
+        "1": {"uri": base_uri, "hf_revision": SHA}
+    }
+    paths = sorted((src / "videos").rglob("*.mp4"))
+    files = {path.relative_to(src).as_posix(): path.read_bytes() for path in paths}
+    expected = VideoDecoder(str(paths[0])).get_frames_at(indices=[4])
+    requests = []
+    send_response = BaseHTTPRequestHandler.send_response
+
+    def record(handler, *args):
+        if handler.command == "GET":
+            requests.append(
+                (handler.path, handler.headers.get("Range"), handler.headers.get("Authorization"))
+            )
+        return send_response(handler, *args)
+
+    monkeypatch.setattr(BaseHTTPRequestHandler, "send_response", record)
+    prefix = f"datasets/test/robot/resolve/{SHA}"
+    with _s3_loopback_server(files, bucket=prefix) as endpoint:
+        # The LanceDB 0.42.0b26 HF provider takes its transport endpoint from the environment.
+        monkeypatch.setenv("HF_ENDPOINT", endpoint)
+        options = {"hf_endpoint": endpoint}
+        if cache_option:
+            options[cache_option] = "false"
+        ds = reader.LanceDBDataset(root=output, storage_options=options, token="fixture", return_uint8=True)
+        assert ds._storage_options["base_1.hf_enable_resolve_cache"] == ("false" if cache_option else "true")
+        assert ds._storage_options["base_1.hf_endpoint"] == endpoint
+        assert ds._storage_options["base_1.revision"] == SHA
+        item = ds[4]
+    assert torch.equal(item[VIDEO_KEY], expected.data[0])
+    assert torch.equal(item["timestamp"], expected.pts_seconds[0].float())
+    assert requests and all(
+        path.startswith(f"/{prefix}/videos/") and rng and auth == "Bearer fixture"
+        for path, rng, auth in requests
+    )
+
+
+def test_projection_skips_unused_cameras_and_tabular_columns(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
+    source = importlib.import_module("bench_workloads").synthetic(tmp_path / "src", "droid-short-gop")
+    output = tmp_path / "out"
+    convert(output, root=source, video_mode="external")
+    cam = "observation.images.cam1"
+    delta = {cam: [-1 / 15, 0.0], "action": [-1 / 15, 0.0]}
+    indices = [2, 0, 2]
+    ref = reader.LanceDBDataset(root=output, delta_timestamps=delta).__getitems__(indices)
+    # Removing unused videos catches any accidental open, including the sparse fallback.
+    for path in (source / "videos").rglob("*.mp4"):
+        if cam not in path.parts:
+            path.unlink()
+    ds = reader.LanceDBDataset(root=output, columns=[cam, "action"], delta_timestamps=delta)
+    assert set(ds.features) == {cam, "action"}
+    assert set(ds._fetch_columns) == {"action", "timestamp"}
+    for item, full in zip(ds.__getitems__(indices), ref, strict=True):
+        assert set(item) == {cam, "action", cam + "_is_pad", "action_is_pad"}
+        assert all(torch.equal(item[k], full[k]) for k in item)
+
+    (output / "videos.lance").rename(output / "hidden-videos")
+    for columns in (["action"], ["task", "action"], ["task"]):
+        ds = reader.LanceDBDataset(root=output, columns=columns)
+        item = ds[0]
+        assert set(item) == set(columns)
+        if "task" in columns:
+            assert item["task"] == ref[1]["task"]
+        assert ds._videos_table is ds._decode_pool is ds._prefetch_pool is None
+    for columns, deltas, error in [
+        ([], {}, "non-empty"),
+        (["typo"], {}, "Unknown"),
+        (["task"], delta, "missing"),
+    ]:
+        with pytest.raises(ValueError, match=error):
+            reader.LanceDBDataset(root=output, columns=columns, delta_timestamps=deltas)
+    info_file = output / "meta/info.json"
+    info = json.loads(info_file.read_text())
+    info["features"]["still"] = {"dtype": "image", "shape": [32, 32, 3], "names": None}
+    info_file.write_text(json.dumps(info))
+    assert set(reader.LanceDBDataset(root=output, columns=["task"])[0]) == {"task"}
+    with pytest.raises(NotImplementedError, match="Image-backed"):
+        reader.LanceDBDataset(root=output, columns=["still"])
