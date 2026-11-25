@@ -1,8 +1,8 @@
 # lerobot-lancedb
 
-Convert a [LeRobot](https://github.com/huggingface/lerobot) dataset to a Lance
-layout once, then train from it - local disk or object storage - faster than
-upstream and without downloading the whole dataset first.
+Convert a LeRobot v3 dataset to Lance for map-style training with a global
+shuffle. Keep the frame table on local disk and read the original videos from
+object storage, or keep both on the training machine.
 
 Three pieces:
 
@@ -14,33 +14,42 @@ Three pieces:
 - **`LanceDBDataset`** - the map-style training loader for the Lance layout, so
   the round trip works from this one package.
 
-## Why convert
+## Hybrid training
 
-The Lance layout is map-style random access over object storage: a training
-worker fetches the exact byte ranges one batch needs, so you get a true global
-shuffle straight from S3 without downloading the dataset and without holding a
-big reservoir buffer in RAM. Upstream's only remote mode is an iterable streamer
-(reservoir shuffle, one worker per shard, OOMs on large frames).
+For a dataset already on the Hub or S3, put the three Lance tables on the
+training machine. Tabular reads stay local. Only selected cameras need remote
+MP4 ranges, and workers can seek directly to a shuffled batch's samples.
+Conversion reads MP4 headers to build the index.
 
-Batch 32, 8 workers, steady-state samples/s (global shuffle for lance; upstream's
-streamer only does its windowed reservoir shuffle):
+```bash
+lerobot-lance-convert --repo-id lerobot/pusht --out ./pusht-lance
+# For an S3 source, install the s3 extra and use its dataset prefix:
+lerobot-lance-convert --root s3://my-bucket/pusht --out ./pusht-s3
+```
 
-| dataset | lance local | lance S3 | upstream local | upstream Hub stream |
-|---|---:|---:|---:|---:|
-| pusht | 4,160 | 2,508 | 2,142 | 430 |
-| aloha | 113 | 107 | 109 | 9.7 (1-worker cap) |
-| koch | 189 | 182 | 120 | 11.7 |
-| soarm | 79 | 74 | 69 | crashes |
-| berkeley | 108 | 92 | 61 | 6.1 |
-| droid (386 GB) | 227 | 136 | 132 | **OOM** |
+```python
+from lerobot_lancedb import LanceDBDataset
 
-The column that matters is **lance S3 vs upstream Hub stream**: same remote data,
-lance is 6-15x faster and simply runs where the streamer exhausts RAM or a decode
-worker crashes. Lance from local disk matches or beats upstream local too, so
-converting doesn't cost you anything on the machine you already have. A
-same-bucket, same-access apples-to-apples comparison (only the loader/format
-differs) and the full methodology are in the [converter
-walkthrough](https://github.com/lancedb/lerobot-lancedb/blob/main/docs/walkthrough.md).
+training = LanceDBDataset(root="./pusht-lance", columns=["observation.image", "observation.state", "action"])
+item = training[0]
+```
+
+Hub conversion pins the video base to a commit. For a private dataset pass
+`token` to the reader. For an S3-compatible service, supply an `s3://`
+base and pass its HTTPS endpoint in `storage_options`.
+
+On an AMD EPYC 4585PX, a global shuffle with one worker and batch size two gave
+the following steady-state samples/s. Hybrid read the original MP4s over loopback
+S3 with 20 ms request latency. Both local loaders read warm local files.
+
+| Workload | Local Parquet | Local external Lance | Hybrid |
+|---|---:|---:|---:|
+| PushT | 521.8 | 944.0 | 81.8 |
+| Three-camera DROID-shaped fixture | 150.2 | 198.2 | 134.2 |
+| Two-camera 720p fixture | 20.6 | 26.4 | 25.6 |
+
+The walkthrough includes the exact commands, streaming replay on the same samples,
+and a wide-table projection measurement. [Loader measurements](docs/walkthrough.md#loader-measurements)
 
 ## Install
 
@@ -130,25 +139,26 @@ It is a map-style `torch.utils.data.Dataset` returning items bit-exact with
 `LeRobotDataset`. `root` may be a local dir or an `s3://` / `gs://` / `hf://` URI
 (ranged reads, nothing downloads up front).
 
-> **Two things to know.** (1) `LanceDBDataset` here is a **vendored copy** of
-> lerobot's loader (the open reader PR), included so this package works end to end
-> against released lerobot. Once the loader lands in lerobot core this re-exports
-> `lerobot.datasets.lancedb_dataset.LanceDBDataset` and the copy is deleted; your
-> import keeps working either way. (2) The `lerobot-train` CLI auto-detecting a
-> Lance root is part of the lerobot reader PR (in `make_dataset`), so training
-> straight off `--dataset.root ...-lance` needs that PR merged; until then, build
-> the `DataLoader` yourself as above.
+With `columns`, samples include the selected features, the requested `task`
+label and padding masks for selected delta windows. A tabular-only selection
+skips opening the video table. For a new local `--video-mode external`
+conversion, eligible RGB clips open directly in TorchCodec. Keep their original
+absolute paths accessible to every worker. Managed, depth and remote clips
+continue to use indexed blob reads.
+
+Unmodified LeRobot 0.7.0 can also open this layout with `LeRobotDataset`.
+Use this package's `LanceDBDataset` for feature projection and local direct decode.
 
 ## The layout
 
 Three Lance tables next to a copy of the standard `meta/` directory. The converter
 stamps `"storage_format": "lance"` into `meta/info.json` (and into the meta table),
-so readers can pick the storage backend from LeRobot metadata alone; everything
-else in `meta/` is copied verbatim:
+so readers can pick the storage backend from LeRobot metadata. Commit-pinned Hub
+video bases also carry a `lance_external_bases` hint in that file.
 
 ```
 <out>/
-  meta/             # byte-identical LeRobot v3.0 metadata
+  meta/             # LeRobot v3.0 metadata with the Lance storage stamp
   frames.lance      # one row per frame: tabular features (dots -> underscores)
   videos.lance      # one row per source mp4: bytes in a blob v2 column + byte index
   meta.lance        # one row per meta/ file (path, bytes): metadata transport for remote roots

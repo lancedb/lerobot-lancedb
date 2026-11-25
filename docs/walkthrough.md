@@ -1,84 +1,120 @@
-# Converting a LeRobot dataset to Lance - one dataset, end to end
+# Converting and training with a Hybrid dataset
 
-This follows one dataset through `lerobot-lance-convert`, showing what each step
-reads and writes. The source is a standard LeRobot v3.0 dataset - the same
-illustrative one the loader walkthrough uses: 100 episodes of 150 frames (15,000
-total), 30 fps, one camera (`observation.images.top`), a 14-dim
-`observation.state` and 14-dim `action`. The output is the three-table Lance
-layout that `LanceDBDataset` reads (the companion loader PR). Values below are
-illustrative; the CLI examples are exact.
+Hybrid keeps `frames.lance`, `videos.lance`, and metadata on the training machine.
+The video table contains descriptors and a byte index. The MP4s stay at the source.
+This gives the sampler random access to episodes while most table operations use local disk.
 
-The whole job is a format transform. Nothing is re-encoded, no pixels are
-touched: the mp4 bytes are copied verbatim, the tabular columns are copied with
-their names normalized, and the standard `meta/` directory is carried along so
-the result is still a self-describing LeRobot dataset. The two things that make
-it a *Lance* dataset rather than a tarball are the byte-index columns on the
-videos (so the loader can fetch one frame's bytes without the whole file) and the
-fact that all three tables are written as single commits (so a training worker
-opens a handful of files, not thousands).
-
-```
+```bash
 lerobot-lance-convert --repo-id lerobot/pusht --out ./pusht-lance
-#   or:  --root /path/to/local/dataset   (nothing downloaded)
 ```
 
-## Benchmarks
+```python
+from lerobot_lancedb import LanceDBDataset
 
-Why convert at all: the Lance layout is map-style random access over object
-storage, so training does a true global shuffle straight from S3, fetching only
-the byte ranges each batch needs. Upstream's only remote mode is an iterable
-streamer (windowed reservoir shuffle, one worker per shard, OOMs on large
-frames). Batch 32, 8 workers, steady-state samples/s.
+# Use the same feature names as the original LeRobot dataset.
+ds = LanceDBDataset(root="./pusht-lance", columns=["observation.image", "observation.state", "action"])
+print(ds[0].keys())
+state_only = LanceDBDataset(root="./pusht-lance", columns=["observation.state", "task"])
+```
 
-**Broad picture - lance local/S3 (global shuffle) vs upstream (iterable):**
+Each worker fetches the selected tabular columns and opens only the decoders it needs.
+A video selection also reads timestamps for alignment. A task label needs the task index.
+Request either internal column by name to include it in a sample. List every feature with
+`delta_timestamps` in `columns` to get its window and padding mask.
 
-| dataset | lance local | lance S3 | upstream local | upstream Hub stream |
-|---|---:|---:|---:|---:|
-| pusht | 4,160 | 2,508 | 2,142 | 430 |
-| aloha | 113 | 107 | 109 | 9.7 (1-worker cap) |
-| koch | 189 | 182 | 120 | 11.7 |
-| soarm | 79 | 74 | 69 | crashes |
-| berkeley | 108 | 92 | 61 | 6.1 |
-| droid (386 GB) | 227 | 136 | 132 | OOM |
+## Choosing a video base
 
-**Same HF-bucket backend, controlling for storage AND access** (2026-08-01). Lance
-is shown in both access modes, so columns 2-vs-3 are the true apples-to-apples
-against upstream's iterable streaming; column 1 is lance's training-correct global
-shuffle, which upstream structurally cannot match:
+- **Hugging Face Hub.** `--repo-id` resolves the source revision to a commit. The converter
+  records the pinned video base in `meta/info.json`. The companion reader enables resolve
+  caching for that base. Pass `token=...` for private videos. Set
+  `storage_options={"base_1.hf_enable_resolve_cache": "false"}` to disable this cache.
+  With LanceDB 0.42.0b26, set `HF_ENDPOINT` in the worker environment for a custom Hub endpoint.
+- **S3 or S3-compatible storage.** Use an `s3://` video base. For a custom HTTPS service
+  provide the endpoint separately, at conversion and when reading. For example, with
+  credentials available through the AWS SDK and `S3_ENDPOINT` set to your service URL:
 
-| dataset | lance bucket (global shuffle) | lance bucket (iterable) | upstream bucket (iterable) | upstream hub (iterable) |
-|---|---:|---:|---:|---:|
-| pusht | 775 | 991 | 436 | 437 |
-| aloha | 101 | 102 | OOM | OOM |
-| koch | 142 | 117 | 12 | 12 |
-| soarm | 63 | 57 | crash | crash |
-| berkeley | 64 | 56 | 5 | 6 |
+  ```bash
+  lerobot-lance-convert --root s3://my-bucket/pusht --out ./pusht-s3 \
+      --source-storage-option "aws_endpoint=$S3_ENDPOINT"
+  ```
 
-Columns 2-vs-3 are airtight: same bucket, same iterable+windowed-shuffle access,
-only the loader/format differ, and lance is 2.3x (pusht), 9.8x (koch), 11x
-(berkeley), and simply runs where upstream crashes (aloha/soarm). Column 1 is what
-upstream can never offer: global-shuffled training straight from object storage.
-`upstream bucket ≈ upstream hub` (436≈437, 12≈12) confirms the storage backend is
-irrelevant to a sequential streamer - the loader is the whole variable. (Lance
-from S3 is faster than from an HF bucket; the bucket gateway adds per-request
-latency that taxes lance's many small ranged reads. S3 is the deployment target;
-buckets are convenient but rate-limited, and their absolute numbers move with
-gateway load.)
+  ```python
+  import os
+  from lerobot_lancedb import LanceDBDataset
 
-**Why upstream OOMs/crashes.** `StreamingLeRobotDataset` holds a reservoir buffer
-of up to ~1000 decoded frames per worker to approximate shuffling; buffer memory
-scales with workers x buffer x frame-size, so on large or multi-camera frames
-(aloha, droid) it exhausts RAM. soarm's failure is a torchcodec frame-index bug
-that crashes the decode worker regardless of memory. Lance never hits either: it
-fetches only the exact byte ranges a batch needs and caps its per-worker decoder
-cache at 2 GiB by construction, so memory is flat and access-pattern-independent.
+  ds = LanceDBDataset(root="./pusht-s3", storage_options={"base_1.aws_endpoint": os.environ["S3_ENDPOINT"]})
+  print(ds[0]["action"])
+  ```
+
+  To index a local mirror, use `--root ./pusht --video-base-uri s3://my-bucket/pusht/videos`.
+  Use `hf://datasets/owner/repo@COMMIT/videos` for a Hub mirror. A raw HTTPS URL is not a Lance video base.
+- **Local disk.** `--root ./pusht --video-mode external` records the absolute, percent-encoded file
+  URI. For whole RGB files whose size matches the index, TorchCodec opens that path directly.
+  Depth files, older relative descriptors and managed blobs use the sparse blob reader. If native
+  open fails, the reader retries through Lance. Use `--video-mode copy` for a self-contained dataset.
+
+## Loader measurements
+
+On an AMD EPYC 4585PX (16 cores, Linux x86-64), Suite A gave Parquet, local
+external Lance and Hybrid the same global shuffle. Suite B captured upstream's
+streaming batches and replayed their episode/frame indices on Hybrid. Both remote
+modes used the same loopback service with 20 ms latency per request. Streaming
+read Parquet and video remotely. Hybrid read its Lance tables locally. Backing
+files were warm. Throughput excludes initialization and two warmup batches.
+
+PushT used the cached `lerobot/pusht` snapshot `7628202a2180972f291ba1bc6723834921e72c19`.
+The DROID-shaped fixture had three 320×180 cameras and a two-frame GOP. The 720p
+fixture had two cameras and a 30-frame GOP. Each measured row used one worker,
+ten batches of two samples, and three-frame camera/action windows. The runtime
+was Python 3.12.16, LeRobot 0.7.0, LanceDB 0.42.0b26 and TorchCodec 0.17.0.
+
+Steady-state samples per second on commit `8441827`:
+
+| Workload | A · local Parquet | A · local Lance | A · Hybrid | B · streaming | B · Hybrid replay |
+|---|---:|---:|---:|---:|---:|
+| PushT | 521.8 | 944.0 | 81.8 | 1,368.6 | 91.0 |
+| DROID-shaped, short GOP | 150.2 | 198.2 | 134.2 | 164.1 | 148.6 |
+| 720p, long GOP | 20.6 | 26.4 | 25.6 | 22.7 | 21.4 |
+
+On the matched P1 run (`0a172dd`), local Lance delivered 621.7, 177.5 and 24.8
+samples/s respectively. The P2/P1 ratios were 1.52×, 1.12× and 1.06×. These are
+short single-run comparisons. Startup, batch latency and bytes transferred are
+reported separately by the harness.
+
+From the repository root, with the PushT snapshot in the Hugging Face cache:
+
+```bash
+export PYTHONPATH="$PWD/src" OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 RAYON_NUM_THREADS=4
+python scripts/bench_loader.py --workloads pusht droid 720p --suites a b \
+    --steps 10 --num-workers 1 --rtt-ms 20 --verify-correctness \
+    --output /tmp/lerobot-lancedb-b0-p2.json
+# With the P1 report from 0a172dd, verify identical inputs, anchors and parameters:
+python scripts/bench_loader.py --compare /tmp/lerobot-lancedb-b0-p1-0a172dd.json \
+    /tmp/lerobot-lancedb-b0-p2.json --markdown /tmp/lerobot-lancedb-b0-p2.compare.md
+python scripts/bench_projection.py --repeats 6 --batches 64
+```
+
+The projection run timed warm, single-process local reads with batch size eight
+and one Torch thread. It alternated read order across six repetitions and checked
+every selected value against the full reader on the same 512 sampled indices.
+The wide fixture added an 8,192-element float32 vector to the three-camera input.
+Its projected reader requested one camera, state and action. PushT requested all
+features and the task label to measure the cost of specifying an equivalent projection.
+
+| Local workload | Full samples/s | Projected samples/s | Projected / full |
+|---|---:|---:|---:|
+| Three cameras and wide vector → one camera, state and action | 807.4 | 840.9 | 1.04× |
+| PushT, all output keys in both runs | 4,082.3 | 3,901.1 | 0.96× |
+
+These are median throughputs. Both paths returned exactly matching selected tensors.
+The small throughput differences are specific to this warm, local CPU workload.
 
 ## What goes in, what comes out
 
 ```
 INPUT  (LeRobot v3.0, on disk or Hub)        OUTPUT  (./pusht-lance/)
 ────────────────────────────────────         ─────────────────────────────
-meta/                                         meta/            # verbatim copy
+meta/                                         meta/            # stamped LeRobot metadata
   info.json  stats.json  tasks.parquet        meta.lance       # meta/ files as (path, bytes)
   episodes/chunk-000/file-000.parquet         frames.lance     # 1 row / frame, tabular only
 data/                                         videos.lance     # 1 row / mp4, bytes + byte index
@@ -198,14 +234,13 @@ schema = pa.schema([
     ("video_key", pa.string()), ("chunk_index", pa.int64()), ("file_index", pa.int64()),
     ("file_size", pa.int64()), ("moov_offset", pa.int64()), ("moov_size", pa.int64()),
     ("kf_indices", pa.list_(pa.int64())), ("kf_positions", pa.list_(pa.int64())),
-    lancedb.blob(VIDEO_BLOB_COLUMN),   # video_bytes, a managed blob-v2 column
+    lancedb.blob(VIDEO_BLOB_COLUMN),   # video_bytes, a blob-v2 column
 ])
 ```
 
-**The bytes.** `video_bytes` is the mp4 read verbatim into a Lance **blob v2**
-column. Blob v2 is what makes the loader's fast path possible: the bytes live in
-their own object, addressable by byte range, so the loader can `fetch_blob_ranges`
-exactly the bytes one batch's frames need instead of pulling the whole file.
+**The bytes.** External mode writes the original clip's URI, position and size.
+Managed mode copies the MP4 bytes into a Lance blob. Both modes share a byte index
+so the reader can fetch the spans covering a batch's frame windows.
 
 **The byte index** is the other half of that. For each file, `build_video_byte_index`
 walks the container once (with pyav) and records, per keyframe, the frame index and
@@ -284,18 +319,9 @@ managed blob - terabytes - so it's the wrong tool there.)
 
 ## The schema contract
 
-The converter writes exactly what the loader reads: same table names, same column
-names, same byte-index layout, same `to_lance_column` mapping. Today the loader
-isn't on PyPI yet, so the converter can't `from lerobot.datasets.lancedb_dataset
-import ...` without breaking every user on released lerobot. So a small set of
-definitions (`FRAMES_TABLE`, `to_lance_column`, `build_video_byte_index`, ...) is
-vendored into `vendored_schema.py`, to be deleted once the loader PR merges.
-
-A vendored copy invites drift, so a test asserts the vendored constants and the
-byte-index builders match the loader in logic (AST comparison with docstrings
-stripped, so cosmetic edits don't false-positive; it skips when the loader isn't
-importable). It has already earned its keep once, catching an `import` that moved
-in the loader but not the copy.
+The converter imports the table names and byte-index contract from the companion
+reader. LeRobot 0.7.0 selects its native reader from the `storage_format` stamp
+and ignores the optional `lance_external_bases` extension.
 
 ## The doctor - audit before (or after) you convert
 
@@ -334,11 +360,11 @@ meta.lance     1 row / meta file     (path, bytes) - transport for the standard 
 ## Reference: the CLI
 
 ```
-lerobot-lance-convert --repo-id lerobot/pusht --out ./pusht-lance   # download + convert
+lerobot-lance-convert --repo-id lerobot/pusht --out ./pusht-lance   # local tables, remote MP4s
 lerobot-lance-convert --root ./my-dataset      --out ./my-lance     # local, nothing downloaded
 lerobot-lance-doctor  --root ./my-dataset                           # audit; exit = # failures
 
-# then train straight off it (loader PR), local or object storage:
+# point the training loader at the converted root:
 lerobot-train --dataset.root ./pusht-lance ...
 lerobot-train --dataset.root s3://bucket/pusht-lance ...
 ```
