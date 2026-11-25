@@ -279,13 +279,19 @@ def _connect(db_uri: str, storage_options: dict | None, revision: str | None = N
     return lancedb.connect(db_uri, **({"storage_options": options} if options else {}))
 
 
-def _materialize_meta(db, local_root: Path) -> None:
+def _open_table(db, name: str, storage_options: dict | None = None):
+    if storage_options:
+        return db.open_table(name, storage_options=storage_options)
+    return db.open_table(name)
+
+
+def _materialize_meta(db, local_root: Path, storage_options: dict | None = None) -> None:
     """Write ``meta/`` from the meta table to a local cache, once."""
     meta_dir = local_root / "meta"
     if meta_dir.exists():
         return
     try:
-        table = db.open_table(META_TABLE)
+        table = _open_table(db, META_TABLE, storage_options)
     except Exception as error:
         raise FileNotFoundError(
             f"Dataset has no '{META_TABLE}' table. Re-convert it with a converter that "
@@ -391,7 +397,8 @@ def resolve_lance_root(
         db_uri = str(root).rstrip("/")
         local_root = HF_LEROBOT_HOME / "remote" / re.sub(r"[^A-Za-z0-9._-]+", "_", db_uri)
         if not (local_root / "meta").exists():
-            _materialize_meta(_connect(db_uri, storage_options), local_root)
+            options = _storage_options(db_uri, storage_options, None)
+            _materialize_meta(_connect(db_uri, storage_options), local_root, options or None)
         return db_uri, local_root
     root_path = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
     if (root_path / f"{FRAMES_TABLE}.lance").exists():
@@ -576,8 +583,9 @@ class LanceDBDataset(torch.utils.data.Dataset):
         if self.meta.video_keys:
             self._prefetch_pool = ThreadPoolExecutor(max_workers=1)
             self._decode_pool = ThreadPoolExecutor(max_workers=16)
+        options = _storage_options(self._db_uri, self._storage_options, self._hub_revision)
         db = _connect(self._db_uri, self._storage_options, revision=self._hub_revision)
-        table = db.open_table(FRAMES_TABLE)
+        table = _open_table(db, FRAMES_TABLE, options or None)
         n_rows = table.count_rows()
         if n_rows != self.meta.total_frames:
             raise ValueError(
@@ -588,7 +596,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
             Permutation.identity(table).select_columns(self._fetch_columns).with_format("arrow")
         )
         if self.meta.video_keys:
-            self._videos_table = db.open_table(VIDEOS_TABLE)
+            self._videos_table = _open_table(db, VIDEOS_TABLE, options or None)
             # TODO: for million-file datasets, resolve row ids lazily per batch.
             index = (
                 self._videos_table.search()

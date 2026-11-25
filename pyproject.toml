@@ -34,9 +34,10 @@ dependencies = [
     # numpy, huggingface_hub), so they're pinned there, not here, to avoid
     # version conflicts.
     "lerobot[dataset]>=0.6.0",
-    # fetch_blob_ranges + blob v2 columns; betas are published on fury, not
-    # PyPI — see the README install note.
-    "lancedb>=0.37.1b0",
+    # External Blob v2 initial_bases + commit-pinned hf:// + 429 Retry-After +
+    # fetch_blob_ranges; betas are published on fury, not PyPI — see the README
+    # install note.
+    "lancedb>=0.42.0b26",
     "pyarrow>=17.0.0",
     # pyav: byte-index construction (converter) and container inspection
     # (doctor). Declared directly because both import it themselves.
@@ -44,7 +45,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+s3 = [
+    "boto3>=1.28.0",
+]
+gcs = [
+    "gcsfs>=2024.2.0",
+]
+cloud = [
+    "boto3>=1.28.0",
+    "gcsfs>=2024.2.0",
+]
 dev = [
+    "boto3>=1.28.0",
+    "pytest>=8.0",
     "ruff>=0.14.1",
     "build>=1.2",
     "twine>=5.1",
@@ -77,3 +90,4 @@ ignore = ["E501"]
 # at call time on purpose, so CLI --help stays fast.
 "src/lerobot_lancedb/convert.py" = ["PLC0415"]
 "src/lerobot_lancedb/doctor.py" = ["PLC0415"]
+"src/lerobot_lancedb/_source.py" = ["PLC0415"]
