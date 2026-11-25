@@ -633,12 +633,20 @@ def _write_frames_table(db, data_files: list[Path], *, mode: str):
 
 
 def _create_scalar_indexes(frames_table, videos_table=None) -> None:
-    # Scalar indexes: not used by the training loader (it reads by _rowid),
-    # but they make user-side SQL fast (episode/task filtering, exploration).
-    frames_table.create_scalar_index("episode_index")
-    frames_table.create_scalar_index("task_index", index_type="BITMAP")
+    from inspect import signature
+
+    def create(table, column, kind):
+        if "config" in signature(table.create_index).parameters:
+            from lancedb.index import Bitmap, BTree
+
+            table.create_index(column, config=BTree() if kind == "BTREE" else Bitmap())
+        else:
+            table.create_scalar_index(column, index_type=kind)
+
+    create(frames_table, "episode_index", "BTREE")
+    create(frames_table, "task_index", "BITMAP")
     if videos_table is not None:
-        videos_table.create_scalar_index("video_key", index_type="BITMAP")
+        create(videos_table, "video_key", "BITMAP")
 
 
 def _print_done(out_target: Path | str, extra: str = "") -> None:
@@ -686,6 +694,7 @@ def _convert_copy(
     storage_options: dict[str, str] | None,
     source_storage_options: dict[str, str] | None = None,
     write_sample_index: bool = True,
+    scalar_indexes: bool = True,
 ) -> None:
     if is_remote_uri(out_target):
         _ensure_remote_output_empty(_connect_output(out_target, storage_options), out_target)
@@ -816,7 +825,8 @@ def _convert_copy(
             videos_table = db.create_table(VIDEOS_TABLE, schema=schema, mode="create")
         print(f"  {videos_table.count_rows()} rows")
         _write_meta_table(db, meta_dir, mode="create")
-        _create_scalar_indexes(frames_table, videos_table if video_files else None)
+        if scalar_indexes:
+            _create_scalar_indexes(frames_table, videos_table if video_files else None)
 
     if is_remote_uri(out_target):
         with tempfile.TemporaryDirectory(prefix="lerobot-lance-convert-") as tmp:
@@ -911,6 +921,7 @@ def _convert_external(
     video_workers: int,
     header_probe_bytes: int,
     write_sample_index: bool = True,
+    scalar_indexes: bool = True,
 ) -> None:
     normalized_explicit_base = normalize_base_uri(video_base_uri) if video_base_uri is not None else None
     if is_remote_uri(out_target):
@@ -1130,7 +1141,8 @@ def _convert_external(
                 print("  0 rows")
 
             _write_meta_table(db, meta_dir, mode="create")
-            _create_scalar_indexes(frames_table, videos_table if video_refs else None)
+            if scalar_indexes:
+                _create_scalar_indexes(frames_table, videos_table if video_refs else None)
 
         if is_remote_uri(out_target):
             if video_refs:
@@ -1171,6 +1183,7 @@ def convert(
     video_workers: int = DEFAULT_IO_WORKERS,
     header_probe_bytes: int = DEFAULT_HEADER_PROBE_BYTES,
     write_sample_index: bool = True,
+    scalar_indexes: bool = True,
 ) -> None:
     """Convert one LeRobot v3.0 dataset to the three-table Lance layout.
 
@@ -1229,6 +1242,7 @@ def convert(
             revision=revision,
             storage_options=storage_options,
             source_storage_options=source_storage_options,
+            scalar_indexes=scalar_indexes,
             write_sample_index=write_sample_index,
             video_workers=video_workers,
             header_probe_bytes=header_probe_bytes,
@@ -1242,6 +1256,7 @@ def convert(
             revision=revision,
             storage_options=storage_options,
             source_storage_options=source_storage_options,
+            scalar_indexes=scalar_indexes,
             write_sample_index=write_sample_index,
         )
 
@@ -1328,6 +1343,7 @@ def main() -> None:
         ),
     )
     parser.add_argument("--no-sample-index", action="store_true", help="Leave the optional RGB sample index null")
+    parser.add_argument("--no-scalar-indexes", action="store_true", help="Skip scalar index construction")
     args = parser.parse_args()
     if args.repo_id is None and args.root is None:
         parser.error("pass --repo-id and/or --root")
@@ -1347,6 +1363,7 @@ def main() -> None:
             storage_options=storage_options,
             source_storage_options=source_storage_options,
             video_workers=args.video_workers,
+            scalar_indexes=not args.no_scalar_indexes,
             write_sample_index=not args.no_sample_index,
         )
     except DamagedSourceError as err:

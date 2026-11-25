@@ -910,6 +910,8 @@ class LanceDBDataset(torch.utils.data.Dataset):
         self._index_cache = _VideoDecoderLRU(128, byte_budget=64 << 20)
         self._mini_ineligible = set()
         self._file_meta: OrderedDict[tuple, dict] = OrderedDict()
+        self._lookahead_buffer = None
+        self._lookahead_hints = ()
         self._prefetch_pool: ThreadPoolExecutor | None = None
         self._decode_pool: ThreadPoolExecutor | None = None
         if video_decoder_cache_size is None:
@@ -948,6 +950,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 self._videos_table.search()
                 .select(["video_key", "chunk_index", "file_index"])
                 .with_row_id(True)
+                .limit(None)
                 .to_arrow()
             )
             self._video_row_ids = {
@@ -969,6 +972,8 @@ class LanceDBDataset(torch.utils.data.Dataset):
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
+        state["_lookahead_buffer"] = None
+        state["_lookahead_hints"] = ()
         state["_frames_perm"] = None
         state["_videos_table"] = None
         state["_video_row_ids"] = None
@@ -1007,6 +1012,22 @@ class LanceDBDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return self.num_frames
 
+    def select_anchors(self, *, where=None, episodes=None, tasks=None, cameras=None):
+        """Select center frames by predicate; delta windows retain their full episode bounds."""
+        from .anchors import select_anchors  # noqa: PLC0415
+
+        return select_anchors(self, where=where, episodes=episodes, tasks=tasks, cameras=cameras)
+
+    def lookahead_loader(self, **kwargs):
+        from .lookahead import lookahead_loader  # noqa: PLC0415
+
+        return lookahead_loader(self, **kwargs)
+
+    def episode_pool(self, **kwargs):
+        from .episode_pool import LanceDBEpisodePoolDataset  # noqa: PLC0415
+
+        return LanceDBEpisodePoolDataset(reader=self, **kwargs)
+
     def __getitem__(self, idx: int) -> dict:
         return self.__getitems__([idx])[0]
 
@@ -1034,11 +1055,13 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 item.update(frames)
         if self.image_transforms is not None:
             for item in items:
-                for cam_key in self._camera_keys:
-                    if cam_key in self._depth_keys:
-                        continue
-                    item[cam_key] = self.image_transforms(item[cam_key])
+                self._transform_item(item)
         return items
+
+    def _transform_item(self, item):
+        for key in self._camera_keys:
+            if key not in self._depth_keys:
+                item[key] = self.image_transforms(item[key])
 
     def _plan_file_windows(self, plans: list[dict]) -> dict[tuple, list[tuple[int, int]]]:
         """Map each batch sample's video windows to (file key -> frame spans).
@@ -1136,6 +1159,9 @@ class LanceDBDataset(torch.utils.data.Dataset):
     ) -> list[dict[str, torch.Tensor]]:
         """Decode all camera frames a batch needs, one blob fetch + one decode pass per file."""
         requests = self._build_video_requests(plans, columns["timestamp"], row_pos)
+        return self._decode_requests(requests, prepared, len(plans))
+
+    def _decode_requests(self, requests, prepared, count):
         mini = {k: v for k, v in prepared.items() if isinstance(v, _MiniFile)}
         legacy = {k: v for k, v in prepared.items() if k not in mini}
         mini_indices = {}
@@ -1149,7 +1175,9 @@ class LanceDBDataset(torch.utils.data.Dataset):
             mini, {k: {i for row in rows for i in row} for k, rows in mini_indices.items()}
         )
         entries = self._ensure_decoders({k: requests[k] for k in legacy}, legacy)
-        results: list[dict[str, torch.Tensor]] = [{} for _ in plans]
+        if self._lookahead_hints:
+            self._schedule_lookahead(prepared)
+        results: list[dict[str, torch.Tensor]] = [{} for _ in range(count)]
 
         def decode_file(file_key, file_requests):
             if file_key in mini:
@@ -1401,6 +1429,35 @@ class LanceDBDataset(torch.utils.data.Dataset):
         prepared.update(self._decode_pool.map(open_decoder, new_files))
         return prepared | mini
 
+    def _schedule_lookahead(self, prepared):
+        indices = [i for batch in self._lookahead_hints for i in batch]
+        windows = self._plan_file_windows(self._plan_batch(indices))
+        self._load_file_meta([k for k in windows if k not in self._file_meta])
+        candidates = [k for k in windows if self._file_meta[k]["local_path"] is None]
+        mini = {k: v for k, v in prepared.items() if isinstance(v, _MiniFile)}
+        if self._has_sample_index:
+            mini.update(self._load_mini_files([k for k in candidates if k not in prepared
+                                               and k not in self._mini_ineligible and k[0] not in self._depth_keys]))
+        ranges = []
+        for key in candidates:
+            if key in mini:
+                entry = mini[key]
+                ordinals = (i for first, last in windows[key] for i in range(first, last + 1))
+                try:
+                    spans = entry.index.spans(ordinals, require_closed=not entry.persistent)
+                except ValueError:
+                    continue
+                byte_ranges = self._mini_byte_ranges(entry, spans)
+                source = entry.source
+            else:
+                meta = self._file_meta[key]
+                byte_ranges = [self._window_byte_range(key[0], meta, a, b) for a, b in windows[key]]
+                source = prepared[key][1] if key in prepared else None
+            gaps = [(a, b) for start, end in byte_ranges for a, b in
+                    (source.missing(start, end) if source is not None else [(start, end)])]
+            ranges.extend((self._video_row_ids[key], a, b) for a, b in _merge_spans(gaps, 64 << 10))
+        self._lookahead_buffer.submit(self._videos_table, ranges)
+
     def _load_mini_files(self, keys):
         missing = [key for key in keys if key not in self._index_cache]
         indices = {key: self._index_cache.get(key) for key in keys if key in self._index_cache}
@@ -1432,6 +1489,22 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 files[key] = _MiniFile(idx, _SparseBlobSource(self._file_meta[key]["file_size"], None))
         return files
 
+    @staticmethod
+    def _mini_byte_ranges(entry, spans):
+        index = entry.index
+        if entry.persistent and entry.decoder is None:
+            spans = [(0, 0), *spans]
+        ranges = [index.prefetch_range(a, b, read_ahead=entry.persistent) for a, b in spans]
+        media_start = int(index.offsets[0])
+        if entry.persistent and index.payload_end - media_start <= 2 << 20:
+            return [(media_start, index.payload_end)]
+        if index.sizes[0] >= _PROMOTE_KEYFRAME_BYTES:
+            first = min(start for start, _ in ranges)
+            if (index.payload_end - first <= 2 * _OPEN_PROBE_BYTES
+                    and index.payload_end - max(end for _, end in ranges) <= _OPEN_PROBE_BYTES):
+                return [(first, index.payload_end)]
+        return ranges
+
     def _prefetch_mini(self, files, indices):
         plans = {}
         requests = []
@@ -1443,28 +1516,9 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 self._mini_ineligible.add(key)
                 continue
             plans[key] = spans
-            fetch_spans = spans
-            if entry.persistent and entry.decoder is None:
-                fetch_spans = [(0, 0), *spans]
-            index = entry.index
-            ranges = [
-                index.prefetch_range(first, last, read_ahead=entry.persistent) for first, last in fetch_spans
-            ]
-            # Repeated FFmpeg reads of short clips otherwise fragment the few
-            # remaining bytes into many AVIO-sized GETs. On promotion, materialize
-            # at most 2 MiB of media, never the original file header or tail moov.
-            media_start = int(index.offsets[0])
-            if entry.persistent and index.payload_end - media_start <= 2 << 20:
-                ranges = [(media_start, index.payload_end)]
-            elif index.sizes[0] >= _PROMOTE_KEYFRAME_BYTES:
-                # For a heavy sync sample, absorb a small remaining suffix in the
-                # same GET. The cold read still begins at the requested sync sample.
-                first = min(start for start, _ in ranges)
-                if (
-                    index.payload_end - first <= 2 * _OPEN_PROBE_BYTES
-                    and index.payload_end - max(end for _, end in ranges) <= _OPEN_PROBE_BYTES
-                ):
-                    ranges = [(first, index.payload_end)]
+            ranges = self._mini_byte_ranges(entry, spans)
+            if self._lookahead_buffer is not None:
+                self._lookahead_buffer.consume(self._video_row_ids[key], entry.source, ranges)
             missing = [gap for start, end in ranges for gap in entry.source.missing(start, end)]
             for start, end in _merge_spans(missing, 64 << 10):
                 requests.append((self._video_row_ids[key], start, end - start))
@@ -1611,6 +1665,10 @@ class LanceDBDataset(torch.utils.data.Dataset):
         range_requests: list[tuple[int, int, int]] = []
         range_targets: list[tuple[tuple, int]] = []
         for key, spans in spans_by_key.items():
+            if self._lookahead_buffer is not None:
+                source = sources[key]
+                self._lookahead_buffer.consume(self._video_row_ids[key], source, spans)
+                spans = [gap for start, end in spans for gap in source.missing(start, end)]
             for start, end in _merge_spans(
                 spans, _range_slack(self._file_meta[key], key[0] in self._depth_keys)
             ):
