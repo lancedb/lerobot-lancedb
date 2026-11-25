@@ -312,7 +312,7 @@ def run_row(args, source, work, repo_id, suite, mode, captured=None):
             **peak,
             measured_samples=count,
             delta_timestamps=delta,
-            anchor_batches=observed,
+            anchor_batches=[[list(anchor) for anchor in batch] for batch in observed],
         )
         return row, replay
 
