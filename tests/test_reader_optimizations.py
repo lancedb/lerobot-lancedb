@@ -658,6 +658,12 @@ def test_projection_skips_unused_cameras_and_tabular_columns(tmp_path, monkeypat
         assert set(item) == {cam, "action", cam + "_is_pad", "action_is_pad"}
         assert all(torch.equal(item[k], full[k]) for k in item)
 
+    selected = reader.LanceDBDataset(root=output, delta_timestamps=delta).select_anchors(
+        episodes=[0], tasks=["reach"], where="frame_index IN (0, 2)", cameras=[cam]
+    )
+    for item, full in zip(selected.__getitems__([1, 0, 1]), ref, strict=True):
+        assert torch.equal(item[cam], full[cam])
+        assert set(item).intersection(selected.dataset.meta.video_keys) == {cam}
     (output / "videos.lance").rename(output / "hidden-videos")
     for columns in (["action"], ["task", "action"], ["task"]):
         ds = reader.LanceDBDataset(root=output, columns=columns)

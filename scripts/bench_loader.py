@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from importlib.metadata import version
 from pathlib import Path
 
@@ -123,10 +123,15 @@ def global_batches(meta, args):
     return [indices[i : i + args.batch_size] for i in range(0, len(indices), args.batch_size)]
 
 
-def make_loader(dataset, args, batches=None):
+def worker_options(args):
     options = {"num_workers": args.num_workers, "generator": torch.Generator().manual_seed(args.seed)}
     if args.num_workers:
         options.update(prefetch_factor=args.prefetch_factor, multiprocessing_context="spawn")
+    return options
+
+
+def make_loader(dataset, args, batches=None):
+    options = worker_options(args)
     if batches is None:
         return DataLoader(dataset, batch_size=args.batch_size, **options)
     return DataLoader(dataset, batch_sampler=batches, **options)
@@ -224,7 +229,10 @@ def run_row(args, source, work, repo_id, suite, mode, captured=None):
             k: [-1 / meta.fps, 0.0, 1 / meta.fps] for k in [*meta.video_keys, "action"] if k in meta.features
         }
     common = dict(repo_id=repo_id, delta_timestamps=delta or None, return_uint8=True)
-    with range_server(source, args.rtt_ms) as (endpoint, traffic):
+    pool_mode = mode == "episode_pool"
+    lookahead = mode.startswith("hybrid_lookahead_")
+    iterable = mode == "streaming" or pool_mode
+    with range_server(source, args.rtt_ms) as (endpoint, traffic), ExitStack() as resources:
 
         def parquet():
             return LeRobotDataset(root=source, video_backend="torchcodec", **common)
@@ -243,26 +251,46 @@ def run_row(args, source, work, repo_id, suite, mode, captured=None):
                     episode_pool_size=args.episode_pool_size,
                     **common,
                 )
+            if pool_mode:
+                return lerobot_lancedb.LanceDBEpisodePoolDataset(
+                    root=work / "hybrid",
+                    storage_options=s3_options(endpoint),
+                    use_mini_mp4=not args.no_mini_mp4,
+                    seed=args.seed,
+                    episode_pool_size=args.episode_pool_size,
+                    batch_size=args.batch_size,
+                    **overrides,
+                    **common,
+                )
             return LanceDBDataset(
-                root=work / mode,
-                storage_options=s3_options(endpoint) if mode == "hybrid" else None,
+                root=work / ("hybrid" if lookahead else mode),
+                storage_options=s3_options(endpoint) if mode == "hybrid" or lookahead else None,
                 use_mini_mp4=not args.no_mini_mp4,
                 **common,
             )
 
         dataset = open_dataset()
         batches = global_batches(meta, args) if suite == "A" else None
-        if captured is not None:
+        if captured is not None and not pool_mode:
             batches = indices_for(captured, meta)
         steps = args.warmup_steps + args.steps
         if batches is not None and len(batches) < steps:
             raise ValueError(f"Requested {steps} batches; only {len(batches)} available")
-        loader = make_loader(dataset, args, batches)
+
+        def make_lookahead(reader, sampler):
+            depth = int(mode.removeprefix("hybrid_lookahead_"))
+            return resources.enter_context(
+                reader.lookahead_loader(
+                    batch_sampler=sampler, lookahead_batches=depth, **worker_options(args)
+                )
+            )
+
+        loader = None if lookahead else make_loader(dataset, args, batches)
         waits, observed = [], []
         before = traffic.snapshot()
         with memory_peak() as peak:
             start = time.perf_counter()
-            iterator = iter(loader)
+            iterator = make_lookahead(dataset, batches) if lookahead else iter(loader)
             for step in range(steps):
                 ready = time.perf_counter()
                 batch = next(iterator)
@@ -277,29 +305,41 @@ def run_row(args, source, work, repo_id, suite, mode, captured=None):
             after = traffic.snapshot()
         count = sum(map(len, observed[args.warmup_steps :]))
         io = {k: {m: v - before[k][m] for m, v in stats.items()} for k, stats in after.items()}
+        if pool_mode and observed != captured[:steps]:
+            raise AssertionError("Episode pool and streaming delivered different anchors")
         if batches is not None and indices_for(observed, meta) != batches[:steps]:
             raise AssertionError(f"{suite} {mode}: delivered batches differ from sampler")
         # Give replay workers the same number of prefetch slots beyond the timed window.
         replay = list(observed)
         if mode == "streaming":
             replay.extend(anchors(next(iterator)) for _ in range(args.num_workers * args.prefetch_factor))
+        resources.close()
         del iterator, loader, batch
         if args.verify_correctness:
             reference = parquet()
-            boundary_dataset = open_dataset(episodes=[0], repeat=False) if mode == "streaming" else dataset
-            verify_boundary(boundary_dataset, reference, delta, args, streaming=mode == "streaming")
+            if mode == "streaming":
+                boundary_dataset = open_dataset(episodes=[0], repeat=False)
+            elif pool_mode:
+                boundary_dataset = open_dataset(episodes=[0])
+            else:
+                boundary_dataset = dataset
+            verify_boundary(boundary_dataset, reference, delta, args, streaming=iterable)
             # Restore at a consumed batch boundary and compare the remaining anchors AND
             # feature values against random access to the source on a fresh iterator.
             skip = min(1, steps - 1)
             restored = open_dataset()
-            if mode == "streaming":
+            if iterable:
                 restored.load_state_dict(
                     {"epoch": 0, "offset": skip * args.batch_size, "batch_size": args.batch_size}
                 )
                 resume_batches = None
             else:
                 resume_batches = batches[skip:steps]
-            it = iter(make_loader(restored, args, resume_batches))
+            it = (
+                make_lookahead(restored, resume_batches)
+                if lookahead
+                else iter(make_loader(restored, args, resume_batches))
+            )
             for offsets in indices_for(observed[skip:], meta):
                 ref = torch.utils.data.default_collate([reference[i] for i in offsets])
                 assert_batch(next(it), ref, meta.video_keys)
@@ -429,6 +469,8 @@ def main(argv=None):
     )
     parser.add_argument("--rtt-ms", type=float, default=20.0)
     parser.add_argument("--no-mini-mp4", action="store_true", help="Use the sparse RGB decoder for indexed blobs")
+    parser.add_argument("--lookahead-batches", type=int, help="Add a matched Suite A hybrid lookahead row")
+    parser.add_argument("--episode-pool", action="store_true", help="Add a matched Suite B Lance episode pool row")
     parser.add_argument("--verify-correctness", action="store_true")
     parser.add_argument("--output-json", "--output", type=Path)
     parser.add_argument(
@@ -475,6 +517,8 @@ def main(argv=None):
             "repo_id",
             "verify_correctness",
             "no_mini_mp4",
+            "lookahead_batches",
+            "episode_pool",
             "workloads",
             "suites",
         }
@@ -507,7 +551,12 @@ def main(argv=None):
             source, repo_id, digest = prepare(args, workload, work)
             for suite in args.suites:
                 captured = None
-                for mode in ("parquet", "local", "hybrid") if suite == "A" else ("streaming", "hybrid"):
+                modes = ["parquet", "local", "hybrid"] if suite == "A" else ["streaming", "hybrid"]
+                if suite == "A" and args.lookahead_batches is not None:
+                    modes.extend(f"hybrid_lookahead_{k}" for k in dict.fromkeys((0, args.lookahead_batches)))
+                if suite == "B" and args.episode_pool:
+                    modes.append("episode_pool")
+                for mode in modes:
                     with ProcessPoolExecutor(1, mp_context=multiprocessing.get_context("spawn")) as pool:
                         row, replay = pool.submit(
                             run_row, args, source, work, repo_id, suite, mode, captured

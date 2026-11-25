@@ -29,6 +29,7 @@ deleted. Import it the same way either way::
 
 from __future__ import annotations
 
+from .episode_pool import LanceDBEpisodePoolDataset
 from .reader import (
     FRAMES_TABLE,
     META_TABLE,
@@ -46,6 +47,7 @@ __version__ = "0.3.0"
 
 __all__ = [
     "LanceDBDataset",
+    "LanceDBEpisodePoolDataset",
     "is_lance_dataset",
     "lance_mp_context",
     "FRAMES_TABLE",
