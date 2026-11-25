@@ -66,6 +66,20 @@ def test_shards_and_window_parity(roots, monkeypatch):
         next(reader.episode_pool().loader(num_workers=2))
 
 
+def random_brightness(image):
+    return image + torch.rand(())
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_resume_preserves_augmented_pixels(roots, workers):
+    ds = LanceDBDataset(root=roots[0], columns=[VIDEO_KEY], image_transforms=random_brightness)
+    pool = ds.episode_pool(where="frame_index IN (0, 4, 9)", batch_size=2)
+    batches = list(pool.loader(num_workers=workers))
+    pool.load_state_dict({"epoch": 0, "offset": 2, "batch_size": 2})
+    for actual, expected in zip(pool.loader(num_workers=workers), batches[1:], strict=True):
+        assert_equal(actual, expected)
+
+
 class _TrackingReader(LanceDBDataset):
     def _fetch_rows(self, rows):
         with self.log.open("a") as stream:

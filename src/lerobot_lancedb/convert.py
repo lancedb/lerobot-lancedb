@@ -1219,6 +1219,8 @@ def convert(
         Optional separate storage options for reading the remote source.
     video_workers:
         Concurrent range-read workers for external MP4 probing.
+    scalar_indexes:
+        Build scalar indexes for episode, task and video-key filters (default True).
     write_sample_index:
         Write compact sample tables for indexed RGB reads. False leaves the column null.
     header_probe_bytes:

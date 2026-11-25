@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import random
 from collections import Counter, defaultdict, deque
 from copy import copy
 from itertools import islice
@@ -128,7 +129,23 @@ def _fill_videos(reader, prepared, requests, cache, item):
             cache.consume((file, i), frame)
 
 
-def _emit_window(reader, indices, max_frames, max_bytes):
+def _transform_anchor(reader, item, seed, epoch, anchor):
+    # A checkpoint contains only a planner offset. Seed standard transform RNGs per
+    # anchor so restoring a worker never has to decode or augment skipped samples.
+    seed64, seed32 = np.random.SeedSequence([seed, epoch, anchor]).generate_state(2, dtype=np.uint64)
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    try:
+        with torch.random.fork_rng(devices=[]):
+            torch.default_generator.manual_seed(int(seed64))
+            random.seed(int(seed64))
+            np.random.seed(int(seed32) % (1 << 32))
+            reader._transform_item(item)
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+
+
+def _emit_window(reader, indices, max_frames, max_bytes, seed, epoch):
     plans = reader._plan_batch(indices)
     rows, positions = reader._batch_rows(plans)
     windows = reader._plan_file_windows(plans)
@@ -149,7 +166,7 @@ def _emit_window(reader, indices, max_frames, max_bytes):
             item = reader._build_item(plan, columns, positions)
             _fill_videos(reader, prepared, requests, cache, item)
             if reader.image_transforms is not None:
-                reader._transform_item(item)
+                _transform_anchor(reader, item, seed, epoch, plan["abs_idx"])
             yield item
     finally:
         cache.clear()
@@ -237,6 +254,8 @@ class LanceDBEpisodePoolDataset(IterableDataset):
 
     def loader(self, *, num_workers=0, **options):
         """Track batches delivered to the parent for exact multi-worker state_dict()."""
+        if options.get("drop_last") or not options.get("in_order", True):
+            raise ValueError("Checkpointed iteration requires in-order batches including the final short batch")
         if num_workers:
             options.setdefault("multiprocessing_context", lance_mp_context())
         loader = DataLoader(self, batch_size=self.batch_size, num_workers=num_workers, **options)
@@ -294,7 +313,7 @@ class LanceDBEpisodePoolDataset(IterableDataset):
         try:
             while chunk := list(islice(stream, self.prefetch_anchors)):
                 reader._ensure_open()
-                for item in _emit_window(reader, chunk, self.max_frames, self.max_bytes):
+                for item in _emit_window(reader, chunk, self.max_frames, self.max_bytes, self.seed, self.epoch):
                     self.offset += 1
                     yield item
         finally:
