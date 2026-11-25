@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from importlib.metadata import version
 from pathlib import Path
 
@@ -399,8 +399,18 @@ def compare(base, candidate):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workloads", "--workload", nargs="+", choices=WORKLOADS, default=list(WORKLOADS))
-    parser.add_argument("--suites", "--suite", nargs="+", choices=["A", "B"], default=["A", "B"])
+    aliases = {"droid": "droid-short-gop", "720p": "long-gop-720p"}
+    parser.add_argument(
+        "--workloads",
+        "--workload",
+        nargs="+",
+        type=lambda w: aliases.get(w, w),
+        choices=WORKLOADS,
+        default=list(WORKLOADS),
+    )
+    parser.add_argument(
+        "--suites", "--suite", nargs="+", type=str.upper, choices=["A", "B"], default=["A", "B"]
+    )
     parser.add_argument("--dataset-path", type=Path)
     parser.add_argument("--repo-id", help="Optional cached Hub dataset or identity of --dataset-path")
     parser.add_argument("--seed", type=int, default=42)
@@ -416,12 +426,31 @@ def main(argv=None):
     )
     parser.add_argument("--rtt-ms", type=float, default=20.0)
     parser.add_argument("--verify-correctness", action="store_true")
-    parser.add_argument("--output-json", type=Path)
-    parser.add_argument("--compare", nargs=2, type=Path, metavar=("BASE", "CANDIDATE"))
+    parser.add_argument("--output-json", "--output", type=Path)
+    parser.add_argument(
+        "--compare",
+        nargs="+",
+        type=Path,
+        metavar="REPORT",
+        help="Baseline for this run, or two existing reports",
+    )
+    parser.add_argument("--markdown", type=Path, help="Write the comparison table to this file")
     args = parser.parse_args(argv)
-    if args.compare:
-        compare(*(json.loads(p.read_text()) for p in args.compare))
+
+    def comparison(base, candidate):
+        if args.markdown:
+            with args.markdown.open("w") as stream, redirect_stdout(stream):
+                compare(base, candidate)
+        else:
+            compare(base, candidate)
+
+    if args.markdown and not args.compare:
+        parser.error("--markdown requires --compare")
+    if args.compare and len(args.compare) == 2:
+        comparison(*(json.loads(p.read_text()) for p in args.compare))
         return
+    if args.compare and len(args.compare) != 1:
+        parser.error("--compare takes one baseline or two existing reports")
     check_source()
     if (
         min(args.batch_size, args.steps, args.prefetch_factor, args.episode_pool_size, args.torch_threads) < 1
@@ -436,6 +465,7 @@ def main(argv=None):
         if k
         not in {
             "output_json",
+            "markdown",
             "compare",
             "dataset_path",
             "repo_id",
@@ -483,6 +513,8 @@ def main(argv=None):
     render(report["rows"])
     if args.output_json:
         args.output_json.write_text(json.dumps(report, indent=2) + "\n")
+    if args.compare:
+        comparison(json.loads(args.compare[0].read_text()), report)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,8 @@ import requests
 import torch
 from lerobot.datasets import dataset_metadata as upstream_meta
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from torchcodec.decoders import VideoDecoder
 
 from lerobot_lancedb import LanceDBDataset
 from lerobot_lancedb._source import (
@@ -219,7 +221,7 @@ def _s3_loopback_server(files: dict[str, bytes], bucket: str = "example-bucket")
             thread.join()
 
 
-def test_external_convert_roundtrip_pixel_exact_and_zero_copy(tmp_path: Path):
+def test_external_convert_roundtrip_pixel_exact_and_zero_copy(tmp_path: Path, monkeypatch):
     # Include a space in the source path to verify file:// percent-encoding end-to-end.
     src = _make_dataset(tmp_path / "src dataset", frames_per_ep=10)
     out_copy = tmp_path / "out_copy"
@@ -238,17 +240,37 @@ def test_external_convert_roundtrip_pixel_exact_and_zero_copy(tmp_path: Path):
     for ep, desc in enumerate(descriptors):
         mp4 = src / "videos" / VIDEO_KEY / "chunk-000" / f"file-{ep:03d}.mp4"
         assert desc["kind"] == 3  # External
-        assert desc["blob_id"] == 1
+        assert desc["blob_id"] == 0
         assert desc["position"] == 0
         assert desc["size"] == mp4.stat().st_size
-        assert desc["blob_uri"] == f"{VIDEO_KEY}/chunk-000/file-{ep:03d}.mp4"
+        assert desc["blob_uri"] == mp4.as_uri()
 
     ds_copy = LanceDBDataset(root=out_copy)
     ds_ext = LanceDBDataset(root=out_ext)
-    assert len(ds_copy) == len(ds_ext) == 20
+    upstream = LeRobotDataset(repo_id="local/ext-test", root=out_ext, return_uint8=True)
+    managed = lancedb.connect(out_copy).open_table(VIDEOS_TABLE)
+    for table in (managed, videos_tbl):
+        descriptor = table.take_row_ids([0]).select(["file_size", VIDEO_BLOB_COLUMN]).to_arrow()
+        assert pa.types.is_struct(descriptor.column(VIDEO_BLOB_COLUMN).type)
+        assert descriptor.nbytes < descriptor["file_size"][0].as_py()
+    paths = sorted((src / "videos").rglob("*.mp4"))
+    reference = [VideoDecoder(str(path), seek_mode="approximate") for path in paths]
+    assert len(ds_copy) == len(ds_ext) == len(upstream) == 20
     for idx in (0, 4, 9, 10, 15, 19):
         item_c = ds_copy[idx]
-        item_e = ds_ext[idx]
+        native = upstream[idx]
+        with monkeypatch.context() as patch:
+            def unexpected(*args, **kwargs):
+                pytest.fail("A local external RGB read used blob I/O")
+
+            patch.setattr(lancedb.table.LanceTable, "fetch_blob_files", unexpected)
+            patch.setattr(lancedb.table.LanceTable, "fetch_blob_ranges", unexpected)
+            item_e = ds_ext[idx]
+        frame = reference[idx // 10].get_frames_at(indices=[idx % 10])
+        assert torch.equal(native[VIDEO_KEY], frame.data[0])
+        assert torch.equal(native["timestamp"], frame.pts_seconds[0].float())
+        assert torch.equal(item_e["timestamp"], native["timestamp"])
+        assert torch.equal(item_e[VIDEO_KEY], frame.data[0] / 255.0)
         assert torch.equal(item_c[VIDEO_KEY], item_e[VIDEO_KEY])
         assert torch.equal(item_c["observation.state"], item_e["observation.state"])
 
@@ -872,4 +894,4 @@ def test_cli_external_mode_and_invalid_storage_option(tmp_path: Path, monkeypatc
 
     descriptors = lancedb.connect(str(out)).open_table(VIDEOS_TABLE).to_arrow().column(VIDEO_BLOB_COLUMN).to_pylist()
     assert len(descriptors) == 2
-    assert all(d["kind"] == 3 and d["blob_id"] == 1 for d in descriptors)
+    assert all(d["kind"] == 3 and d["blob_id"] == 0 for d in descriptors)

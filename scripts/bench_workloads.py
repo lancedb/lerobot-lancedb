@@ -33,7 +33,7 @@ def write_clip(path, width, height, gop, length, camera, episode):
             output.mux(packet)
 
 
-def synthetic(root, profile):
+def synthetic(root, profile, *, vector_width=0):
     width, height, cameras, gop, length = PROFILES[profile]
     videos = [f"observation.images.cam{i}" for i in range(cameras)]
     meta = LeRobotDatasetMetadata.create(
@@ -43,6 +43,7 @@ def synthetic(root, profile):
         features={
             "observation.state": {"dtype": "float32", "shape": (7,), "names": None},
             "action": {"dtype": "float32", "shape": (7,), "names": None},
+            **({"wide": {"dtype": "float32", "shape": (vector_width,), "names": None}} if vector_width else {}),
             **{
                 k: {"dtype": "video", "shape": (height, width, 3), "names": ["height", "width", "channels"]}
                 for k in videos
@@ -88,6 +89,9 @@ def synthetic(root, profile):
                 "action": pa.array((-states).tolist(), pa.list_(pa.float32(), 7)),
             }
         )
+        if vector_width:
+            values = pa.array(np.arange(length * vector_width, dtype=np.float32))
+            rows = rows.append_column("wide", pa.FixedSizeListArray.from_arrays(values, vector_width))
         path = root / meta.get_data_file_path(ep)
         path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(rows, path)

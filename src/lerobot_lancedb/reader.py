@@ -707,7 +707,9 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 self._storage_options["revision"] = resolved
             self._storage_options = _storage_options(self._db_uri, self._storage_options, resolved, token)
 
-        _apply_external_hf_options(self._storage_options, self.meta.info.get("lance_external_bases"), token)
+        # LeRobot 0.7 discards extension fields when it constructs DatasetInfo.
+        info = json.loads((self.meta.root / "meta/info.json").read_text())
+        _apply_external_hf_options(self._storage_options, info.get("lance_external_bases"), token)
 
         selected = set(columns) if columns is not None else None
         if selected is not None:
