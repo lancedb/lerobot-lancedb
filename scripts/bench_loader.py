@@ -123,10 +123,15 @@ def global_batches(meta, args):
     return [indices[i : i + args.batch_size] for i in range(0, len(indices), args.batch_size)]
 
 
-def make_loader(dataset, args, batches=None):
+def worker_options(args):
     options = {"num_workers": args.num_workers, "generator": torch.Generator().manual_seed(args.seed)}
     if args.num_workers:
         options.update(prefetch_factor=args.prefetch_factor, multiprocessing_context="spawn")
+    return options
+
+
+def make_loader(dataset, args, batches=None):
+    options = worker_options(args)
     if batches is None:
         return DataLoader(dataset, batch_size=args.batch_size, **options)
     return DataLoader(dataset, batch_sampler=batches, **options)
@@ -248,10 +253,14 @@ def run_row(args, source, work, repo_id, suite, mode, captured=None):
                 )
             if pool_mode:
                 return lerobot_lancedb.LanceDBEpisodePoolDataset(
-                    root=work / "hybrid", storage_options=s3_options(endpoint),
-                    use_mini_mp4=not args.no_mini_mp4, seed=args.seed,
-                    episode_pool_size=args.episode_pool_size, batch_size=args.batch_size,
-                    **overrides, **common,
+                    root=work / "hybrid",
+                    storage_options=s3_options(endpoint),
+                    use_mini_mp4=not args.no_mini_mp4,
+                    seed=args.seed,
+                    episode_pool_size=args.episode_pool_size,
+                    batch_size=args.batch_size,
+                    **overrides,
+                    **common,
                 )
             return LanceDBDataset(
                 root=work / ("hybrid" if lookahead else mode),
@@ -267,20 +276,21 @@ def run_row(args, source, work, repo_id, suite, mode, captured=None):
         steps = args.warmup_steps + args.steps
         if batches is not None and len(batches) < steps:
             raise ValueError(f"Requested {steps} batches; only {len(batches)} available")
-        loader = make_loader(dataset, args, batches)
+
+        def make_lookahead(reader, sampler):
+            depth = int(mode.removeprefix("hybrid_lookahead_"))
+            return resources.enter_context(
+                reader.lookahead_loader(
+                    batch_sampler=sampler, lookahead_batches=depth, **worker_options(args)
+                )
+            )
+
+        loader = None if lookahead else make_loader(dataset, args, batches)
         waits, observed = [], []
         before = traffic.snapshot()
         with memory_peak() as peak:
             start = time.perf_counter()
-            if lookahead:
-                depth = int(mode.removeprefix("hybrid_lookahead_"))
-                iterator = resources.enter_context(dataset.lookahead_loader(
-                    batch_sampler=batches, num_workers=args.num_workers, lookahead_batches=depth,
-                    generator=torch.Generator().manual_seed(args.seed),
-                    **({"prefetch_factor": args.prefetch_factor, "multiprocessing_context": "spawn"} if args.num_workers else {}),
-                ))
-            else:
-                iterator = iter(loader)
+            iterator = make_lookahead(dataset, batches) if lookahead else iter(loader)
             for step in range(steps):
                 ready = time.perf_counter()
                 batch = next(iterator)
@@ -325,7 +335,11 @@ def run_row(args, source, work, repo_id, suite, mode, captured=None):
                 resume_batches = None
             else:
                 resume_batches = batches[skip:steps]
-            it = iter(make_loader(restored, args, resume_batches))
+            it = (
+                make_lookahead(restored, resume_batches)
+                if lookahead
+                else iter(make_loader(restored, args, resume_batches))
+            )
             for offsets in indices_for(observed[skip:], meta):
                 ref = torch.utils.data.default_collate([reference[i] for i in offsets])
                 assert_batch(next(it), ref, meta.video_keys)

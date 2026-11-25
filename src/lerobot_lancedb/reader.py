@@ -1436,8 +1436,17 @@ class LanceDBDataset(torch.utils.data.Dataset):
         candidates = [k for k in windows if self._file_meta[k]["local_path"] is None]
         mini = {k: v for k, v in prepared.items() if isinstance(v, _MiniFile)}
         if self._has_sample_index:
-            mini.update(self._load_mini_files([k for k in candidates if k not in prepared
-                                               and k not in self._mini_ineligible and k[0] not in self._depth_keys]))
+            mini.update(
+                self._load_mini_files(
+                    [
+                        k
+                        for k in candidates
+                        if k not in prepared
+                        and k not in self._mini_ineligible
+                        and k[0] not in self._depth_keys
+                    ]
+                )
+            )
         ranges = []
         for key in candidates:
             if key in mini:
@@ -1453,8 +1462,11 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 meta = self._file_meta[key]
                 byte_ranges = [self._window_byte_range(key[0], meta, a, b) for a, b in windows[key]]
                 source = prepared[key][1] if key in prepared else None
-            gaps = [(a, b) for start, end in byte_ranges for a, b in
-                    (source.missing(start, end) if source is not None else [(start, end)])]
+            gaps = [
+                (a, b)
+                for start, end in byte_ranges
+                for a, b in (source.missing(start, end) if source is not None else [(start, end)])
+            ]
             ranges.extend((self._video_row_ids[key], a, b) for a, b in _merge_spans(gaps, 64 << 10))
         self._lookahead_buffer.submit(self._videos_table, ranges)
 

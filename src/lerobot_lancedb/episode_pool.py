@@ -108,26 +108,24 @@ class _FrameReuse:
 
 def _fill_videos(reader, prepared, requests, cache, item):
     missing = {
-        file: [ts for ts in dict.fromkeys(times) if (file, ts) not in cache.frames]
-        for file, times in requests.items()
+        file: {i: ts for i, ts in zip(indices, times, strict=True) if (file, i) not in cache.frames}
+        for file, (indices, times) in requests.items()
     }
-    to_decode = {file: [(0, times)] for file, times in missing.items() if times}
+    to_decode = {file: [(0, list(frames.values()))] for file, frames in missing.items() if frames}
     decoded = (
-        reader._decode_requests(to_decode, {k: prepared[k] for k in to_decode}, 1)[0]
-        if to_decode
-        else {}
+        reader._decode_requests(to_decode, {k: prepared[k] for k in to_decode}, 1)[0] if to_decode else {}
     )
-    for file, times in requests.items():
+    for file, (indices, _) in requests.items():
         seen = {}
         if missing[file]:
             values = decoded[file[0]]
             frames = values.unsqueeze(0) if len(missing[file]) == 1 else values
             seen.update(zip(missing[file], frames, strict=True))
-        for ts in set(times) - seen.keys():
-            seen[ts] = cache.frames[file, ts]
-        item[file[0]] = torch.stack([seen[ts] for ts in times]).squeeze(0)
-        for ts, frame in seen.items():
-            cache.consume((file, ts), frame)
+        for i in set(indices) - seen.keys():
+            seen[i] = cache.frames[file, i]
+        item[file[0]] = torch.stack([seen[i] for i in indices]).squeeze(0)
+        for i, frame in seen.items():
+            cache.consume((file, i), frame)
 
 
 def _emit_window(reader, indices, max_frames, max_bytes):
@@ -141,9 +139,10 @@ def _emit_window(reader, indices, max_frames, max_bytes):
     if windows:
         for file, requests in reader._build_video_requests(plans, columns["timestamp"], positions).items():
             for anchor, times in requests:
-                # Exact source timestamps distinguish queries with different PTS tolerance outcomes.
-                by_anchor[anchor][file] = times
-                counts.update((file, ts) for ts in set(times))
+                plan = plans[anchor]
+                indices = plan["windows"].get(file[0], [plan["abs_idx"]])
+                by_anchor[anchor][file] = indices, times
+                counts.update((file, i) for i in set(indices))
     cache = _FrameReuse(counts, max_frames, max_bytes)
     try:
         for plan, requests in zip(plans, by_anchor, strict=True):

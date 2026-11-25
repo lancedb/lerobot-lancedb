@@ -1,5 +1,7 @@
 import threading
+import time
 
+import lancedb
 import pyarrow as pa
 import pytest
 import torch
@@ -51,6 +53,36 @@ def test_order_transform_and_shutdown(dataset_root, workers, explicit):
     for depth in (0, 2):
         for a, b in zip(expected, run(depth), strict=True):
             assert torch.equal(a["index"], b["index"]) and torch.equal(a[VIDEO_KEY], b[VIDEO_KEY])
+
+
+def test_range_io_overlaps_current_decode(dataset_root, monkeypatch):
+    started, decoding, finished = threading.Event(), threading.Event(), threading.Event()
+    fetch = lancedb.table.LanceTable.fetch_blob_ranges
+    decode = LanceDBDataset._decode_mini_file
+    background = []
+
+    def fetch_ranges(table, column, requests):
+        if threading.current_thread().name.startswith("lance-lookahead"):
+            background.extend(requests)
+            started.set()
+            assert decoding.wait(3)
+            time.sleep(0.020)
+            result = fetch(table, column, requests)
+            finished.set()
+            return result
+        return fetch(table, column, requests)
+
+    def decode_mini(reader, *args):
+        decoding.set()
+        assert started.wait(3) and finished.wait(3)
+        return decode(reader, *args)
+
+    monkeypatch.setattr(lancedb.table.LanceTable, "fetch_blob_ranges", fetch_ranges)
+    monkeypatch.setattr(LanceDBDataset, "_decode_mini_file", decode_mini)
+    ds = LanceDBDataset(root=dataset_root)
+    with ds.lookahead_loader(batch_sampler=[[0], [10]], lookahead_batches=1) as it:
+        assert [b["index"].item() for b in it] == [0, 10]
+    assert finished.is_set() and background
 
 
 @pytest.mark.parametrize("failed", [True, False])

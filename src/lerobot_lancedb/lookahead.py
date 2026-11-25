@@ -1,7 +1,7 @@
 """Ordered DataLoader batches with optional same-worker compressed range prefetch."""
 
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import copy
 from itertools import islice
@@ -19,60 +19,61 @@ class RangeBuffer:
         self.budget = budget
         self.reserved = 0
         self.pending = {}
+        self.groups = {}
         self.executor = ThreadPoolExecutor(1, thread_name_prefix="lance-lookahead")
 
+    def _release(self, key):
+        future, _ = self.pending.pop(key)
+        remaining, size = self.groups[future]
+        if remaining == 1:
+            del self.groups[future]
+            self.reserved -= size
+        else:
+            self.groups[future] = remaining - 1, size
+
     def submit(self, table, ranges):
-        # Keep reservations from older hints only while they can still be consumed.
-        for key, future in list(self.pending.items()):
+        for key, (future, _) in list(self.pending.items()):
             row, start, end = key
             if future.done() and not any(r == row and a < end and start < b for r, a, b in ranges):
-                del self.pending[key]
-                self.reserved -= end - start
-        accepted = {}
+                self._release(key)
+        accepted = []
+        size = 0
         for row, start, end in ranges:
-            # Adjacent batches can ask for different slices of the same GOP.
+            # Adjacent batches can request overlapping slices of the same GOP.
             covered = sorted((a, b) for r, a, b in self.pending if r == row and a < end and start < b)
             for a, b in [*covered, (end, end)]:
-                if start < a and a - start <= self.budget - self.reserved:
-                    key = row, start, a
-                    self.reserved += a - start
-                    accepted[key] = self.pending[key] = Future()
+                if start < a and a - start <= self.budget - self.reserved - size:
+                    accepted.append((row, start, a))
+                    size += a - start
                 start = max(start, b)
         if accepted:
-            self.executor.submit(self._read, table, accepted)
-
-    @staticmethod
-    def _read(table, accepted):
-        try:
             requests = [(row, a, b - a) for row, a, b in accepted]
-            blobs = table.fetch_blob_ranges(VIDEO_BLOB_COLUMN, requests)
-            for (_, a, b), future, blob in zip(accepted, accepted.values(), blobs, strict=True):
-                if len(data := blob.as_py()) != b - a:
-                    raise ValueError("Truncated lookahead range")
-                future.set_result(data)
-        except Exception as error:
-            for future in accepted.values():
-                if not future.done():
-                    future.set_exception(error)
+            self.reserved += size
+            future = self.executor.submit(table.fetch_blob_ranges, VIDEO_BLOB_COLUMN, requests)
+            self.groups[future] = len(accepted), size
+            self.pending.update((key, (future, i)) for i, key in enumerate(accepted))
 
     def consume(self, row, source, ranges):
         for key in list(self.pending):
             owner, start, end = key
             if owner != row or not any(a < end and start < b for a, b in ranges):
                 continue
-            future = self.pending.pop(key)
+            future, i = self.pending[key]
             try:
-                data = future.result()
+                # Lance returns one contiguous Arrow array. Retain the whole
+                # reservation until its last member leaves the buffer.
+                data = future.result()[i].as_py()
+                if len(data) == end - start:
+                    source.add(start, data)
             except Exception:
-                continue  # foreground range planning retries any missing bytes
-            else:
-                source.add(start, data)
+                pass  # the normal foreground range plan retries every missing byte
             finally:
-                self.reserved -= end - start
+                self._release(key)
 
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.pending.clear()
+        self.groups.clear()
         self.reserved = 0
 
 
@@ -102,9 +103,11 @@ class _WorkerReader:
     def __getitems__(self, ticket):
         indices, hints = ticket[0]
         if self.finalizer is None:
-            self.reader._lookahead_buffer = RangeBuffer(self.budget)
             self.finalizer = Finalize(self, self.close, exitpriority=10)
-        self.reader._lookahead_hints = hints
+        # The parent consumes futures only inside the matching foreground read.
+        if self.reader._lookahead_buffer is None and self.budget and hints:
+            self.reader._lookahead_buffer = RangeBuffer(self.budget)
+        self.reader._lookahead_hints = hints if self.reader._lookahead_buffer is not None else ()
         return self.reader.__getitems__(indices)
 
     def close(self):

@@ -6,7 +6,7 @@ import torch
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from test_convert_external import FPS, VIDEO_KEY, _make_dataset
 
-from lerobot_lancedb import LanceDBDataset, LanceDBEpisodePoolDataset
+from lerobot_lancedb import LanceDBDataset
 from lerobot_lancedb.convert import convert
 from lerobot_lancedb.episode_pool import _fallback_pool, _FrameReuse, _shards
 
@@ -66,12 +66,21 @@ def test_shards_and_window_parity(roots, monkeypatch):
         next(reader.episode_pool().loader(num_workers=2))
 
 
+class _TrackingReader(LanceDBDataset):
+    def _fetch_rows(self, rows):
+        with self.log.open("a") as stream:
+            print(*rows, file=stream)
+        return super()._fetch_rows(rows)
+
+
 @pytest.mark.parametrize("workers", [0, 2])
-def test_resume_before_short_batch(roots, workers):
+def test_resume_before_short_batch(roots, workers, tmp_path):
     root, _ = roots
+    reader = _TrackingReader(root=root, columns=["index"])
+    reader.log = tmp_path / "reads"
 
     def pool():
-        return LanceDBEpisodePoolDataset(root=root, columns=["index"], batch_size=3)
+        return reader.episode_pool(batch_size=3)
 
     def batches(ds):
         return [row["index"].tolist() for row in ds.loader(num_workers=workers)]
@@ -87,9 +96,36 @@ def test_resume_before_short_batch(roots, workers):
         assert state == {"epoch": 0, "offset": sum(map(len, full[:cut])), "batch_size": 3}
         resumed = pool()
         resumed.load_state_dict(state)
+        reader.log.write_text("")
         assert batches(resumed) == full[cut:]
+        assert sorted(map(int, reader.log.read_text().split())) == sorted(
+            i for row in full[cut:] for i in row
+        )
         resumed.set_epoch(2)
         assert resumed.state_dict()["offset"] == 0
+
+
+def test_cache_contains_only_frames_with_another_pending_consumer(roots, monkeypatch):
+    root, _ = roots
+    caches = []
+    consume = _FrameReuse.consume
+
+    def observe(self, key, value):
+        if not caches or self is not caches[-1]:
+            caches.append(self)
+        consume(self, key, value)
+
+    monkeypatch.setattr(_FrameReuse, "consume", observe)
+    reader = LanceDBDataset(root=root, delta_timestamps={VIDEO_KEY: [0, 1 / FPS]})
+    ds = reader.episode_pool(episodes=[0], where="frame_index IN (3, 4, 5)", order="sequential")
+    with closing(iter(ds)) as it:
+        for expected in (4, 5, None):
+            next(it)
+            assert [i for file, i in caches[-1].frames] == ([] if expected is None else [expected])
+    with closing(iter(ds)) as it:
+        next(it)
+        assert caches[-1].nbytes > 0
+    assert not caches[-1].frames and caches[-1].nbytes == 0
 
 
 def test_hit_only_storage_and_caps():
