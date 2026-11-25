@@ -405,7 +405,7 @@ def test_sample_index_envelope(tmp_path):
         ("libaom-av1", ["-cpu-used", "8"], "64x64", 8),
     ],
 )
-def test_multi_gop_sample_index_pixel_and_pts(tmp_path, codec, options, size, gop):
+def test_multi_gop_sample_index_pixel_and_pts(tmp_path, codec, options, size, gop, monkeypatch):
     if not shutil.which("ffmpeg"):
         pytest.skip("FFmpeg CLI is required to encode codec fixtures")
     path = tmp_path / "video.mp4"
@@ -434,6 +434,17 @@ def test_multi_gop_sample_index_pixel_and_pts(tmp_path, codec, options, size, go
     data = path.read_bytes()
     index = ParsedSampleIndex.parse(probe_local_mp4(path).sample_index)
     reference = VideoDecoder(path)
+    header, start = index.virtual_header(len(data))
+    sparse = reader._SparseBlobSource(len(data), None)
+    virtual = reader._PrefixedSparseSource(header, start, index.payload_end, sparse, lambda lo, hi: data[lo:hi])
+    persistent = VideoDecoder(virtual, seek_mode="approximate")
+    opens = []
+
+    def record_open(movie, *, seek_mode):
+        opens.append((type(movie), seek_mode))
+        return VideoDecoder(movie, seek_mode=seek_mode)
+
+    monkeypatch.setattr("torchcodec.decoders.VideoDecoder", record_open)
     for indices in ([gop + 2], [gop + 2, gop + 1, gop + 2], [2 * gop + 3, 1, gop + 2, 1]):
         expected = reference.get_frames_at(indices=indices)
         spans = index.spans(indices)
@@ -442,7 +453,10 @@ def test_multi_gop_sample_index_pixel_and_pts(tmp_path, codec, options, size, go
         # Exact mode independently scans the synthesized timeline, including holes.
         actual = VideoDecoder(mini).get_frames_at(indices=[positions[s] for s in index.order[indices]])
         assert torch.equal(actual.data, expected.data)
-        # Exercise the reader's approximate-seek strategy on the same encoded data.
+        via_header = persistent.get_frames_at(indices=indices)
+        assert torch.equal(via_header.data, expected.data)
+        assert torch.equal(via_header.pts_seconds, expected.pts_seconds)
+        opens.clear()
         ds = reader.LanceDBDataset.__new__(reader.LanceDBDataset)
         ds.meta = SimpleNamespace(features={"camera": {"shape": [3, 720, 1280]}})
         ds.return_uint8 = True
@@ -450,6 +464,7 @@ def test_multi_gop_sample_index_pixel_and_pts(tmp_path, codec, options, size, go
         source = SimpleNamespace(cached_span=lambda start, end: data[start:end])
         requests = [(0, expected.pts_seconds.tolist())]
         result = ds._decode_mini_file(("camera", 0, 0), requests, reader._MiniFile(index, source), spans, [indices])
+        assert opens == [(bytes, "exact")]
         assert torch.equal(result[0][1], expected.data.squeeze(0))
         assert torch.equal(actual.pts_seconds, expected.pts_seconds)
         assert np.array_equal(

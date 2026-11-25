@@ -143,9 +143,69 @@ def test_cold_multi_file_mini_ranges(indexed_videos, monkeypatch):
     responses.clear()
     repeat = ds.__getitems__(indices)
     assert not responses and not handles
+    # A later sample within each cold GOP needs no further GET.
+    ds.__getitems__([503, count + 510])
+    assert not responses and not handles
     for first, second, expected in zip(results, repeat, baseline, strict=True):
         for key in first:
             assert torch.equal(first[key], expected[key]) and torch.equal(first[key], second[key])
+    restored = pickle.loads(pickle.dumps(ds))
+    assert restored._decoder_cache._total_bytes == restored._index_cache._total_bytes == 0
+
+
+def test_heavy_file_promotes_on_second_batch(indexed_videos, monkeypatch):
+    root, paths, options, _ = indexed_videos
+    # The fixture's 32px H.264 frames let us exercise promotion without a large asset.
+    monkeypatch.setattr(reader, "_PROMOTE_KEYFRAME_BYTES", 1)
+    modes = []
+    ranges = []
+    fetch = lancedb.table.LanceTable.fetch_blob_ranges
+
+    def trace(table, column, requests):
+        ranges.append(requests)
+        return fetch(table, column, requests)
+
+    def observe(source, *, seek_mode):
+        modes.append((type(source), seek_mode))
+        return VideoDecoder(source, seek_mode=seek_mode)
+
+    monkeypatch.setattr(lancedb.table.LanceTable, "fetch_blob_ranges", trace)
+    monkeypatch.setattr(
+        lancedb.table.LanceTable, "fetch_blob_files", lambda *_: pytest.fail("Opened BlobFile")
+    )
+    monkeypatch.setattr("torchcodec.decoders.VideoDecoder", observe)
+    ds = reader.LanceDBDataset(root=root, storage_options=options, return_uint8=True)
+    ref = VideoDecoder(paths[0])
+    index = reader.ParsedSampleIndex.parse(
+        lancedb.connect(root)
+        .open_table("videos")
+        .take_row_ids([0])
+        .select(["sample_index"])
+        .to_arrow()[0][0]
+        .as_py()
+    )
+    for hit, frames in enumerate(([501, 513], [801, 802], [811, 105], [105, 811])):
+        ranges.clear()
+        actual = ds.__getitems__(frames)
+        expected = ref.get_frames_at(frames)
+        for item, pixels, pts in zip(actual, expected.data, expected.pts_seconds, strict=True):
+            assert torch.equal(item[VIDEO_KEY], pixels) and torch.equal(item["timestamp"], pts.float())
+        for batch in ranges:
+            assert all(
+                index.offsets[0] <= start < start + length <= index.payload_end for _, start, length in batch
+            )
+        if hit == 0:
+            assert len(ranges) == len(ranges[0]) == 1
+            assert ranges[0][0][1] == index.offsets[500]
+            assert modes == [(bytes, "exact")]
+        else:
+            assert modes == [(bytes, "exact"), (reader._PrefixedSparseSource, "approximate")]
+        if hit == 1:
+            assert len(ranges) == 1
+            assert ranges[0][0][1] == index.offsets[0]
+        if hit == 3:
+            assert ranges == []
+    assert not ds._mini_ineligible
     restored = pickle.loads(pickle.dumps(ds))
     assert restored._decoder_cache._total_bytes == restored._index_cache._total_bytes == 0
 
@@ -234,6 +294,11 @@ def test_open_gop_falls_back_to_sparse_decoder(tmp_path):
         index._check_idr(path.read_bytes()[start:end])
     ids = [ordinal, ordinal + 2, ordinal, 1]
     reference = VideoDecoder(path).get_frames_at(indices=ids)
+    header, base = index.virtual_header(path.stat().st_size)
+    data = path.read_bytes()
+    source = reader._PrefixedSparseSource(header, base, index.payload_end, reader._SparseBlobSource(len(data), None), lambda lo, hi: data[lo:hi])
+    warm = VideoDecoder(source, seek_mode="approximate").get_frames_at(ids)
+    assert torch.equal(warm.data, reference.data) and torch.equal(warm.pts_seconds, reference.pts_seconds)
     for pos, result in enumerate(ds.__getitems__(ids)):
         assert torch.equal(result[VIDEO_KEY], reference.data[pos])
         assert torch.equal(result["timestamp"], reference.pts_seconds[pos].float())

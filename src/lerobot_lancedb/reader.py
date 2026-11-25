@@ -78,6 +78,7 @@ _OPEN_PROBE_BYTES = 256 * 1024
 # scatter copies, and decoder-internal memory are excluded from the byte estimate.
 _RGB_DECODE_MAX_FRAMES = 64
 _RGB_DECODE_MAX_BYTES = 64 << 20
+_PROMOTE_KEYFRAME_BYTES = 16 << 10
 
 # Limit the temporal span when merging multiple depth windows, further bounded
 # by the byte budget. Individual windows keep the direct decode path; these
@@ -277,6 +278,56 @@ class _SparseBlobSource(io.RawIOBase):
         return len(data)
 
 
+class _PrefixedSparseSource(io.RawIOBase):
+    """Seekable MP4 whose header is local and whose mdat maps to indexed blob bytes."""
+
+    def __init__(self, header, start, end, sparse, fetch_range):
+        self.header = header
+        self._shift = start - len(header)
+        self._length = len(header) + end - start
+        self._sparse = sparse
+        self._fetch_range = fetch_range
+        self._pos = 0
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=io.SEEK_SET):
+        if whence == io.SEEK_CUR:
+            offset += self._pos
+        elif whence == io.SEEK_END:
+            offset += self._length
+        if offset < 0:
+            raise ValueError("Negative MP4 seek")
+        self._pos = offset
+        return offset
+
+    def readinto(self, buffer):
+        end = min(self._pos + len(buffer), self._length)
+        if self._pos >= end:
+            return 0
+        if self._pos < len(self.header):
+            data = self.header[self._pos : end]
+        else:
+            start = self._pos + self._shift
+            stop = end + self._shift
+            for first, last in list(self._sparse.missing(start, stop)):
+                chunk = self._fetch_range(first, last)
+                if len(chunk) != last - first:
+                    raise ValueError("Truncated indexed video range")
+                self._sparse.add(first, chunk)
+            data = self._sparse.cached_span(start, stop)
+        buffer[: len(data)] = data
+        self._pos += len(data)
+        return len(data)
+
+
 class _EpisodeSubsetIndexMapping(Mapping[int, int]):
     """Index selected episode intervals without allocating an entry per frame."""
 
@@ -334,6 +385,17 @@ class _EpisodeSubsetIndexMapping(Mapping[int, int]):
 class _MiniFile:
     index: ParsedSampleIndex
     source: _SparseBlobSource
+    persistent: bool = False
+    decoder: object | None = None
+    header_size: int = 0
+
+    @property
+    def cache_bytes(self):
+        cost = self.source.buffered + self.header_size
+        if self.decoder is not None:
+            meta = self.decoder.metadata
+            cost += (8 << 20) + 8 * (meta.height or 0) * (meta.width or 0)
+        return cost
 
 
 class _VideoDecoderLRU:
@@ -1113,6 +1175,11 @@ class LanceDBDataset(torch.utils.data.Dataset):
                     raise
                 retry[key] = requests[key]
                 continue
+            if key in mini:
+                entry = mini[key]
+                self._decoder_cache.put(
+                    ("mini", *key), (entry.source, entry.decoder, entry.header_size), entry.cache_bytes
+                )
             for sample_idx, frames in decoded:
                 results[sample_idx][key[0]] = frames
         if retry:
@@ -1129,48 +1196,35 @@ class LanceDBDataset(torch.utils.data.Dataset):
     def _decode_mini_file(self, key, requests, entry, spans, indices):
         from torchcodec.decoders import VideoDecoder  # noqa: PLC0415
 
-        # Approximate ordinal seeks use the average frame rate. Across a hole in
-        # decode time they can land on an entirely different picture. Keep adjacent
-        # GOPs in one container and split only where samples were omitted.
-        groups = []
-        for span in spans:
-            if not groups or groups[-1][-1][1] + 1 != span[0]:
-                groups.append([])
-            groups[-1].append(span)
         index = entry.index
-        needed = {int(index.order[i]): i for row in indices for i in row}
-        locations = {}
-        movies = []
-        for group_id, group in enumerate(groups):
-            movie, order = index.mini_mp4(group, entry.source.cached_span)
-            movies.append(movie)
-            for pos, sample in enumerate(order):
-                if sample in needed:
-                    locations[needed[sample]] = (group_id, pos)
+        positions = None
+        if entry.persistent:
+            if entry.decoder is None:
+                header, start = index.virtual_header(self._file_meta[key]["file_size"])
+                table = self._videos_table
+                row = self._video_row_ids[key]
 
-        @lru_cache(maxsize=1)
-        def open_group(group_id):
-            return VideoDecoder(movies[group_id], seek_mode="approximate")
+                def fetch(start, end):
+                    return table.fetch_blob_ranges(VIDEO_BLOB_COLUMN, [(row, start, end - start)])[0].as_py()
 
-        def decode(indices):
-            by_group = defaultdict(list)
-            for output_pos, i in enumerate(indices):
-                group, local = locations[i]
-                by_group[group].append((output_pos, local))
-            for part, (group, positions) in enumerate(by_group.items()):
-                output, local = zip(*positions, strict=True)
-                batch = open_group(group).get_frames_at(indices=list(local))
-                expected = index.pts[index.order[[indices[pos] for pos in output]]]
-                if not np.array_equal(np.rint(batch.pts_seconds.cpu().numpy() * index.timescale), expected):
-                    raise ValueError("Mini-MP4 decoded a different sample PTS")
-                if len(by_group) == 1:
-                    return batch.data, batch.pts_seconds
-                if part == 0:
-                    frames = batch.data.new_empty((len(indices), *batch.data.shape[1:]))
-                    pts = batch.pts_seconds.new_empty(len(indices))
-                frames[list(output)] = batch.data
-                pts[list(output)] = batch.pts_seconds
-            return frames, pts
+                source = _PrefixedSparseSource(header, start, index.payload_end, entry.source, fetch)
+                entry.decoder = VideoDecoder(source, seek_mode="approximate")
+                entry.header_size = len(header)
+            decoder = entry.decoder
+        else:
+            movie, order = index.mini_mp4(spans, entry.source.cached_span)
+            decoder = VideoDecoder(movie, seek_mode="exact")
+            positions = {sample: i for i, sample in enumerate(order)}
+
+        def decode(ordinals):
+            samples = index.order[ordinals]
+            local = ordinals if positions is None else [positions[sample] for sample in samples]
+            batch = decoder.get_frames_at(indices=local)
+            if not np.array_equal(
+                np.rint(batch.pts_seconds.cpu().numpy() * index.timescale), index.pts[samples]
+            ):
+                raise ValueError("Indexed decoder returned a different sample PTS")
+            return batch.data, batch.pts_seconds
 
         return self._decode_rgb_file_requests(None, requests, key, indices, decode)
 
@@ -1369,12 +1423,13 @@ class LanceDBDataset(torch.utils.data.Dataset):
         files = {}
         for key, idx in indices.items():
             cache_key = ("mini", *key)
-            source = (
-                self._decoder_cache.get(cache_key)
-                if cache_key in self._decoder_cache
-                else _SparseBlobSource(self._file_meta[key]["file_size"], None)
-            )
-            files[key] = _MiniFile(idx, source)
+            if cache_key in self._decoder_cache:
+                source, decoder, header_size = self._decoder_cache.get(cache_key)
+                files[key] = _MiniFile(
+                    idx, source, idx.sizes[0] >= _PROMOTE_KEYFRAME_BYTES, decoder, header_size
+                )
+            else:
+                files[key] = _MiniFile(idx, _SparseBlobSource(self._file_meta[key]["file_size"], None))
         return files
 
     def _prefetch_mini(self, files, indices):
@@ -1383,17 +1438,37 @@ class LanceDBDataset(torch.utils.data.Dataset):
         targets = []
         for key, entry in files.items():
             try:
-                spans = entry.index.spans(indices[key])
+                spans = entry.index.spans(indices[key], require_closed=not entry.persistent)
             except ValueError:
                 self._mini_ineligible.add(key)
                 continue
             plans[key] = spans
-            ranges = [entry.index.byte_span(*span) for span in spans]
-            missing = [gap for span in ranges for gap in entry.source.missing(*span)]
-            for first, last in _merge_spans(missing, 64 << 10):
-                for start, end in entry.source.missing(first, last):
-                    requests.append((self._video_row_ids[key], start, end - start))
-                    targets.append((key, start, end))
+            fetch_spans = spans
+            if entry.persistent and entry.decoder is None:
+                fetch_spans = [(0, 0), *spans]
+            index = entry.index
+            ranges = [
+                index.prefetch_range(first, last, read_ahead=entry.persistent) for first, last in fetch_spans
+            ]
+            # Repeated FFmpeg reads of short clips otherwise fragment the few
+            # remaining bytes into many AVIO-sized GETs. On promotion, materialize
+            # at most 2 MiB of media, never the original file header or tail moov.
+            media_start = int(index.offsets[0])
+            if entry.persistent and index.payload_end - media_start <= 2 << 20:
+                ranges = [(media_start, index.payload_end)]
+            elif index.sizes[0] >= _PROMOTE_KEYFRAME_BYTES:
+                # For a heavy sync sample, absorb a small remaining suffix in the
+                # same GET. The cold read still begins at the requested sync sample.
+                first = min(start for start, _ in ranges)
+                if (
+                    index.payload_end - first <= 2 * _OPEN_PROBE_BYTES
+                    and index.payload_end - max(end for _, end in ranges) <= _OPEN_PROBE_BYTES
+                ):
+                    ranges = [(first, index.payload_end)]
+            missing = [gap for start, end in ranges for gap in entry.source.missing(start, end)]
+            for start, end in _merge_spans(missing, 64 << 10):
+                requests.append((self._video_row_ids[key], start, end - start))
+                targets.append((key, start, end))
         if requests:
             try:
                 blobs = self._videos_table.fetch_blob_ranges(VIDEO_BLOB_COLUMN, requests)
@@ -1406,9 +1481,6 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 for key, _, _ in targets:
                     plans.pop(key, None)
                     self._mini_ineligible.add(key)
-        for key in plans:
-            source = files[key].source
-            self._decoder_cache.put(("mini", *key), source, source.buffered)
         return plans
 
     def _video_file_key(self, key: str, ep_idx: int) -> tuple[str, int, int]:

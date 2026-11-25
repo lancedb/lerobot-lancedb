@@ -892,6 +892,7 @@ class ParsedSampleIndex:
     ftyp: bytes
     mvhd: bytes
     tkhd: bytes
+    edts: bytes
     mdhd: bytes
     hdlr: bytes
     media_info: bytes
@@ -1000,6 +1001,7 @@ class ParsedSampleIndex:
             _select_boxes(raw, (b"ftyp",)),
             mvhd,
             tkhd,
+            _select_boxes(trak, (b"edts",)),
             mdhd,
             _select_boxes(mdia, (b"hdlr",)),
             _select_boxes(minf, (b"vmhd", b"dinf")),
@@ -1019,8 +1021,8 @@ class ParsedSampleIndex:
             sync,
         )
 
-    def spans(self, indices) -> list[tuple[int, int]]:
-        """Inclusive decode-order spans, one per requested closed GOP."""
+    def spans(self, indices, *, require_closed: bool = True) -> list[tuple[int, int]]:
+        """Inclusive decode-order spans, one per requested GOP."""
         groups = {}
         for idx in indices:
             if not 0 <= idx < len(self.order):
@@ -1032,13 +1034,59 @@ class ParsedSampleIndex:
         for group, last in sorted(groups.items()):
             first = int(self.sync[group])
             end = self.sync[group + 1] if group + 1 < len(self.sync) else len(self.pts)
-            if self.pts[first:end].min() < self.pts[first]:
+            if require_closed and self.pts[first:end].min() < self.pts[first]:
                 raise ValueError("Open GOP with leading pictures")
             spans.append((first, last))
         return spans
 
     def byte_span(self, first: int, last: int) -> tuple[int, int]:
         return int(self.offsets[first]), int(self.offsets[last] + self.sizes[last])
+
+    @property
+    def payload_end(self) -> int:
+        return int(self.offsets[-1]) + int(self.sizes[-1])
+
+    def prefetch_range(self, first: int, last: int, *, read_ahead: bool) -> tuple[int, int]:
+        start, requested_end = self.byte_span(first, last)
+        next_sync = self.sync.searchsorted(first, side="right")
+        end = int(self.offsets[self.sync[next_sync]]) if next_sync < len(self.sync) else self.payload_end
+        if end - start > 8 << 20:
+            end = requested_end
+        if read_ahead:
+            end = min(self.payload_end, max(end, start + (64 << 10)))
+        return start, end
+
+    def virtual_header(self, file_size: int) -> tuple[bytes, int]:
+        """Prefix for a seekable MP4 exposing just the contiguous video samples."""
+        start, end = self.byte_span(0, len(self.sizes) - 1)
+        if not 0 <= start < end <= file_size:
+            raise ValueError("Video sample payload outside file")
+        count = len(self.sizes)
+        tables = (
+            _box(b"stsd", self.stsd)
+            + _box(b"stts", _timing_table(self.durations))
+            + _box(b"stsc", struct.pack(">IIIII", 0, 1, 1, count, 1))
+            + _box(b"stsz", struct.pack(">III", 0, 0, count) + self.sizes.astype(">u4").tobytes())
+            + _box(b"stss", struct.pack(">II", 0, len(self.sync)) + (self.sync + 1).astype(">u4").tobytes())
+        )
+        if self.ctts_version is not None:
+            tables += _box(b"ctts", _timing_table(self.composition, self.ctts_version))
+
+        # All samples are contiguous, so one chunk represents every original offset
+        # shifted by len(header) - start. Its 64-bit offset never changes header size.
+        def header(offset):
+            stbl = tables + _box(b"co64", struct.pack(">IIQ", 0, 1, offset))
+            return self._header(stbl, self.mvhd, self.tkhd, self.edts, self.mdhd) + struct.pack(
+                ">I4sQ", 1, b"mdat", 16 + end - start
+            )
+
+        return header(len(header(0))), start
+
+    def _header(self, stbl, mvhd, tkhd, edts, mdhd):
+        minf = self.media_info + _box(b"stbl", stbl)
+        mdia = _box(b"mdhd", mdhd) + self.hdlr + _box(b"minf", minf)
+        trak = _box(b"tkhd", tkhd) + edts + _box(b"mdia", mdia)
+        return self.ftyp + _box(b"moov", _box(b"mvhd", mvhd) + _box(b"trak", trak))
 
     def _check_idr(self, sample: bytes) -> None:
         if not self.nal_length_size:
@@ -1107,10 +1155,7 @@ class ParsedSampleIndex:
 
         def header(offset):
             stbl = tables + _box(b"stco", struct.pack(">III", 0, 1, offset))
-            minf = self.media_info + _box(b"stbl", stbl)
-            mdia = _box(b"mdhd", mdhd) + self.hdlr + _box(b"minf", minf)
-            trak = _box(b"tkhd", tkhd) + _box(b"edts", _box(b"elst", edit)) + _box(b"mdia", mdia)
-            return self.ftyp + _box(b"moov", _box(b"mvhd", mvhd) + _box(b"trak", trak))
+            return self._header(stbl, mvhd, tkhd, _box(b"edts", _box(b"elst", edit)), mdhd)
 
         return header(len(header(0)) + 8) + _box(b"mdat", b"".join(chunks)), samples[np.argsort(pts)]
 
