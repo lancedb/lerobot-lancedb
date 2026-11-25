@@ -248,8 +248,10 @@ def test_external_convert_roundtrip_pixel_exact_and_zero_copy(tmp_path: Path, mo
     ds_copy = LanceDBDataset(root=out_copy)
     ds_ext = LanceDBDataset(root=out_ext)
     upstream = LeRobotDataset(repo_id="local/ext-test", root=out_ext, return_uint8=True)
+    upstream_copy = LeRobotDataset(repo_id="local/ext-test", root=out_copy, return_uint8=True)
     managed = lancedb.connect(out_copy).open_table(VIDEOS_TABLE)
     for table in (managed, videos_tbl):
+        assert all(row.as_py().startswith(b"LMP4\x01") for row in table.search().select(["sample_index"]).to_arrow()[0])
         descriptor = table.take_row_ids([0]).select(["file_size", VIDEO_BLOB_COLUMN]).to_arrow()
         assert pa.types.is_struct(descriptor.column(VIDEO_BLOB_COLUMN).type)
         assert descriptor.nbytes < descriptor["file_size"][0].as_py()
@@ -265,8 +267,12 @@ def test_external_convert_roundtrip_pixel_exact_and_zero_copy(tmp_path: Path, mo
 
             patch.setattr(lancedb.table.LanceTable, "fetch_blob_files", unexpected)
             patch.setattr(lancedb.table.LanceTable, "fetch_blob_ranges", unexpected)
+            patch.setattr(ds_ext, "_load_mini_files", unexpected)
             item_e = ds_ext[idx]
         frame = reference[idx // 10].get_frames_at(indices=[idx % 10])
+        native_copy = upstream_copy[idx]
+        assert torch.equal(native_copy[VIDEO_KEY], frame.data[0])
+        assert torch.equal(native_copy["timestamp"], frame.pts_seconds[0].float())
         assert torch.equal(native[VIDEO_KEY], frame.data[0])
         assert torch.equal(native["timestamp"], frame.pts_seconds[0].float())
         assert torch.equal(item_e["timestamp"], native["timestamp"])

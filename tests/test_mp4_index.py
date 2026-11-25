@@ -6,14 +6,19 @@ import shutil
 import struct
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import av
 import numpy as np
 import pytest
+import torch
+from torchcodec.decoders import VideoDecoder
 
+from lerobot_lancedb import reader
 from lerobot_lancedb.mp4_index import (
     DEFAULT_HEADER_PROBE_BYTES,
     DEFAULT_MAX_PROBE_BYTES,
+    ParsedSampleIndex,
     _parse_stz2,
     probe_local_mp4,
     probe_mp4_byte_index,
@@ -233,6 +238,7 @@ def test_probe_supports_stz2_and_elst_bounds_parity_with_pyav(tmp_path: Path):
     trimmed_mp4.write_bytes(bytes(buf))
 
     probed_trimmed = probe_local_mp4(trimmed_mp4)
+    assert probed_trimmed.sample_index is None
     assert probed_trimmed.to_index_dict() == build_video_byte_index(trimmed_mp4)
     with av.open(str(trimmed_mp4)) as container:
         decoded_trimmed = sum(1 for _ in container.decode(video=0))
@@ -369,3 +375,98 @@ def test_probe_tail_moov_jumps_large_free_padding_before_and_after_moov(tmp_path
             )
             assert probed_bounded.sample_count == 24
             assert all(sz <= 4096 for sz in read_sizes)
+
+
+def test_sample_index_envelope(tmp_path):
+    path = tmp_path / "video.mp4"
+    _encode_mp4(path)
+    data = probe_local_mp4(path).sample_index
+    assert data.startswith(b"LMP4\x01") and len(data) < path.stat().st_size
+    for invalid in (
+        data[:4] + b"\x02" + data[5:],
+        data[:-1],
+        data + b"junk",
+        data[:5] + b"\xff" * 4 + data[9:],
+    ):
+        with pytest.raises(ValueError):
+            ParsedSampleIndex.parse(invalid)
+
+
+@pytest.mark.parametrize(
+    "codec,options,size,gop",
+    [
+        ("libx264", ["-bf", "0"], "64x64", 2),
+        ("libx264", ["-bf", "0"], "1280x720", 30),
+        ("libx264", ["-bf", "3"], "64x64", 8),
+        ("libx264", ["-bf", "3", "-movflags", "+negative_cts_offsets"], "64x64", 8),
+        ("libx264", ["-bf", "3", "-output_ts_offset", "0.5"], "64x64", 8),
+        ("libx265", ["-x265-params", "open-gop=0:pools=none:frame-threads=1"], "64x64", 8),
+        ("libvpx-vp9", ["-deadline", "realtime"], "64x64", 8),
+        ("libaom-av1", ["-cpu-used", "8"], "64x64", 8),
+    ],
+)
+def test_multi_gop_sample_index_pixel_and_pts(tmp_path, codec, options, size, gop, monkeypatch):
+    if not shutil.which("ffmpeg"):
+        pytest.skip("FFmpeg CLI is required to encode codec fixtures")
+    path = tmp_path / "video.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size={size}:rate=16",
+            "-frames:v",
+            str(2 * gop + 6),
+            "-c:v",
+            codec,
+            "-threads",
+            "1",
+            "-g",
+            str(gop),
+            *options,
+            str(path),
+        ],
+        check=True,
+    )
+    data = path.read_bytes()
+    index = ParsedSampleIndex.parse(probe_local_mp4(path).sample_index)
+    reference = VideoDecoder(path)
+    header, start = index.virtual_header(len(data))
+    sparse = reader._SparseBlobSource(len(data), None)
+    virtual = reader._PrefixedSparseSource(header, start, index.payload_end, sparse, lambda lo, hi: data[lo:hi])
+    persistent = VideoDecoder(virtual, seek_mode="approximate")
+    opens = []
+
+    def record_open(movie, *, seek_mode):
+        opens.append((type(movie), seek_mode))
+        return VideoDecoder(movie, seek_mode=seek_mode)
+
+    monkeypatch.setattr("torchcodec.decoders.VideoDecoder", record_open)
+    for indices in ([gop + 2], [gop + 2, gop + 1, gop + 2], [2 * gop + 3, 1, gop + 2, 1]):
+        expected = reference.get_frames_at(indices=indices)
+        spans = index.spans(indices)
+        mini, order = index.mini_mp4(spans, lambda start, end: data[start:end])
+        positions = {s: i for i, s in enumerate(order)}
+        # Exact mode independently scans the synthesized timeline, including holes.
+        actual = VideoDecoder(mini).get_frames_at(indices=[positions[s] for s in index.order[indices]])
+        assert torch.equal(actual.data, expected.data)
+        via_header = persistent.get_frames_at(indices=indices)
+        assert torch.equal(via_header.data, expected.data)
+        assert torch.equal(via_header.pts_seconds, expected.pts_seconds)
+        opens.clear()
+        ds = reader.LanceDBDataset.__new__(reader.LanceDBDataset)
+        ds.meta = SimpleNamespace(features={"camera": {"shape": [3, 720, 1280]}})
+        ds.return_uint8 = True
+        ds.tolerance_s = 0.0001
+        source = SimpleNamespace(cached_span=lambda start, end: data[start:end])
+        requests = [(0, expected.pts_seconds.tolist())]
+        result = ds._decode_mini_file(("camera", 0, 0), requests, reader._MiniFile(index, source), spans, [indices])
+        assert opens == [(bytes, "exact")]
+        assert torch.equal(result[0][1], expected.data.squeeze(0))
+        assert torch.equal(actual.pts_seconds, expected.pts_seconds)
+        assert np.array_equal(
+            np.rint(actual.pts_seconds.numpy() * index.timescale), index.pts[index.order[indices]]
+        )

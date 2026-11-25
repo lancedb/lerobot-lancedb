@@ -244,7 +244,10 @@ def run_row(args, source, work, repo_id, suite, mode, captured=None):
                     **common,
                 )
             return LanceDBDataset(
-                root=work / mode, storage_options=s3_options(endpoint) if mode == "hybrid" else None, **common
+                root=work / mode,
+                storage_options=s3_options(endpoint) if mode == "hybrid" else None,
+                use_mini_mp4=not args.no_mini_mp4,
+                **common,
             )
 
         dataset = open_dataset()
@@ -425,6 +428,7 @@ def main(argv=None):
         "--delta-timestamps", type=json.loads, help="JSON feature to seconds map; {} disables windows"
     )
     parser.add_argument("--rtt-ms", type=float, default=20.0)
+    parser.add_argument("--no-mini-mp4", action="store_true", help="Use the sparse RGB decoder for indexed blobs")
     parser.add_argument("--verify-correctness", action="store_true")
     parser.add_argument("--output-json", "--output", type=Path)
     parser.add_argument(
@@ -470,6 +474,7 @@ def main(argv=None):
             "dataset_path",
             "repo_id",
             "verify_correctness",
+            "no_mini_mp4",
             "workloads",
             "suites",
         }
@@ -480,6 +485,7 @@ def main(argv=None):
         verify_correctness=args.verify_correctness,
         rows=[],
         runtime={
+            "use_mini_mp4": not args.no_mini_mp4,
             "harness_sha256": {
                 p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in sorted((ROOT / "scripts").glob("bench_*.py"))

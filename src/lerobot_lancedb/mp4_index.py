@@ -23,6 +23,7 @@ sample-table counts) before any Lance table is written.
 from __future__ import annotations
 
 import struct
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +71,7 @@ class ProbedMp4:
     faststart: bool
     range_gets: int
     bytes_read: int
+    sample_index: bytes | None = None
 
     def to_index_dict(self) -> dict[str, Any]:
         """Return the 5-column byte index expected by ``videos.lance``."""
@@ -551,6 +553,7 @@ def probe_mp4_byte_index(
     path: str,
     read_range: Callable[[str, int, int], bytes],
     *,
+    write_sample_index: bool = True,
     file_size: int,
     header_probe_bytes: int = DEFAULT_HEADER_PROBE_BYTES,
     max_probe_bytes: int = DEFAULT_MAX_PROBE_BYTES,
@@ -682,6 +685,7 @@ def probe_mp4_byte_index(
                 sample_count=sample_count,
                 fps=avg_fps,
                 faststart=moov_box.start < mdat_box.start,
+                sample_index=build_sample_index(data, moov_payload) if write_sample_index else None,
                 range_gets=range_gets,
                 bytes_read=bytes_read,
             )
@@ -800,6 +804,7 @@ def probe_mp4_byte_index(
                 sample_count=sample_count,
                 fps=avg_fps,
                 faststart=False,
+                sample_index=build_sample_index(data, moov_payload) if write_sample_index else None,
                 range_gets=range_gets,
                 bytes_read=bytes_read,
             )
@@ -822,6 +827,337 @@ def probe_mp4_byte_index(
         if not chunk:
             raise ValueError(f"{path}: empty range read at offset {len(data)}")
         data += chunk
+
+
+# Limit both the serialized tables and the arrays that a constant-size/run-length
+# table can expand to. Larger files remain readable through the sparse decoder.
+_INDEX_MAGIC = b"LMP4\x01"
+_MAX_INDEX_BYTES = 8 << 20
+_MAX_INDEX_SAMPLES = 1_000_000
+_SAMPLE_TABLES = (b"stsd", b"stts", b"ctts", b"stsc", b"stsz", b"stz2", b"stco", b"co64", b"stss")
+
+
+def _box(kind: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I4s", len(payload) + 8, kind) + payload
+
+
+def _select_boxes(data: bytes, kinds: tuple[bytes, ...]) -> bytes:
+    return b"".join(data[b.start : b.end] for b in _iter_boxes(data, 0, len(data)) if b.type in kinds)
+
+
+def build_sample_index(prefix: bytes, moov: bytes) -> bytes | None:
+    """Strip an already-probed moov down to the configuration and tables of one video track."""
+    try:
+        ftyp = _find_child_payload(prefix, b"ftyp")
+        if (
+            _find_optional_child(moov, b"mvex")
+            or sum(b.type == b"trak" for b in _iter_boxes(moov, 0, len(moov))) != 1
+        ):
+            return None
+        trak = _find_video_trak(moov)
+        mdia = _find_child_payload(trak, b"mdia")
+        minf = _find_child_payload(mdia, b"minf")
+        stbl = _select_boxes(_find_child_payload(minf, b"stbl"), _SAMPLE_TABLES)
+        minf = _select_boxes(minf, (b"vmhd", b"dinf")) + _box(b"stbl", stbl)
+        mdia = _select_boxes(mdia, (b"mdhd", b"hdlr")) + _box(b"minf", minf)
+        trak = _select_boxes(trak, (b"tkhd", b"edts")) + _box(b"mdia", mdia)
+        raw = _box(b"ftyp", ftyp) + _box(b"moov", _select_boxes(moov, (b"mvhd",)) + _box(b"trak", trak))
+        if len(raw) > _MAX_INDEX_BYTES:
+            return None
+        ParsedSampleIndex.from_boxes(raw)
+        return _INDEX_MAGIC + struct.pack(">I", len(raw)) + zlib.compress(raw, 1)
+    except (ValueError, struct.error, IndexError, OverflowError):
+        return None
+
+
+def sample_index_from_mp4(data: bytes) -> bytes | None:
+    """Managed copy already holds the file in memory. Skip mdat by its declared size."""
+    try:
+        boxes = _iter_boxes(data, 0, len(data))
+        if any(b.type == b"moof" for b in boxes) or sum(b.type == b"mdat" for b in boxes) != 1:
+            return None
+        return build_sample_index(data, _find_child_payload(data, b"moov"))
+    except ValueError:
+        return None
+
+
+def _timing_table(values: np.ndarray, version: int = 0) -> bytes:
+    starts = np.r_[0, np.flatnonzero(np.diff(values)) + 1]
+    runs = np.column_stack((np.diff(np.r_[starts, len(values)]), values[starts]))
+    return struct.pack(">II", version << 24, len(runs)) + runs.astype(">u4").tobytes()
+
+
+@dataclass
+class ParsedSampleIndex:
+    ftyp: bytes
+    mvhd: bytes
+    tkhd: bytes
+    edts: bytes
+    mdhd: bytes
+    hdlr: bytes
+    media_info: bytes
+    stsd: bytes
+    codec: bytes
+    nal_length_size: int
+    ctts_version: int | None
+    timescale: int
+    fps: float
+    sizes: np.ndarray
+    offsets: np.ndarray
+    dts: np.ndarray
+    durations: np.ndarray
+    composition: np.ndarray
+    pts: np.ndarray
+    order: np.ndarray
+    sync: np.ndarray
+
+    @property
+    def nbytes(self) -> int:
+        return sum(
+            v.nbytes if isinstance(v, np.ndarray) else len(v)
+            for v in vars(self).values()
+            if isinstance(v, (np.ndarray, bytes))
+        )
+
+    @classmethod
+    def parse(cls, data: bytes) -> ParsedSampleIndex:
+        if len(data) < 9 or data[:5] != _INDEX_MAGIC:
+            raise ValueError("Unknown MP4 sample index version")
+        length = struct.unpack_from(">I", data, 5)[0]
+        if length > _MAX_INDEX_BYTES or len(data) > _MAX_INDEX_BYTES + 65536:
+            raise ValueError("MP4 sample index exceeds size limit")
+        inflater = zlib.decompressobj()
+        try:
+            raw = inflater.decompress(data[9:], length + 1)
+            if not inflater.eof or inflater.unused_data or len(raw) != length:
+                raise ValueError("Invalid MP4 sample index length")
+            return cls.from_boxes(raw)
+        except (zlib.error, struct.error, IndexError, OverflowError) as exc:
+            raise ValueError("Malformed MP4 sample index") from exc
+
+    @classmethod
+    def from_boxes(cls, raw: bytes) -> ParsedSampleIndex:
+        moov = _find_child_payload(raw, b"moov")
+        if (
+            _find_optional_child(moov, b"mvex")
+            or sum(b.type == b"trak" for b in _iter_boxes(moov, 0, len(moov))) != 1
+        ):
+            raise ValueError("Expected one unfragmented video track")
+        trak = _find_video_trak(moov)
+        mdia = _find_child_payload(trak, b"mdia")
+        minf = _find_child_payload(mdia, b"minf")
+        stbl = _find_child_payload(minf, b"stbl")
+        stsd = _find_child_payload(stbl, b"stsd")
+        if struct.unpack_from(">I", stsd, 4)[0] != 1:
+            raise ValueError("Multiple sample descriptions")
+        codec = stsd[12:16]
+        nal_length = 0
+        if codec in (b"avc1", b"avc3"):
+            nal_length = 1 + (_find_child_payload(stsd[94:], b"avcC")[4] & 3)
+        elif codec in (b"hvc1", b"hev1"):
+            nal_length = 1 + (_find_child_payload(stsd[94:], b"hvcC")[21] & 3)
+        elif codec not in (b"av01", b"vp09"):
+            raise ValueError("Unsupported sample codec")
+        size_box = _find_optional_child(stbl, b"stsz") or _find_child(stbl, b"stz2")
+        count = struct.unpack_from(">I", stbl, size_box.payload_start + 8)[0]
+        if not 0 < count <= _MAX_INDEX_SAMPLES:
+            raise ValueError("Sample count outside index limits")
+        sizes = _parse_sample_sizes(stbl)
+        chunks = _parse_stsc(_find_child_payload(stbl, b"stsc"))
+        if any(desc != 1 for _, _, desc in chunks):
+            raise ValueError("Unknown sample description")
+        offsets = _compute_sample_offsets(chunks, _parse_chunk_offsets(stbl), sizes)
+        if (sizes <= 0).any() or (np.diff(offsets) != sizes[:-1]).any():
+            raise ValueError("Non-contiguous video samples")
+        durations = _parse_stts(_find_child_payload(stbl, b"stts"), count)
+        sync = _parse_stss(stbl, count)
+        if not len(sync) or sync[0] != 0 or (np.diff(sync) <= 0).any() or (durations <= 0).any():
+            raise ValueError("Invalid sync samples or durations")
+        composition = _parse_ctts(stbl, count)
+        ctts = _find_optional_child(stbl, b"ctts")
+        mvhd = _find_child_payload(moov, b"mvhd")
+        tkhd = _find_child_payload(trak, b"tkhd")
+        mdhd = _find_child_payload(mdia, b"mdhd")
+        if mvhd[0] or tkhd[0] or mdhd[0]:
+            raise ValueError("Unsupported 64-bit movie header")
+        movie_scale, _ = _parse_timescale_and_duration(mvhd, "mvhd")
+        scale, _ = _parse_timescale_and_duration(mdhd, "mdhd")
+        dts = np.cumsum(durations) - durations
+        pts = dts + composition
+        edit = _parse_edit_list(trak)
+        if edit:
+            empty, duration, trim = edit
+            if (
+                empty * scale % movie_scale
+                or pts.min() != trim
+                or pts.max() >= trim + (duration * scale + movie_scale // 2) // movie_scale
+            ):
+                raise ValueError("Unsupported fractional or trimming edit")
+            pts += empty * scale // movie_scale - trim
+        order = np.argsort(pts)
+        if pts[order[0]] < 0 or (np.diff(pts[order]) == 0).any():
+            raise ValueError("Ambiguous presentation timestamps")
+        return cls(
+            _select_boxes(raw, (b"ftyp",)),
+            mvhd,
+            tkhd,
+            _select_boxes(trak, (b"edts",)),
+            mdhd,
+            _select_boxes(mdia, (b"hdlr",)),
+            _select_boxes(minf, (b"vmhd", b"dinf")),
+            stsd,
+            codec,
+            nal_length,
+            stbl[ctts.payload_start] if ctts else None,
+            scale,
+            count * scale / int(durations.sum()),
+            sizes,
+            offsets,
+            dts,
+            durations,
+            composition,
+            pts,
+            order,
+            sync,
+        )
+
+    def spans(self, indices, *, require_closed: bool = True) -> list[tuple[int, int]]:
+        """Inclusive decode-order spans, one per requested GOP."""
+        groups = {}
+        for idx in indices:
+            if not 0 <= idx < len(self.order):
+                raise ValueError("Frame outside sample index")
+            sample = int(self.order[idx])
+            group = int(self.sync.searchsorted(sample, side="right")) - 1
+            groups[group] = max(groups.get(group, 0), sample)
+        spans = []
+        for group, last in sorted(groups.items()):
+            first = int(self.sync[group])
+            end = self.sync[group + 1] if group + 1 < len(self.sync) else len(self.pts)
+            if require_closed and self.pts[first:end].min() < self.pts[first]:
+                raise ValueError("Open GOP with leading pictures")
+            spans.append((first, last))
+        return spans
+
+    def byte_span(self, first: int, last: int) -> tuple[int, int]:
+        return int(self.offsets[first]), int(self.offsets[last] + self.sizes[last])
+
+    @property
+    def payload_end(self) -> int:
+        return int(self.offsets[-1]) + int(self.sizes[-1])
+
+    def prefetch_range(self, first: int, last: int, *, read_ahead: bool) -> tuple[int, int]:
+        start, requested_end = self.byte_span(first, last)
+        next_sync = self.sync.searchsorted(first, side="right")
+        end = int(self.offsets[self.sync[next_sync]]) if next_sync < len(self.sync) else self.payload_end
+        if end - start > 8 << 20:
+            end = requested_end
+        if read_ahead:
+            end = min(self.payload_end, max(end, start + (64 << 10)))
+        return start, end
+
+    def virtual_header(self, file_size: int) -> tuple[bytes, int]:
+        """Prefix for a seekable MP4 exposing just the contiguous video samples."""
+        start, end = self.byte_span(0, len(self.sizes) - 1)
+        if not 0 <= start < end <= file_size:
+            raise ValueError("Video sample payload outside file")
+        count = len(self.sizes)
+        tables = (
+            _box(b"stsd", self.stsd)
+            + _box(b"stts", _timing_table(self.durations))
+            + _box(b"stsc", struct.pack(">IIIII", 0, 1, 1, count, 1))
+            + _box(b"stsz", struct.pack(">III", 0, 0, count) + self.sizes.astype(">u4").tobytes())
+            + _box(b"stss", struct.pack(">II", 0, len(self.sync)) + (self.sync + 1).astype(">u4").tobytes())
+        )
+        if self.ctts_version is not None:
+            tables += _box(b"ctts", _timing_table(self.composition, self.ctts_version))
+
+        # All samples are contiguous, so one chunk represents every original offset
+        # shifted by len(header) - start. Its 64-bit offset never changes header size.
+        def header(offset):
+            stbl = tables + _box(b"co64", struct.pack(">IIQ", 0, 1, offset))
+            return self._header(stbl, self.mvhd, self.tkhd, self.edts, self.mdhd) + struct.pack(
+                ">I4sQ", 1, b"mdat", 16 + end - start
+            )
+
+        return header(len(header(0))), start
+
+    def _header(self, stbl, mvhd, tkhd, edts, mdhd):
+        minf = self.media_info + _box(b"stbl", stbl)
+        mdia = _box(b"mdhd", mdhd) + self.hdlr + _box(b"minf", minf)
+        trak = _box(b"tkhd", tkhd) + edts + _box(b"mdia", mdia)
+        return self.ftyp + _box(b"moov", _box(b"mvhd", mvhd) + _box(b"trak", trak))
+
+    def _check_idr(self, sample: bytes) -> None:
+        if not self.nal_length_size:
+            return
+        avc = self.codec in (b"avc1", b"avc3")
+        pos = 0
+        while pos + self.nal_length_size < len(sample):
+            size = int.from_bytes(sample[pos : pos + self.nal_length_size], "big")
+            pos += self.nal_length_size
+            if size < (1 if avc else 2) or pos + size > len(sample):
+                break
+            kind = sample[pos] & 31 if avc else (sample[pos] >> 1) & 63
+            if avc:
+                if kind == 5:
+                    return
+                if 1 <= kind <= 4 or kind in (19, 20, 21):
+                    break
+            elif kind <= 31:
+                if kind in (19, 20):
+                    return
+                break
+            pos += size
+        raise ValueError("GOP does not start with an IDR picture")
+
+    def mini_mp4(self, spans, read_span) -> tuple[bytes, np.ndarray]:
+        """Pack selected decode-order spans and return their original samples in display order."""
+        chunks = []
+        for first, last in spans:
+            start, end = self.byte_span(first, last)
+            data = read_span(start, end)
+            if len(data) != end - start:
+                raise ValueError("Incomplete GOP payload")
+            if first:
+                self._check_idr(data[: self.sizes[first]])
+            chunks.append(data)
+        samples = np.concatenate([np.arange(first, last + 1) for first, last in spans])
+        sizes = self.sizes[samples]
+        # Extend the last decode duration before each gap. Composition offsets and
+        # every retained sample's position on the presentation clock stay exact.
+        durations = np.diff(self.dts[samples], append=self.dts[samples[-1]] + self.durations[samples[-1]])
+        if max(durations) > 0xFFFFFFFF:
+            raise ValueError("Decode timestamp gap exceeds MP4 duration field")
+        composition = self.composition[samples]
+        pts = self.pts[samples]
+        start = int(pts.min())
+        trim = int((self.dts[samples] - self.dts[samples[0]] + composition).min())
+        duration = int((pts + self.durations[samples]).max()) - start
+        edit = struct.pack(">II", 0, 1 + bool(start))
+        if start:
+            edit += struct.pack(">Iihh", start, -1, 1, 0)
+        edit += struct.pack(">Iihh", duration, trim, 1, 0)
+        keys = np.cumsum([1] + [last - first + 1 for first, last in spans[:-1]])
+        tables = (
+            _box(b"stsd", self.stsd)
+            + _box(b"stts", _timing_table(durations))
+            + _box(b"stsc", struct.pack(">IIIII", 0, 1, 1, len(samples), 1))
+            + _box(b"stsz", struct.pack(">III", 0, 0, len(samples)) + sizes.astype(">u4").tobytes())
+            + _box(b"stss", struct.pack(">II", 0, len(keys)) + keys.astype(">u4").tobytes())
+        )
+        if self.ctts_version is not None:
+            tables += _box(b"ctts", _timing_table(composition, self.ctts_version))
+        end = start + duration
+        mdhd = self.mdhd[:16] + struct.pack(">I", max(int(durations.sum()), trim + duration)) + self.mdhd[20:]
+        tkhd = self.tkhd[:20] + struct.pack(">I", end) + self.tkhd[24:]
+        mvhd = self.mvhd[:12] + struct.pack(">II", self.timescale, end) + self.mvhd[20:]
+
+        def header(offset):
+            stbl = tables + _box(b"stco", struct.pack(">III", 0, 1, offset))
+            return self._header(stbl, mvhd, tkhd, _box(b"edts", _box(b"elst", edit)), mdhd)
+
+        return header(len(header(0)) + 8) + _box(b"mdat", b"".join(chunks)), samples[np.argsort(pts)]
 
 
 def probe_local_mp4(

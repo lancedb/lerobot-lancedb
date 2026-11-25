@@ -74,7 +74,7 @@ Steady-state samples per second on commit `8441827`:
 |---|---:|---:|---:|---:|---:|
 | PushT | 521.8 | 944.0 | 81.8 | 1,368.6 | 91.0 |
 | DROID-shaped, short GOP | 150.2 | 198.2 | 134.2 | 164.1 | 148.6 |
-| 720p, long GOP | 20.6 | 26.4 | 25.6 | 22.7 | 21.4 |
+| 720p, long GOP | 20.6 | 26.4 | 25.6 | 22.6 | 21.4 |
 
 On the matched P1 run (`0a172dd`), local Lance delivered 621.7, 177.5 and 24.8
 samples/s respectively. The P2/P1 ratios were 1.52×, 1.12× and 1.06×. These are
