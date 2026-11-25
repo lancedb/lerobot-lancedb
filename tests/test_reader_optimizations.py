@@ -146,6 +146,10 @@ def test_cold_multi_file_mini_ranges(indexed_videos, monkeypatch):
     # A later sample within each cold GOP needs no further GET.
     ds.__getitems__([503, count + 510])
     assert not responses and not handles
+    # The next two GOPs straddle the cached GOP. Keep the short cached gap in
+    # a single merged request instead of splitting it into two network reads.
+    ds.__getitems__([495, 510])
+    assert len(responses) == 1 and not handles
     for first, second, expected in zip(results, repeat, baseline, strict=True):
         for key in first:
             assert torch.equal(first[key], expected[key]) and torch.equal(first[key], second[key])
