@@ -227,11 +227,15 @@ def test_external_convert_roundtrip_pixel_exact_and_zero_copy(tmp_path: Path, mo
     out_copy = tmp_path / "out_copy"
     out_ext = tmp_path / "out_ext"
 
-    convert(out_copy, root=src, video_mode="copy")
+    convert(out_copy, root=src, video_mode="copy", scalar_indexes=False)
+    assert not lancedb.connect(out_copy).open_table("frames").list_indices()
     # file:// root with default video_mode='auto' selects zero-copy external mode.
     convert(out_ext.as_uri(), root=src.as_uri())
 
     db_ext = lancedb.connect(str(out_ext))
+    assert {ix.columns[0]: ix.index_type for ix in db_ext.open_table("frames").list_indices()} == {
+        "episode_index": "BTree", "task_index": "Bitmap",
+    }
     videos_tbl = db_ext.open_table(VIDEOS_TABLE)
     assert videos_tbl.schema.field(VIDEO_BLOB_COLUMN).metadata == {b"lancedb:logical_type": b"mp4"}
 

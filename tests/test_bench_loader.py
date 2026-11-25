@@ -90,6 +90,9 @@ def test_loaders_and_compare(tmp_path, bench, monkeypatch, capsys):
             "2",
             "--rtt-ms",
             "1",
+            "--episode-pool",
+            "--lookahead-batches",
+            "2",
             "--verify-correctness",
             "--output-json",
             str(output),
@@ -97,7 +100,9 @@ def test_loaders_and_compare(tmp_path, bench, monkeypatch, capsys):
         check=True,
     )
     report = json.loads(output.read_text())
-    parquet, local, hybrid, streaming, replay = report["rows"]
+    parquet, local, hybrid, control, lookahead, streaming, replay, pool = report["rows"]
+    assert lookahead["anchor_batches"] == control["anchor_batches"] == hybrid["anchor_batches"]
+    assert pool["anchor_batches"] == replay["anchor_batches"]
     assert parquet["anchor_batches"] == local["anchor_batches"] == hybrid["anchor_batches"]
     assert streaming["anchor_batches"] == replay["anchor_batches"]
     assert parquet["traffic"]["total"]["gets"] == local["traffic"]["total"]["gets"] == 0

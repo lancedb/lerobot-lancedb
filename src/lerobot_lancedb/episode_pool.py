@@ -106,6 +106,30 @@ class _FrameReuse:
         self.nbytes = 0
 
 
+def _fill_videos(reader, prepared, requests, cache, item):
+    missing = {
+        file: [ts for ts in dict.fromkeys(times) if (file, ts) not in cache.frames]
+        for file, times in requests.items()
+    }
+    to_decode = {file: [(0, times)] for file, times in missing.items() if times}
+    decoded = (
+        reader._decode_requests(to_decode, {k: prepared[k] for k in to_decode}, 1)[0]
+        if to_decode
+        else {}
+    )
+    for file, times in requests.items():
+        seen = {}
+        if missing[file]:
+            values = decoded[file[0]]
+            frames = values.unsqueeze(0) if len(missing[file]) == 1 else values
+            seen.update(zip(missing[file], frames, strict=True))
+        for ts in set(times) - seen.keys():
+            seen[ts] = cache.frames[file, ts]
+        item[file[0]] = torch.stack([seen[ts] for ts in times]).squeeze(0)
+        for ts, frame in seen.items():
+            cache.consume((file, ts), frame)
+
+
 def _emit_window(reader, indices, max_frames, max_bytes):
     plans = reader._plan_batch(indices)
     rows, positions = reader._batch_rows(plans)
@@ -124,28 +148,7 @@ def _emit_window(reader, indices, max_frames, max_bytes):
     try:
         for plan, requests in zip(plans, by_anchor, strict=True):
             item = reader._build_item(plan, columns, positions)
-            missing = {
-                file: [ts for ts in dict.fromkeys(times) if (file, ts) not in cache.frames]
-                for file, times in requests.items()
-            }
-            to_decode = {file: [(0, times)] for file, times in missing.items() if times}
-            decoded = (
-                reader._decode_requests(to_decode, {k: prepared[k] for k in to_decode}, 1)[0]
-                if to_decode
-                else {}
-            )
-            for file, times in requests.items():
-                seen = {}
-                if missing[file]:
-                    values = decoded[file[0]]
-                    frames = values.unsqueeze(0) if len(missing[file]) == 1 else values
-                    seen.update(zip(missing[file], frames, strict=True))
-                for ts in set(times) - seen.keys():
-                    seen[ts] = cache.frames[file, ts]
-                item[file[0]] = torch.stack([seen[ts] for ts in times]).squeeze(0)
-                for ts, frame in seen.items():
-                    cache.consume((file, ts), frame)
-                del seen, frame
+            _fill_videos(reader, prepared, requests, cache, item)
             if reader.image_transforms is not None:
                 reader._transform_item(item)
             yield item

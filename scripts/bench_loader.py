@@ -273,10 +273,11 @@ def run_row(args, source, work, repo_id, suite, mode, captured=None):
         with memory_peak() as peak:
             start = time.perf_counter()
             if lookahead:
+                depth = int(mode.removeprefix("hybrid_lookahead_"))
                 iterator = resources.enter_context(dataset.lookahead_loader(
-                    batch_sampler=batches, num_workers=args.num_workers, lookahead_batches=args.lookahead_batches,
+                    batch_sampler=batches, num_workers=args.num_workers, lookahead_batches=depth,
                     generator=torch.Generator().manual_seed(args.seed),
-                    **({"prefetch_factor": args.prefetch_factor} if args.num_workers else {}),
+                    **({"prefetch_factor": args.prefetch_factor, "multiprocessing_context": "spawn"} if args.num_workers else {}),
                 ))
             else:
                 iterator = iter(loader)
@@ -538,7 +539,7 @@ def main(argv=None):
                 captured = None
                 modes = ["parquet", "local", "hybrid"] if suite == "A" else ["streaming", "hybrid"]
                 if suite == "A" and args.lookahead_batches is not None:
-                    modes.append(f"hybrid_lookahead_{args.lookahead_batches}")
+                    modes.extend(f"hybrid_lookahead_{k}" for k in dict.fromkeys((0, args.lookahead_batches)))
                 if suite == "B" and args.episode_pool:
                     modes.append("episode_pool")
                 for mode in modes:
